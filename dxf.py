@@ -451,7 +451,7 @@ def _entity_shapes(
             for points, closed in _flattened_paths(entity, scale)
         ]
 
-    return []  # DIMENSION, MULTILEADER, ACAD_TABLE и прочее оформление
+    return []
 
 
 def _scaled_point(point: Any, scale: float) -> tuple[float, float, float]:
@@ -487,7 +487,7 @@ def _flattened_paths(
 ) -> list[tuple[list[tuple[float, float, float]], bool]]:
     """Кривая -> спрямлённые контуры в мировых координатах."""
     if entity.dxftype() == "POLYLINE" and (entity.is_polygon_mesh or entity.is_poly_face_mesh):
-        return []  # сетки и полигональные меши в плане участка не используются
+        return []
 
     explicit_closed = _entity_is_closed(entity)
     result = []
@@ -579,7 +579,7 @@ def _walk_polygon_structure(node: Any, ignore_holes: bool) -> Iterator[tuple[ezp
 def _quad_corners(entity: DXFEntity, scale: float) -> list[tuple[float, float, float]]:
     """SOLID, TRACE, 3DFACE: четыре точки в порядке обхода контура."""
     corners: list[tuple[float, float, float]] = []
-    for name in ("vtx0", "vtx1", "vtx3", "vtx2"):  # в DXF 3-я и 4-я точки перевёрнуты
+    for name in ("vtx0", "vtx1", "vtx3", "vtx2"):
         if entity.dxf.hasattr(name):
             point = _scaled_point(entity.dxf.get(name), scale)
             if not corners or point != corners[-1]:
