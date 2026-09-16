@@ -128,33 +128,60 @@ def _resolve_layer(entity: DXFEntity, parent_layer: str | None) -> str:
 # ФУНКЦИЯ 2. Отбор нужных слоёв языковой моделью
 
 # Категории объектов площадки, которые нас интересуют.
+# TARGET_OBJECT_TYPES: dict[str, str] = {
+#     "site_boundary": "граница участка, границы ГПЗУ, красные линии участка",
+#     "building_footprint": "пятна застройки, контуры и штриховки зданий, ТП, БКТ",
+#     "building_overhang": "нависающие части зданий, консоли, эркеры",
+#     "canopy": "навесы, козырьки",
+#     "porch": "крыльца, входные группы, ступени, пандусы",
+#     "driveway": "проезды, внутриквартальные дороги, асфальт проездов",
+#     "sidewalk": "тротуары, пешеходные дорожки, плитка пешеходных зон",
+#     "guest_parking": "гостевые стоянки, парковочные площадки, машиноместа",
+#     "road_marking": "разметка проездов и стоянок, разметка МГН",
+#     "rubber_surface": "резиновая крошка, покрытие детских и спортивных площадок",
+#     "waste_platform": "площадки ТБО, мусорные площадки, контейнерные площадки",
+#     "lawn": "газоны, обычное озеленение, посевной газон",
+#     "flowerbed": "клумбы, цветники, цветочное озеленение",
+#     "tree": "деревья, отдельно стоящие деревья, крупномеры — не ограждения и не полосы леса",
+#     "shrub": "кустарники, кусты, живые изгороди — не заборы",
+#     "maf": "МАФ: скамьи, урны, велопарковки, игровое и спортивное оборудование — не выноски",
+#     "curbs": "бортовой камень, лотки, поребрики — не оси дорог",
+#     "fence": "ограды, заборы, ограждения участка",
+#     "terrain": "рельеф: горизонтали, отметки, топографическая поверхность",
+# }
 TARGET_OBJECT_TYPES: dict[str, str] = {
-    "site_boundary": "граница участка, границы ГПЗУ, красные линии участка",
-    "building_footprint": "пятна застройки, контуры и штриховки зданий, ТП, БКТ",
-    "building_overhang": "нависающие части зданий, консоли, эркеры",
-    "canopy": "навесы, козырьки",
-    "porch": "крыльца, входные группы, ступени, пандусы",
-    "driveway": "проезды, внутриквартальные дороги, асфальт проездов",
-    "sidewalk": "тротуары, пешеходные дорожки, плитка пешеходных зон",
-    "guest_parking": "гостевые стоянки, парковочные площадки, машиноместа",
-    "road_marking": "разметка проездов и стоянок, разметка МГН",
-    "rubber_surface": "резиновая крошка, покрытие детских и спортивных площадок",
-    "waste_platform": "площадки ТБО, мусорные площадки, контейнерные площадки",
-    "lawn": "газоны, обычное озеленение, посевной газон",
-    "flowerbed": "клумбы, цветники, цветочное озеленение",
-    "tree": "деревья, отдельно стоящие деревья, крупномеры",
-    "shrub": "кустарники, кусты, живые изгороди",
-    "maf": "МАФ: скамьи, урны, велопарковки, игровое и спортивное оборудование",
-    "curbs": "бортовой камень, лотки, поребрики",
-    "terrain": "рельеф: горизонтали, отметки, топографическая поверхность",
+    "site_boundary": (
+        "граница участка, ГПЗУ, красные линии участка — не граница улицы, не рамка листа"
+    ),
+    "building": (
+        "здания и пристройки: пятна, контуры, штриховки, ТП, БКТ, "
+        "нависания, навесы, козырьки, крыльца, ступени, пандусы"
+    ),
+    "pavement": (
+        "твёрдые покрытия: проезды, асфальт, тротуары, плитка, "
+        "гостевые стоянки, резиновая крошка, площадки ТБО — не разметка"
+    ),
+    "green": (
+        "газоны, цветники, клумбы, озеленение поверхностью — не деревья и не кусты"
+    ),
+    "vegetation": (
+        "деревья и кустарники как посадки/блоки — не полосы леса, не живая изгородь-забор"
+    ),
+    "furniture": (
+        "МАФ: скамьи, урны, игровое и спортивное оборудование — не выноски"
+    ),
+    "fence": (
+        "ограды, заборы, ограждения участка — не бордюр и не оси"
+    ),
 }
 
 # Слои, которые нужно отсеять: оформление листа, размеры, легенда, схемы.
 EXCLUDE_HINT = (
     "оформление листов и рамки, штампы, размеры и выноски, ведомости, "
     "экспликации, легенда и условные обозначения, схемы движения и ОДИ, "
-    "разбивочные оси, инженерные сети и топосъёмка, зоны ограничений (СЗЗ), "
-    "служебные слои вида Defpoints"
+    "разбивочные оси и оси дорог, инженерные сети, трассы коммуникаций, "
+    "топосъёмка и геодезические пункты, зоны ограничений (СЗЗ), "
+    "служебные слои вида Defpoints, граница улицы если есть граница участка"
 )
 
 DEFAULT_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:1234/v1")
@@ -162,17 +189,23 @@ DEFAULT_MODEL = os.environ.get("LLM_MODEL", "google/gemma-4-e4b")
 DEFAULT_API_KEY = os.environ.get("LLM_API_KEY", "")
 
 # Слоёв в чертеже бывает много
-DEFAULT_BATCH_SIZE = 60
+DEFAULT_BATCH_SIZE = 40
 
 SYSTEM_PROMPT = (
     "Ты помогаешь разбирать чертежи планировки участка (ПЗУ) в формате DXF. "
     "Тебе дают имена слоёв AutoCAD, а ты определяешь, к какому типу "
     "объектов площадки относится каждый слой. "
-    "Отвечай только JSON-объектом, без пояснений и без markdown."
+    "Не рассуждай вслух. Верни только один JSON-объект, без markdown, "
+    "без тегов channel/think и без текста до или после JSON."
 )
 
-THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+THINK_BLOCK_RE = re.compile(
+    r"<think>.*?</think>"
+    r"|<\|channel\|>thought.*?(?=<\|channel\|>final|$)"
+    r"|<\|start\|>.*?<\|channel\|>thought.*?(?=<\|channel\|>final|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+CHANNEL_FINAL_RE = re.compile(r"<\|channel\|>final", re.IGNORECASE)
 
 
 @dataclass
@@ -200,30 +233,73 @@ class LayerSelection:
         }
 
 
+HINT_SUFFIX_RE = re.compile(r"\s*\[.*?\]\s*$")
+# Номер листа в имени слоя AutoCAD: «1 Граница участка», «1_ГП_…», «2 СЗЗ_…».
+SHEET_PREFIX_RE = re.compile(r"^\d+[_\s]+")
+
+
 def _build_prompt(layer_names: Sequence[str], hints: Mapping[str, str] | None = None) -> str:
     categories = "\n".join(f"- {c}: {d}" for c, d in TARGET_OBJECT_TYPES.items())
+    quoted = ",\n".join(f"  {json.dumps(name, ensure_ascii=False)}" for name in layer_names)
 
+    hint_block = ""
     if hints:
-        layers = "\n".join(
-            f"- {name} [{hints[name]}]" if hints.get(name) else f"- {name}" for name in layer_names
-        )
-    else:
-        layers = "\n".join(f"- {name}" for name in layer_names)
+        hint_lines = [
+            f"  {json.dumps(name, ensure_ascii=False)}: {hints[name]}"
+            for name in layer_names
+            if hints.get(name)
+        ]
+        if hint_lines:
+            hint_block = (
+                "\n\nСостав слоя — только подсказка, в JSON не копируй:\n"
+                + "\n".join(hint_lines)
+            )
 
     return (
         "Категории объектов площадки:\n"
         f"{categories}\n\n"
         f"Не относятся к площадке и должны быть отброшены: {EXCLUDE_HINT}.\n\n"
-        "Имена слоёв из чертежа:\n"
-        f"{layers}\n\n"
+        "Имена слоёв из чертежа — JSON-массив точных строк:\n"
+        f"[\n{quoted}\n]"
+        f"{hint_block}\n\n"
         "Верни JSON: ключ — категория из списка выше, значение — массив "
         "имён слоёв этой категории. Правила:\n"
-        "1. Имена слоёв копируй посимвольно из списка, ничего не меняй и не придумывай.\n"
+        "1. Копируй строку из массива целиком. Ведущие «1 », «2 », «!», «_» — "
+        "часть имени AutoCAD, не номер пункта и не маркдаун. Не отрезай их.\n"
         "2. Слой указывай не более одного раза.\n"
         "3. Слои, которые не относятся ни к одной категории, не включай.\n"
         "4. Если подходящих слоёв нет, верни пустой объект {}.\n"
         'Пример ответа: {"sidewalk": ["1 ГП_УДС_Тротуары"], "lawn": ["1 ГП_Штриховки_газон"]}'
     )
+
+
+def _resolve_layer_name(raw: str, allowed: Mapping[str, str]) -> str | None:
+    """Сопоставляет имя из ответа LLM с реальным слоем.
+
+    Модель часто отрезает номер листа («1 Граница участка» → «Граница участка»)
+    или дописывает «состав». Это не выдуманное имя, если совпадение уникально.
+    """
+    cleaned = HINT_SUFFIX_RE.sub("", str(raw)).strip().strip("\"'")
+    cleaned = re.sub(r"\s*состав\s*:.*$", "", cleaned, flags=re.IGNORECASE).strip()
+    if not cleaned:
+        return None
+    key = normalize_name(cleaned)
+    if key in allowed:
+        return allowed[key]
+    for allowed_key, original in sorted(allowed.items(), key=lambda item: -len(item[0])):
+        if key.startswith(allowed_key + " ") or key.startswith(allowed_key + "["):
+            return original
+
+    stripped_key = SHEET_PREFIX_RE.sub("", key)
+    hits: list[str] = []
+    for allowed_key, original in allowed.items():
+        stripped_allowed = SHEET_PREFIX_RE.sub("", allowed_key)
+        if stripped_key == stripped_allowed or key == stripped_allowed:
+            hits.append(original)
+    unique = list(dict.fromkeys(hits))
+    if len(unique) == 1:
+        return unique[0]
+    return None
 
 
 def select_target_layers(
@@ -248,14 +324,24 @@ def select_target_layers(
             user=_build_prompt(batch, hints),
             model=model, base_url=base_url, api_key=api_key, timeout=timeout,
         )
+        try:
+            parsed = _parse_selection(reply)
+        except ValueError:
+            reply = _request_chat_completion(
+                system=SYSTEM_PROMPT,
+                user=_build_prompt(batch, hints)
+                + "\n\nОтвет — только JSON, без thinking и без пояснений.",
+                model=model, base_url=base_url, api_key=api_key, timeout=timeout,
+            )
+            parsed = _parse_selection(reply)
 
-        for category, layers in _parse_selection(reply).items():
+        for category, layers in parsed.items():
             if category not in TARGET_OBJECT_TYPES:
                 selection.unknown_categories.setdefault(category, []).extend(str(n) for n in layers)
                 continue
 
             for name in layers:
-                original = allowed.get(normalize_name(name))
+                original = _resolve_layer_name(str(name), allowed)
                 if original is None:
                     selection.invented.append(str(name))
                     continue
@@ -271,19 +357,75 @@ def select_target_layers(
     return selection
 
 
-def _parse_selection(reply: str) -> dict[str, list[str]]:
-    """Достаёт JSON из ответа модели (убирает <think> и ```json оболочку)."""
-    text = THINK_BLOCK_RE.sub("", reply).strip()
-    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+def _message_text(message: Mapping[str, Any] | None) -> str:
+    """Собирает текст из content / reasoning — Gemma кладёт мысли в отдельные поля."""
+    if not message:
+        return ""
 
-    match = JSON_OBJECT_RE.search(text)
-    if match is None:
+    chunks: list[str] = []
+    for key in ("content", "reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            chunks.append(value)
+        elif isinstance(value, list):
+            for part in value:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content") or ""
+                    if text:
+                        chunks.append(str(text))
+                elif part:
+                    chunks.append(str(part))
+    return "\n".join(chunks)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Убирает thinking-каналы Gemma/Harmony и markdown-ограждение."""
+    if CHANNEL_FINAL_RE.search(text):
+        text = CHANNEL_FINAL_RE.split(text, maxsplit=1)[-1]
+    text = THINK_BLOCK_RE.sub("", text)
+    text = re.sub(r"<\|[^|>]+\|>", " ", text)
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE)
+    return text.strip()
+
+
+def _iter_json_objects(text: str) -> Iterator[dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        start = text.find("{", index)
+        if start < 0:
+            return
+        try:
+            data, consumed = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        if isinstance(data, dict):
+            yield data
+        index = start + max(consumed, 1)
+
+
+def _score_selection(data: dict[str, Any]) -> int:
+    score = 0
+    for category, layers in data.items():
+        if category not in TARGET_OBJECT_TYPES:
+            continue
+        if isinstance(layers, str):
+            layers = [layers]
+        if isinstance(layers, list):
+            score += 10 + len(layers)
+    return score
+
+
+def _parse_selection(reply: str) -> dict[str, list[str]]:
+    """Достаёт JSON из ответа модели, даже если вокруг thinking-теги."""
+    candidates = list(_iter_json_objects(_strip_reasoning(reply)))
+    if not candidates:
+        candidates = list(_iter_json_objects(reply))
+    if not candidates:
         raise ValueError(f"Модель вернула ответ без JSON:\n{reply[:500]}")
 
-    data = json.loads(match.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("Ожидался JSON-объект категория -> список слоёв.")
-
+    data = max(candidates, key=_score_selection)
     result: dict[str, list[str]] = {}
     for category, layers in data.items():
         if isinstance(layers, str):
@@ -305,6 +447,7 @@ def _request_chat_completion(
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": 0.0,
         "stream": False,
+        "response_format": {"type": "json_object"},
     }
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -318,13 +461,32 @@ def _request_chat_completion(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        # Старые серверы не принимают response_format — повторяем без него.
+        if error.code in {400, 422} and "response_format" in payload:
+            payload.pop("response_format", None)
+            request = urllib.request.Request(
+                url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers=headers, method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        else:
+            raise ConnectionError(
+                f"Не удалось обратиться к модели по адресу {url}: {error}\n"
+                "Проверьте, что сервер запущен, и задайте LLM_BASE_URL и LLM_MODEL."
+            ) from error
     except urllib.error.URLError as error:
         raise ConnectionError(
             f"Не удалось обратиться к модели по адресу {url}: {error}\n"
             "Проверьте, что сервер запущен, и задайте LLM_BASE_URL и LLM_MODEL."
         ) from error
 
-    return data["choices"][0]["message"]["content"]
+    choice = data["choices"][0]
+    text = _message_text(choice.get("message"))
+    if not text.strip():
+        text = str(choice.get("text") or "")
+    return text
 
 
 def _chunks(items: list[Any], size: int) -> Iterator[list[Any]]:
@@ -603,14 +765,14 @@ def shapes_to_json(shapes: Sequence[Shape], path: str | Path, source: str = "") 
     return output
 
 if "__main__" == __name__:
-    print(_layer_report("output_dxf/ПЗУ Касимовская 33.dxf"))
+    #print(_layer_report("output_dxf/ПЗУ Касимовская 33.dxf"))
     #print(list_layers("output_dxf/ПЗУ Касимовская 33.dxf"))
-    DXF_PATH = "output_dxf/ПЗУ Касимовская 33.dxf"
+    DXF_PATH = "output_dxf/ПЗУ Касимовская 33 (1).dxf"
 
     # Функция 1
     layers = list_layers(DXF_PATH)
     print(f"Слоёв в файле: {len(layers)}")
-    print(layers[:10])
+    print(layers)
 
     # Функция 2
     selection = select_target_layers(layers)
@@ -622,8 +784,7 @@ if "__main__" == __name__:
     if selection.invented:
         print("Модель придумала несуществующие имена:", selection.invented)
 
-    target_layers = selection.by_category.get("sidewalk", []) + \
-                    selection.by_category.get("flowerbed", [])
+    target_layers = selection.by_category.get("site_boundary", [])
 
     # Функция 3
     shapes = read_layer_geometry(DXF_PATH, target_layers)
