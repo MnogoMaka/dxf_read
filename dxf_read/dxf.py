@@ -689,7 +689,7 @@ def _close_ring(points: list[tuple[float, float, float]]) -> list[tuple[float, f
 def _flattened_paths(
     entity: DXFEntity, scale: float,
 ) -> list[tuple[list[tuple[float, float, float]], bool]]:
-    """Кривая -> спрямлённые контуры в мировых координатах."""
+    """Кривая спрямлённые контуры в мировых координатах."""
     if entity.dxftype() == "POLYLINE" and (entity.is_polygon_mesh or entity.is_poly_face_mesh):
         return []
 
@@ -826,7 +826,7 @@ def shapes_to_json(shapes: Sequence[Shape], path: str | Path, source: str = "") 
     return output
 
 
-# ФУНКЦИЯ 4. HATCH из групп функции 2 → 2D arrangement → отрисовка
+# ФУНКЦИЯ 4.
 
 
 def infer_layer_category(name: str) -> str | None:
@@ -1119,9 +1119,7 @@ def draw_classified_hatches(
     show: bool = True,
     save_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Функция 4. Группы слоёв → все HATCH (и из INSERT) → arrangement → план.
-
-    ``by_category`` — то, что вернула функция 2 в ``selection.by_category``.
+    """Функция 4. Группы слоёв все HATCH (и из INSERT) arrangement → план.
     """
     from matplotlib.patches import PathPatch
     from matplotlib.path import Path as MplPath
@@ -1447,7 +1445,6 @@ def _geometry_origin(
     categories: Sequence[str] | None = None,
 ) -> tuple[float, float]:
     """Центр масс площади, не середина bbox.
-
     Копия/рамка в километрах от участка растягивает bbox: origin падает
     в пустоту, в Blender вокруг сетки ничего не видно.
     """
@@ -1654,8 +1651,7 @@ def export_blender_underlay(
     blend_path: str | Path | None = None,
     run_blender: bool = True,
 ) -> dict[str, Any]:
-    """Функция 5. Те же группы, что в функции 4 → плоская подложка Blender.
-
+    """
     Каждый слой AutoCAD становится отдельной коллекцией. Без выдавливания:
     HATCH через earcut режется на треугольники в Z=0.
     """
@@ -1749,7 +1745,6 @@ def export_blender_underlay(
         "blend": str(blend_output),
         "from_blocks": from_blocks,
     }
-
 
 def _focus_axes_on_geometries(axes: Any, geometries: Sequence[BaseGeometry]) -> None:
     xs: list[float] = []
