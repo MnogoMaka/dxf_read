@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+input_dwg
+models
+output
+output_dxf
+output_old
