@@ -7,3 +7,5 @@ models
 output
 output_dxf
 output_old
+.env.example
+.env
