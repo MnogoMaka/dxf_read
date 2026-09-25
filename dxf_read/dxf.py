@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -27,30 +28,22 @@ from shapely.ops import polygonize, unary_union
 from shapely.strtree import STRtree
 from shapely.validation import make_valid
 
+from . import config
 from .config import (
     ARRANGEMENT_PRIORITY,
     BLENDER,
     BLENDER_SEARCH_ROOTS,
     CHANNEL_FINAL_RE,
     CURVE_TYPES,
-    DEFAULT_API_KEY,
-    DEFAULT_BASE_URL,
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_MODEL,
     DXF_OUTPUT_DIR,
     DXF_VERSION,
     EXCLUDE_HINT,
-    FILL_POLYLINE_TOKENS,
     FILL_TYPES,
-    FLATTENING_DISTANCE_M,
     GENERIC_BLOCK_LAYERS,
-    GENERIC_FILL_ASSOCIATE_M,
     HATCH_DRAW_COLORS,
     HATCH_DRAW_ORDER,
     HINT_SUFFIX_RE,
-    JUNK_LAYER_TOKENS,
     LAYER_CATEGORY_HINTS,
-    MIN_ARRANGEMENT_AREA_M2,
     ODA_CONVERTER,
     ODA_SEARCH_ROOTS,
     OUTPUT_DIR,
@@ -59,7 +52,6 @@ from .config import (
     QUAD_TYPES,
     ROOT_COLLECTION,
     SHEET_PREFIX_RE,
-    SITE_CLUSTER_RADIUS_M,
     SYSTEM_PROMPT,
     TARGET_OBJECT_TYPES,
     TEXT_TYPES,
@@ -96,7 +88,7 @@ def is_junk_layer(name: str) -> bool:
     if PENA_SUFFIX_RE.search(text):
         return True
     probe = layer_leaf(name)
-    return any(token in probe for token in JUNK_LAYER_TOKENS)
+    return any(token in probe for token in config.settings().junk_layer_tokens)
 
 
 def is_generic_block_layer(name: str) -> bool:
@@ -107,7 +99,7 @@ def is_generic_block_layer(name: str) -> bool:
 def is_area_polyline_layer(name: str) -> bool:
     """Замкнутая полилиния на слое заливки пятна, не контур стен."""
     text = layer_leaf(name)
-    return any(token in text for token in FILL_POLYLINE_TOKENS)
+    return any(token in text for token in config.settings().fill_polyline_tokens)
 
 # ФУНКЦИЯ 1. Перечень слоёв
 
@@ -348,15 +340,21 @@ def _fuzzy_layer(key: str, allowed: Mapping[str, str]) -> str | None:
 def select_target_layers(
     layer_names: Sequence[str],
     hints: Mapping[str, str] | None = None,
-    model: str = DEFAULT_MODEL,
-    base_url: str = DEFAULT_BASE_URL,
-    api_key: str = DEFAULT_API_KEY,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    timeout: float = 300.0,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    batch_size: int | None = None,
+    timeout: float | None = None,
 ) -> LayerSelection:
     """
     Функция 2. Имена слоёв нужные нам слои по категориям через LLM.
     """
+    cfg = config.settings()
+    model = model or cfg.llm_model
+    base_url = base_url or cfg.llm_base_url
+    api_key = cfg.llm_api_key if api_key is None else api_key
+    batch_size = cfg.batch_size if batch_size is None else batch_size
+    timeout = cfg.llm_timeout if timeout is None else timeout
     selection = LayerSelection(model=model)
     allowed = {normalize_name(name): name for name in layer_names}
     used: set[str] = set()
@@ -495,9 +493,13 @@ def _parse_selection(reply: str) -> dict[str, list[str]]:
 
 def _request_chat_completion(
     system: str, user: str, model: str,
-    base_url: str = DEFAULT_BASE_URL, api_key: str = DEFAULT_API_KEY, timeout: float = 300.0,
+    base_url: str | None = None, api_key: str | None = None, timeout: float | None = None,
 ) -> str:
     """Один запрос к OpenAI-совместимому API. Возвращает текст ответа."""
+    cfg = config.settings()
+    base_url = cfg.llm_base_url if base_url is None else base_url
+    api_key = cfg.llm_api_key if api_key is None else api_key
+    timeout = cfg.llm_timeout if timeout is None else timeout
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
@@ -667,7 +669,8 @@ def _scaled_point(point: Any, scale: float) -> tuple[float, float, float]:
 
 
 def _flattening_distance(scale: float) -> float:
-    return FLATTENING_DISTANCE_M / scale if scale else FLATTENING_DISTANCE_M
+    distance = config.settings().flattening_distance_m
+    return distance / scale if scale else distance
 
 
 def _path_vertices(path: ezpath.Path, scale: float) -> list[tuple[float, float, float]]:
@@ -1000,7 +1003,7 @@ def _assign_generic_fills_to_buildings(
         return
 
     tree = STRtree(building_polys)
-    radius = GENERIC_FILL_ASSOCIATE_M
+    radius = config.settings().generic_fill_associate_m
     for entity, layer, block_path in orphans:
         handle = str(entity.dxf.get("handle", "") or "")
         for outer, holes in _hatch_rings(entity, scale):
@@ -1061,7 +1064,7 @@ def arrange_hatch_faces(
     labeled: list[tuple[ShapelyPolygon, str]] = []
     for piece in clustered:
         for polygon in _piece_polygons(piece):
-            if polygon.area >= MIN_ARRANGEMENT_AREA_M2:
+            if polygon.area >= config.settings().min_arrangement_area_m2:
                 labeled.append((polygon, piece.category))
     if not labeled:
         return []
@@ -1075,7 +1078,7 @@ def arrange_hatch_faces(
 
     try:
         noded = unary_union(lines)
-        faces = [face for face in polygonize(noded) if face.area >= MIN_ARRANGEMENT_AREA_M2]
+        faces = [face for face in polygonize(noded) if face.area >= config.settings().min_arrangement_area_m2]
     except Exception:
         faces = []
 
@@ -1193,7 +1196,7 @@ def _piece_polygons(piece: HatchPiece) -> list[ShapelyPolygon]:
     return [
         polygon
         for polygon in _iter_shapely_polygons(geom)
-        if polygon.area >= MIN_ARRANGEMENT_AREA_M2
+        if polygon.area >= config.settings().min_arrangement_area_m2
     ]
 
 
@@ -1220,7 +1223,7 @@ def _cluster_hatch_pieces(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
     """
     ranked: list[HatchPiece] = []
     for piece in pieces:
-        if _ring_area(piece.vertices) >= MIN_ARRANGEMENT_AREA_M2:
+        if _ring_area(piece.vertices) >= config.settings().min_arrangement_area_m2:
             ranked.append(piece)
     if not ranked:
         return list(pieces)
@@ -1275,7 +1278,7 @@ def _near_hatch_cluster(
     cluster: Sequence[Sequence[tuple[float, float, float]]],
 ) -> bool:
     cx, cy = _centroid_xy(ring)
-    radius_sq = SITE_CLUSTER_RADIUS_M ** 2
+    radius_sq = config.settings().site_cluster_radius_m ** 2
     for other in cluster:
         ox, oy = _centroid_xy(other)
         if (cx - ox) ** 2 + (cy - oy) ** 2 <= radius_sq:
@@ -1325,7 +1328,7 @@ def arrange_hatch_faces_by_layer(
     labeled: list[tuple[ShapelyPolygon, str, str]] = []
     for piece in clustered:
         for polygon in _piece_polygons(piece):
-            if polygon.area >= MIN_ARRANGEMENT_AREA_M2:
+            if polygon.area >= config.settings().min_arrangement_area_m2:
                 labeled.append((polygon, piece.category, piece.layer))
     if not labeled:
         return []
@@ -1339,7 +1342,7 @@ def arrange_hatch_faces_by_layer(
 
     try:
         noded = unary_union(lines)
-        faces = [face for face in polygonize(noded) if face.area >= MIN_ARRANGEMENT_AREA_M2]
+        faces = [face for face in polygonize(noded) if face.area >= config.settings().min_arrangement_area_m2]
     except Exception:
         faces = []
 
@@ -1420,7 +1423,7 @@ def _layer_mesh(
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
     for polygon in _iter_shapely_polygons(geometry):
-        if polygon.area < MIN_ARRANGEMENT_AREA_M2:
+        if polygon.area < config.settings().min_arrangement_area_m2:
             continue
         try:
             xy, tri = _earcut_polygon(polygon)
@@ -1516,6 +1519,56 @@ def find_oda_converter(explicit: str | Path | None = None) -> Path:
     return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
+def _hide_process_windows(pid: int) -> None:
+    """Прячет окна процесса. ODA File Converter рисует своё окно после старта."""
+    if os.name != "nt" or pid <= 0:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd, _lparam):
+        proc_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+        if proc_id.value == pid:
+            user32.ShowWindow(hwnd, 0)
+        return True
+
+    user32.EnumWindows(callback, 0)
+
+
+def _run_hidden(command: list[str]) -> subprocess.CompletedProcess[str]:
+    """Запуск без консоли и без окна программы."""
+    startupinfo = None
+    creationflags = 0
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        startupinfo=startupinfo,
+        creationflags=creationflags,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    while True:
+        if os.name == "nt":
+            _hide_process_windows(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    return subprocess.CompletedProcess(command, proc.returncode or 0, stdout, stderr)
+
+
 def convert_dwg_to_dxf(
     dwg_path: str | Path,
     output_dir: str | Path | None = None,
@@ -1539,10 +1592,7 @@ def convert_dwg_to_dxf(
             DXF_VERSION, "DXF", "0", "1", "*.DWG",
         ]
         print("ODA:", converter)
-        result = subprocess.run(
-            command, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", check=False,
-        )
+        result = _run_hidden(command)
         if result.returncode != 0:
             print(result.stdout)
             print(result.stderr)
@@ -1584,6 +1634,13 @@ def open_drawing(
     return document
 
 
+def _result_dir() -> Path:
+    raw = str(config.settings().output_dir or "").strip()
+    path = Path(raw) if raw else OUTPUT_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def run_pipeline(
     path: str | Path,
     *,
@@ -1594,7 +1651,10 @@ def run_pipeline(
     run_blender: bool = True,
 ) -> dict[str, Any]:
     """Полный пайплайн"""
-    document = open_drawing(path, oda_exe=oda_exe)
+    cfg = config.settings()
+    oda = oda_exe if oda_exe is not None else (cfg.oda_converter or None)
+    out = _result_dir()
+    document = open_drawing(path, dxf_dir=out / "_dxf", oda_exe=oda or None)
     source = _drawing_path(document, path)
     layers = list_layers(document)
     print(f"Слоёв в файле: {len(layers)}")
@@ -1611,7 +1671,7 @@ def run_pipeline(
             print(f"  {category}: {names}")
         if selection.invented:
             print("Модель придумала несуществующие имена:", selection.invented)
-        layers_json = OUTPUT_DIR / f"{source.stem}_layers.json"
+        layers_json = out / f"{source.stem}_layers.json"
         layers_json.parent.mkdir(parents=True, exist_ok=True)
         with layers_json.open("w", encoding="utf-8") as file:
             json.dump(selection.to_dict(), file, ensure_ascii=False, indent=2)
@@ -1625,13 +1685,13 @@ def run_pipeline(
     if draw_preview:
         draw_classified_hatches(
             document, groups, show=False,
-            save_path=str(OUTPUT_DIR / f"{source.stem}_hatches.png"),
+            save_path=str(out / f"{source.stem}_hatches.png"),
         )
 
     underlay = export_blender_underlay(
         document, groups,
-        json_path=str(OUTPUT_DIR / f"{source.stem}_underlay.json"),
-        blend_path=str(OUTPUT_DIR / f"{source.stem}_underlay.blend"),
+        json_path=str(out / f"{source.stem}_underlay.json"),
+        blend_path=str(out / f"{source.stem}_underlay.blend"),
         run_blender=run_blender,
     )
     return {

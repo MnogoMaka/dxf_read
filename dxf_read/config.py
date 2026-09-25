@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import re
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -64,7 +67,7 @@ SITE_CLUSTER_RADIUS_M = 400000.0
 # Слой 0 / HATCH: SOLID-заливка внутри контура стен здания.
 GENERIC_FILL_ASSOCIATE_M = 15.0
 FILL_POLYLINE_TOKENS = ("ЗАЛИВ", "ЗАПОЛН", "ПЯТН")
-DEFAULT_BATCH_SIZE = 40
+DEFAULT_BATCH_SIZE = 600
 DXF_VERSION = "ACAD2018"
 PROJECT_CLUSTER_CATEGORIES = frozenset({"pavement", "green", "building"})
 
@@ -195,6 +198,61 @@ SYSTEM_PROMPT = (
     "без тегов channel/think и без текста до или после JSON. "
     "JSON должен быть строгим: без висячих запятых."
 )
+
+@dataclass
+class PipelineSettings:
+    """Параметры прогона. Пустое переопределение не используется: его даёт settings()."""
+
+    site_cluster_radius_m: float = 400000.0
+    generic_fill_associate_m: float = 15.0
+    min_arrangement_area_m2: float = 0.05
+    flattening_distance_m: float = 0.02
+    batch_size: int = 600
+    llm_timeout: float = 300.0
+    fill_polyline_tokens: tuple[str, ...] = ("ЗАЛИВ", "ЗАПОЛН", "ПЯТН")
+    junk_layer_tokens: tuple[str, ...] = ()
+    llm_model: str = ""
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    oda_converter: str = ""
+    output_dir: str = ""
+
+
+_SETTINGS: contextvars.ContextVar[PipelineSettings | None] = contextvars.ContextVar(
+    "dwgreader_pipeline_settings",
+    default=None,
+)
+
+
+def settings() -> PipelineSettings:
+    """Текущие параметры: переопределение аддона или значения этого модуля."""
+    custom = _SETTINGS.get()
+    if custom is not None:
+        return custom
+    return PipelineSettings(
+        site_cluster_radius_m=SITE_CLUSTER_RADIUS_M,
+        generic_fill_associate_m=GENERIC_FILL_ASSOCIATE_M,
+        min_arrangement_area_m2=MIN_ARRANGEMENT_AREA_M2,
+        flattening_distance_m=FLATTENING_DISTANCE_M,
+        batch_size=DEFAULT_BATCH_SIZE,
+        fill_polyline_tokens=FILL_POLYLINE_TOKENS,
+        junk_layer_tokens=JUNK_LAYER_TOKENS,
+        llm_model=DEFAULT_MODEL,
+        llm_base_url=DEFAULT_BASE_URL,
+        llm_api_key=DEFAULT_API_KEY,
+        oda_converter=ODA_CONVERTER,
+        output_dir=str(OUTPUT_DIR),
+    )
+
+
+@contextmanager
+def use_settings(custom: PipelineSettings):
+    token = _SETTINGS.set(custom)
+    try:
+        yield custom
+    finally:
+        _SETTINGS.reset(token)
+
 
 HINT_SUFFIX_RE = re.compile(r"\s*\[.*?\]\s*$")
 SHEET_PREFIX_RE = re.compile(r"^\d+[_\s]+")
