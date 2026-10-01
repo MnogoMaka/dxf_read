@@ -18,8 +18,8 @@ import threading
 from pathlib import Path
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
-from bpy.types import AddonPreferences, Operator, Panel
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 
 from .build_scene import build
 
@@ -27,15 +27,27 @@ from .build_scene import build
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
-    "description": "Импорт DWG/DXF в плоскую цветную подложку площадки",
+    "description": "DXF → проверка слоёв → благоустройство в сцене",
     "category": "Import-Export",
 }
 
 MARKER = "UNDERLAY_JSON="
 EMPTY_MARKER = "UNDERLAY_EMPTY="
+LAYERS_MARKER = "LAYERS_JSON="
+LAYER_CATEGORIES = (
+    ("none", "None", "Тип не задан"),
+    ("site_boundary", "Граница", "Граница участка"),
+    ("building", "Здания", "Здания и пристройки"),
+    ("pavement", "Покрытия", "Проезды, тротуары, площадки"),
+    ("green", "Газоны", "Газоны и цветники"),
+    ("vegetation", "Посадки", "Деревья и кустарники"),
+    ("furniture", "МАФ", "Скамьи, урны, оборудование"),
+    ("fence", "Ограждения", "Заборы и ограды"),
+)
+CATEGORY_IDS = {item[0] for item in LAYER_CATEGORIES}
 PIP_PACKAGES = ("ezdxf", "shapely", "numpy", "mapbox-earcut")
 WINGET_ODA_ID = "ODA.ODAFileConverter"
 JUNK_TOKENS = (
@@ -473,7 +485,12 @@ class DWGREADER_OT_pick_file(Operator):
     filter_glob: StringProperty(default="*.dwg;*.dxf;*.DWG;*.DXF", options={"HIDDEN"})
 
     def execute(self, context):
-        context.scene.dwgreader_source = self.filepath
+        scene = context.scene
+        if scene.dwgreader_source != self.filepath:
+            scene.dwgreader_selected.clear()
+            scene.dwgreader_ignored.clear()
+            scene.dwgreader_classified = ""
+        scene.dwgreader_source = self.filepath
         return {"FINISHED"}
 
     def invoke(self, context, event):
@@ -481,65 +498,247 @@ class DWGREADER_OT_pick_file(Operator):
         return {"RUNNING_MODAL"}
 
 
-class DWGREADER_OT_import(Operator):
-    bl_idname = "dwgreader.import_underlay"
-    bl_label = "Собрать подложку"
-    bl_description = "Конвертировать чертёж и добавить подложку в сцену"
-    bl_options = {"REGISTER", "UNDO"}
+class DWGREADER_LayerItem(PropertyGroup):
+    layer_name: StringProperty(name="Слой")
+    category: EnumProperty(name="Тип", items=LAYER_CATEGORIES, default="none")
+
+
+class DWGREADER_UL_layers(UIList):
+    bl_idname = "DWGREADER_UL_layers"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=item.layer_name)
+        row.prop(item, "category", text="")
+
+
+def _drawing_path(context) -> Path | None:
+    raw = context.scene.dwgreader_source.strip()
+    if not raw:
+        return None
+    path = Path(bpy.path.abspath(raw))
+    if path.suffix.lower() not in {".dwg", ".dxf"} or not path.is_file():
+        return None
+    return path
+
+
+def _launch_pipeline(operator, context, extra: list[str], title: str, mode: str):
+    prefs = _addon_prefs(context)
+    if prefs is None:
+        operator.report({"ERROR"}, "Настройки аддона недоступны")
+        return {"CANCELLED"}
+    if not _deps_ready():
+        operator.report({"ERROR"}, "Сначала нажмите «Установить библиотеки»")
+        return {"CANCELLED"}
+    source = _drawing_path(context)
+    if source is None:
+        operator.report({"ERROR"}, "Выберите существующий файл .dxf или .dwg")
+        return {"CANCELLED"}
+    if source.suffix.lower() == ".dwg" and not _oda_installed(prefs):
+        operator.report({"ERROR"}, "Для DWG нужен ODA File Converter. Нажмите «Установить ODA File Converter»")
+        return {"CANCELLED"}
+    try:
+        python = _blender_python()
+        engine = _engine_dir()
+    except FileNotFoundError as exc:
+        operator.report({"ERROR"}, str(exc))
+        return {"CANCELLED"}
+    out = _output_dir(prefs, source)
+    settings_path = out / "_pipeline_settings.json"
+    settings_path.write_text(
+        json.dumps(_settings_payload(prefs, source), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    command = [
+        str(python), "-m", "dxf_read", str(source),
+        "--no-blender", "--settings", str(settings_path),
+        *extra,
+    ]
+    operator._mode = mode
+    return _start_process(
+        operator, context, command, cwd=engine, env=_python_env(),
+        title=title,
+        log_path=out / "dwgreader_import.log",
+    )
+
+
+def _fill_review(context, layers_path: Path) -> tuple[int, int]:
+    data = json.loads(layers_path.read_text(encoding="utf-8"))
+    scene = context.scene
+    scene.dwgreader_selected.clear()
+    scene.dwgreader_ignored.clear()
+    seen: set[str] = set()
+    order = [item[0] for item in LAYER_CATEGORIES]
+    grouped = data.get("by_category") or {}
+    for category in order:
+        for name in grouped.get(category) or []:
+            text = str(name).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            item = scene.dwgreader_selected.add()
+            item.layer_name = text
+            item.category = category
+    for category, names in grouped.items():
+        if category in CATEGORY_IDS:
+            continue
+        for name in names or []:
+            text = str(name).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            item = scene.dwgreader_selected.add()
+            item.layer_name = text
+            item.category = "none"
+    for name in data.get("rejected") or []:
+        text = str(name).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        item = scene.dwgreader_ignored.add()
+        item.layer_name = text
+        item.category = "none"
+    scene.dwgreader_selected_index = 0
+    scene.dwgreader_ignored_index = 0
+    scene.dwgreader_classified = scene.dwgreader_source
+    return len(scene.dwgreader_selected), len(scene.dwgreader_ignored)
+
+
+def _move_layer(source, target, index: int) -> None:
+    if index < 0 or index >= len(source):
+        return
+    item = source[index]
+    copy = target.add()
+    copy.layer_name = item.layer_name
+    copy.category = item.category
+    source.remove(index)
+
+
+class DWGREADER_OT_classify(Operator):
+    bl_idname = "dwgreader.classify_layers"
+    bl_label = "Разобрать слои"
+    bl_description = "Прочитать чертёж и показать слои, которые модель отнесла к благоустройству"
+    bl_options = {"REGISTER"}
 
     _timer = None
     _proc = None
     _thread = None
     _state: dict | None = None
+    _mode = "classify"
 
     @classmethod
     def poll(cls, context):
         return not context.window_manager.dwgreader_busy
 
     def invoke(self, context, event):
-        prefs = _addon_prefs(context)
-        if prefs is None:
-            self.report({"ERROR"}, "Настройки аддона недоступны")
-            return {"CANCELLED"}
-        if not _deps_ready():
-            self.report({"ERROR"}, "Сначала нажмите «Установить библиотеки»")
-            return {"CANCELLED"}
-        source = Path(bpy.path.abspath(context.scene.dwgreader_source.strip()))
-        if source.suffix.lower() not in {".dwg", ".dxf"} or not source.is_file():
-            self.report({"ERROR"}, "Выберите существующий файл .dwg или .dxf")
-            return {"CANCELLED"}
-        if source.suffix.lower() == ".dwg" and not _oda_installed(prefs):
-            self.report({"ERROR"}, "Для DWG нужен ODA File Converter. Нажмите «Установить ODA File Converter»")
-            return {"CANCELLED"}
-        try:
-            python = _blender_python()
-            engine = _engine_dir()
-        except FileNotFoundError as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-
-        out = _output_dir(prefs, source)
-        settings_path = out / "_pipeline_settings.json"
-        settings_path.write_text(
-            json.dumps(_settings_payload(prefs, source), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        command = [
-            str(python), "-m", "dxf_read", str(source),
-            "--no-blender", "--settings", str(settings_path),
-        ]
-        return _start_process(
-            self, context, command, cwd=engine, env=_python_env(),
-            title="Конвертация и классификация слоёв…",
-            log_path=out / "dwgreader_import.log",
+        return _launch_pipeline(
+            self, context, ["--classify-only"],
+            "Разбор чертежа и классификация слоёв…",
+            "classify",
         )
 
     def modal(self, context, event):
         return _poll_process(
             self, context, event,
             on_ok="",
-            on_err="Импорт не удался",
-            build=True,
+            on_err="Разбор слоёв не удался",
+            mode="classify",
+        )
+
+    def _stop(self, context, kill: bool) -> None:
+        _stop_process(self, context, kill)
+
+
+class DWGREADER_OT_exclude(Operator):
+    bl_idname = "dwgreader.exclude_layer"
+    bl_label = "Убрать слой"
+    bl_description = "Убрать выбранный слой из благоустройства"
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return not context.window_manager.dwgreader_busy and len(scene.dwgreader_selected) > 0
+
+    def execute(self, context):
+        scene = context.scene
+        index = scene.dwgreader_selected_index
+        _move_layer(scene.dwgreader_selected, scene.dwgreader_ignored, index)
+        scene.dwgreader_selected_index = min(index, len(scene.dwgreader_selected) - 1)
+        return {"FINISHED"}
+
+
+class DWGREADER_OT_include(Operator):
+    bl_idname = "dwgreader.include_layer"
+    bl_label = "Добавить слой"
+    bl_description = "Вернуть пропущенный слой в благоустройство"
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return not context.window_manager.dwgreader_busy and len(scene.dwgreader_ignored) > 0
+
+    def execute(self, context):
+        scene = context.scene
+        index = scene.dwgreader_ignored_index
+        _move_layer(scene.dwgreader_ignored, scene.dwgreader_selected, index)
+        scene.dwgreader_ignored_index = min(index, len(scene.dwgreader_ignored) - 1)
+        return {"FINISHED"}
+
+
+class DWGREADER_OT_generate(Operator):
+    bl_idname = "dwgreader.generate_underlay"
+    bl_label = "Сгенерировать благоустройство"
+    bl_description = "Собрать подложку в сцене из подтверждённых слоёв"
+    bl_options = set()
+
+    _timer = None
+    _proc = None
+    _thread = None
+    _state: dict | None = None
+    _mode = "build"
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        return (
+            not context.window_manager.dwgreader_busy
+            and len(scene.dwgreader_selected) > 0
+            and scene.dwgreader_classified == scene.dwgreader_source
+        )
+
+    def invoke(self, context, event):
+        scene = context.scene
+        source = _drawing_path(context)
+        prefs = _addon_prefs(context)
+        if source is None or prefs is None:
+            self.report({"ERROR"}, "Выберите чертёж и разберите слои")
+            return {"CANCELLED"}
+        groups: dict[str, list[str]] = {}
+        for item in scene.dwgreader_selected:
+            name = item.layer_name.strip()
+            if name:
+                groups.setdefault(item.category, []).append(name)
+        if not groups:
+            self.report({"ERROR"}, "В благоустройстве не осталось слоёв")
+            return {"CANCELLED"}
+        out = _output_dir(prefs, source)
+        groups_path = out / "_confirmed_layers.json"
+        groups_path.write_text(
+            json.dumps({"by_category": groups}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return _launch_pipeline(
+            self, context, ["--groups", str(groups_path)],
+            "Сборка благоустройства…",
+            "build",
+        )
+
+    def modal(self, context, event):
+        return _poll_process(
+            self, context, event,
+            on_ok="",
+            on_err="Генерация не удалась",
+            mode="build",
         )
 
     def _stop(self, context, kill: bool) -> None:
@@ -547,7 +746,7 @@ class DWGREADER_OT_import(Operator):
 
 
 class DWGREADER_PT_panel(Panel):
-    bl_label = "Подложка DWG"
+    bl_label = "Благоустройство"
     bl_idname = "DWGREADER_PT_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -565,9 +764,47 @@ class DWGREADER_PT_panel(Panel):
             layout.label(text="Для DWG не найден ODA File Converter")
             layout.operator("dwgreader.install_oda", icon="IMPORT")
             layout.separator()
-        layout.prop(scene, "dwgreader_source", text="")
-        layout.operator("dwgreader.pick_file", icon="FILEBROWSER")
-        layout.operator("dwgreader.import_underlay", icon="IMPORT")
+
+        step1 = layout.box()
+        step1.label(text="1. Чертёж")
+        step1.prop(scene, "dwgreader_source", text="")
+        step1.operator("dwgreader.pick_file", icon="FILEBROWSER", text="Загрузить DXF")
+        step1.operator("dwgreader.classify_layers", icon="VIEWZOOM")
+
+        reviewed = len(scene.dwgreader_selected) + len(scene.dwgreader_ignored) > 0
+        same_file = scene.dwgreader_classified == scene.dwgreader_source and scene.dwgreader_classified != ""
+        if reviewed and same_file:
+            step2 = layout.box()
+            step2.label(text="2. Слои благоустройства")
+            step2.label(text="Уберите лишние или верните пропущенные")
+            step2.template_list(
+                "DWGREADER_UL_layers", "selected",
+                scene, "dwgreader_selected",
+                scene, "dwgreader_selected_index",
+                rows=6,
+            )
+            step2.operator("dwgreader.exclude_layer", icon="X")
+            step2.separator()
+            step2.label(text="Пропущенные слои")
+            step2.template_list(
+                "DWGREADER_UL_layers", "ignored",
+                scene, "dwgreader_ignored",
+                scene, "dwgreader_ignored_index",
+                rows=4,
+            )
+            step2.operator("dwgreader.include_layer", icon="ADD")
+            step2.separator()
+            step2.label(text="3. Генерация")
+            generate = step2.row()
+            generate.scale_y = 1.3
+            generate.operator(
+                "dwgreader.generate_underlay",
+                text="Сгенерировать благоустройство",
+                icon="PLAY",
+            )
+        elif reviewed:
+            layout.label(text="Слои от другого файла. Разберите чертёж заново")
+
         if scene.dwgreader_status:
             layout.label(text=scene.dwgreader_status)
         if prefs is None:
@@ -602,6 +839,7 @@ def _start_process(operator, context, command, cwd: Path, env: dict, title: str,
         "status": title,
         "tail": [],
         "json": "",
+        "layers": "",
         "empty": "",
         "log": log_path or (cwd / "dwgreader_import.log"),
         "status_locked": False,
@@ -626,6 +864,8 @@ def _start_process(operator, context, command, cwd: Path, env: dict, title: str,
                 del tail[:-40]
                 if line.startswith(MARKER):
                     state["json"] = line[len(MARKER):].strip()
+                elif line.startswith(LAYERS_MARKER):
+                    state["layers"] = line[len(LAYERS_MARKER):].strip()
                 elif line.startswith(EMPTY_MARKER):
                     state["empty"] = line[len(EMPTY_MARKER):].strip()
                 elif line.startswith("STATUS="):
@@ -654,7 +894,7 @@ def _stop_process(operator, context, kill: bool) -> None:
     context.window_manager.dwgreader_busy = False
 
 
-def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool = False):
+def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool = False, mode: str = ""):
     if event.type == "ESC":
         operator._stop(context, kill=True)
         context.scene.dwgreader_status = "Отменено"
@@ -674,13 +914,28 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
     state = operator._state or {}
     operator._stop(context, kill=False)
 
-    if build and state.get("empty"):
+    if mode == "classify":
+        layers_raw = str(state.get("layers") or "")
+        layers_path = Path(layers_raw) if layers_raw else None
+        if proc.returncode != 0 or layers_path is None or not layers_path.is_file():
+            tail = state.get("tail") or []
+            detail = tail[-1] if tail else f"код {proc.returncode}"
+            context.scene.dwgreader_status = f"Ошибка: {detail}"
+            operator.report({"ERROR"}, f"{on_err}. Журнал: {state.get('log')}")
+            return {"CANCELLED"}
+        selected, ignored = _fill_review(context, layers_path)
+        context.scene.dwgreader_status = f"Слои разобраны: {selected} в благоустройстве, {ignored} пропущено"
+        operator.report({"INFO"}, context.scene.dwgreader_status)
+        _redraw(context)
+        return {"FINISHED"}
+
+    if (build or mode == "build") and state.get("empty"):
         message = str(state["empty"])
         context.scene.dwgreader_status = message[:180]
         operator.report({"WARNING"}, message)
         return {"FINISHED"}
 
-    if build:
+    if build or mode == "build":
         if proc.returncode != 0 or not state.get("json"):
             tail = state.get("tail") or []
             detail = tail[-1] if tail else f"код {proc.returncode}"
@@ -698,8 +953,8 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
             context.scene.dwgreader_status = f"Ошибка сборки: {exc}"
             operator.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        context.scene.dwgreader_status = f"Готово: {count} слоёв"
-        operator.report({"INFO"}, f"Подложка собрана, слоёв: {count}")
+        context.scene.dwgreader_status = f"Готово: благоустройство в сцене, слоёв {count}"
+        operator.report({"INFO"}, f"Благоустройство собрано, слоёв: {count}")
         return {"FINISHED"}
 
     if proc.returncode != 0:
@@ -719,10 +974,15 @@ def build_underlay(json_path: Path) -> int:
 
 CLASSES = (
     DWGREADER_AddonPreferences,
+    DWGREADER_LayerItem,
+    DWGREADER_UL_layers,
     DWGREADER_OT_install_deps,
     DWGREADER_OT_install_oda,
     DWGREADER_OT_pick_file,
-    DWGREADER_OT_import,
+    DWGREADER_OT_classify,
+    DWGREADER_OT_exclude,
+    DWGREADER_OT_include,
+    DWGREADER_OT_generate,
     DWGREADER_PT_panel,
 )
 
@@ -737,6 +997,11 @@ def register() -> None:
         default="",
     )
     bpy.types.Scene.dwgreader_status = StringProperty(name="Статус", default="")
+    bpy.types.Scene.dwgreader_classified = StringProperty(name="Разобранный чертёж", default="")
+    bpy.types.Scene.dwgreader_selected = CollectionProperty(type=DWGREADER_LayerItem)
+    bpy.types.Scene.dwgreader_ignored = CollectionProperty(type=DWGREADER_LayerItem)
+    bpy.types.Scene.dwgreader_selected_index = IntProperty(default=0)
+    bpy.types.Scene.dwgreader_ignored_index = IntProperty(default=0)
     bpy.types.WindowManager.dwgreader_busy = BoolProperty(name="Идёт импорт", default=False)
     try:
         addon = bpy.context.preferences.addons.get(__package__ or __name__)
@@ -752,6 +1017,11 @@ def register() -> None:
 
 def unregister() -> None:
     del bpy.types.WindowManager.dwgreader_busy
+    del bpy.types.Scene.dwgreader_ignored_index
+    del bpy.types.Scene.dwgreader_selected_index
+    del bpy.types.Scene.dwgreader_ignored
+    del bpy.types.Scene.dwgreader_selected
+    del bpy.types.Scene.dwgreader_classified
     del bpy.types.Scene.dwgreader_status
     del bpy.types.Scene.dwgreader_source
     for cls in reversed(CLASSES):

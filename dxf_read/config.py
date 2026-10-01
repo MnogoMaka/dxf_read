@@ -173,6 +173,7 @@ ARRANGEMENT_PRIORITY: dict[str, int] = {
     "furniture": 4,
     "vegetation": 5,
     "building": 6,
+    "none": 7,
 }
 
 HATCH_DRAW_COLORS: dict[str, tuple[float, float, float]] = {
@@ -183,10 +184,11 @@ HATCH_DRAW_COLORS: dict[str, tuple[float, float, float]] = {
     "vegetation": (0.22, 0.48, 0.20),
     "fence": (0.35, 0.28, 0.22),
     "site_boundary": (0.20, 0.20, 0.20),
+    "none": (0.72, 0.72, 0.70),
 }
 
 HATCH_DRAW_ORDER = (
-    "green", "pavement", "building", "furniture", "vegetation", "fence", "site_boundary",
+    "green", "pavement", "building", "furniture", "vegetation", "fence", "site_boundary", "none",
 )
 
 # --- промпт и разбор ответа LLM ---

@@ -643,7 +643,7 @@ def _ensure_model_awake(model: str, base_url: str, api_key: str) -> None:
         "stream": False,
     }
     body = json.dumps(probe).encode("utf-8")
-    _status("Проверка модели")
+    _status("Проверка доступности модели...")
     started = time.monotonic()
     deadline = started + _MODEL_WAKE_BUDGET_S
     last_error: Exception | None = None
@@ -1070,20 +1070,40 @@ def extract_classified_hatches(
     document: Drawing,
     by_category: Mapping[str, Sequence[str]],
     include_blocks: bool = True,
+    lock_groups: bool = False,
 ) -> list[HatchPiece]:
     """Собирает заливки слоёв из групп, включая геометрию внутри INSERT.
     Если вставка стоит на выбранном слое (типично здание-блок), берём и те HATCH
     внутри блока, чей собственный слой в группы не входил — иначе заливка пропадает.
     Слой заливки, если он сам классифицирован, важнее слоя вставки.
     SOLID-HATCH на слое 0 внутри контура стен относится к зданию.
+    lock_groups берёт только переданные имена: подсказки по хвосту слоя больше ничего не добавляют.
     """
-    all_names = [str(layer.dxf.name) for layer in document.layers]
-    groups = refine_layer_groups(by_category, all_names)
-    layer_to_category: dict[str, str] = {}
-    for category, names in groups.items():
-        for name in names:
-            layer_to_category[normalize_name(name)] = category
-            layer_to_category.setdefault(layer_leaf(name), category)
+    if lock_groups:
+        groups = {
+            category: list(names)
+            for category, names in by_category.items()
+            if _is_drawable_category(category) and names
+        }
+        layer_to_category = {
+            normalize_name(name): category
+            for category, names in groups.items()
+            for name in names
+        }
+
+        def category_of(layer: str) -> str | None:
+            return layer_to_category.get(normalize_name(layer))
+    else:
+        all_names = [str(layer.dxf.name) for layer in document.layers]
+        groups = refine_layer_groups(by_category, all_names)
+        layer_to_category = {}
+        for category, names in groups.items():
+            for name in names:
+                layer_to_category[normalize_name(name)] = category
+                layer_to_category.setdefault(layer_leaf(name), category)
+
+        def category_of(layer: str) -> str | None:
+            return _category_for_layer(layer, layer_to_category)
     # Чертёж уже в метрах, $INSUNITS не используем.
     scale = 1.0
     pieces: list[HatchPiece] = []
@@ -1117,7 +1137,8 @@ def extract_classified_hatches(
             if chosen:
                 emit(entity, layer, chosen, block_path)
             elif (
-                is_generic_block_layer(layer)
+                not lock_groups
+                and is_generic_block_layer(layer)
                 and not is_junk_layer(layer)
                 and bool(entity.dxf.get("solid_fill", 0))
             ):
@@ -1133,14 +1154,14 @@ def extract_classified_hatches(
 
     for entity in document.modelspace():
         layer = str(entity.dxf.layer)
-        category = _category_for_layer(layer, layer_to_category)
+        category = category_of(layer)
         consider(entity, layer, category, ())
 
         if not include_blocks or not isinstance(entity, Insert):
             continue
 
         for child, child_layer, block_path in _iter_block_content(entity):
-            chosen = _category_for_layer(child_layer, layer_to_category)
+            chosen = category_of(child_layer)
             if (
                 chosen is None
                 and category
@@ -1829,16 +1850,51 @@ def _result_dir() -> Path:
     return path
 
 
+def _is_drawable_category(category: str) -> bool:
+    return category in TARGET_OBJECT_TYPES or category == "none"
+
+
+def _confirmed_groups(by_category: Mapping[str, Sequence[str]]) -> dict[str, list[str]]:
+    """Список слоёв, который подтвердил пользователь. Подсказки имён его не дополняют."""
+    groups: dict[str, list[str]] = {}
+    for category, names in by_category.items():
+        if not _is_drawable_category(category):
+            continue
+        clean = sorted({str(name).strip() for name in names if str(name).strip()})
+        if clean:
+            groups[category] = clean
+    return groups
+
+
+def _write_layers_json(
+    path: Path,
+    selection: LayerSelection,
+    groups: Mapping[str, Sequence[str]],
+    layers: Sequence[str],
+    source: Path,
+) -> Path:
+    kept = {name for names in groups.values() for name in names}
+    selection.by_category = {key: list(names) for key, names in groups.items()}
+    selection.rejected = sorted(set(layers) - kept)
+    payload = selection.to_dict()
+    payload["dxf"] = str(source)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def run_pipeline(
     path: str | Path,
     *,
     oda_exe: str | Path | None = None,
     classify: bool = True,
     by_category: Mapping[str, Sequence[str]] | None = None, # пример by_category={"building": ["ГП_Здания", "ГП_Крыльца"],"pavement": ["ГП_Тротуар"],"green": ["ГП_Газон"],}
+    lock_groups: bool = False,
+    classify_only: bool = False,
     draw_preview: bool = False,
     run_blender: bool = True,
 ) -> dict[str, Any]:
-    """Полный пайплайн"""
+    """Полный пайплайн. classify_only останавливается после списка слоёв."""
     cfg = config.settings()
     oda = oda_exe if oda_exe is not None else (cfg.oda_converter or None)
     out = _result_dir()
@@ -1848,7 +1904,11 @@ def run_pipeline(
     print(f"Слоёв в файле: {len(layers)}")
 
     selection: LayerSelection | None = None
-    if by_category is not None:
+    layers_json: Path | None = None
+    if by_category is not None and lock_groups:
+        groups = _confirmed_groups(by_category)
+        _status("Генерация по подтверждённым слоям")
+    elif by_category is not None:
         groups = refine_layer_groups(by_category, layers)
     elif classify:
         llm_down = False
@@ -1860,20 +1920,26 @@ def run_pipeline(
             print(f"Модель недоступна, слои отбираются по именам: {error}")
             selection = LayerSelection(model=cfg.llm_model)
         groups = refine_layer_groups(selection.by_category, layers)
-        selection.by_category = groups
         if llm_down:
-            kept = {name for names in groups.values() for name in names}
-            selection.rejected = sorted(set(layers) - kept)
+            print("Слои отобраны по именам, без ответа модели.")
         print("Отобрано по категориям:")
         for category, names in groups.items():
             print(f"  {category}: {names}")
         if selection.invented:
             print("Модель придумала несуществующие имена:", selection.invented)
-        layers_json = out / f"{source.stem}_layers.json"
-        layers_json.parent.mkdir(parents=True, exist_ok=True)
-        with layers_json.open("w", encoding="utf-8") as file:
-            json.dump(selection.to_dict(), file, ensure_ascii=False, indent=2)
+        layers_json = _write_layers_json(
+            out / f"{source.stem}_layers.json", selection, groups, layers, source,
+        )
         print(f"Классификация: {layers_json}")
+        if classify_only:
+            _status("Слои разобраны. Проверьте список и запустите генерацию")
+            return {
+                "dxf": str(source),
+                "layers": len(layers),
+                "by_category": groups,
+                "layers_json": str(layers_json),
+                "underlay": {"layers": 0, "json": None, "blend": None},
+            }
     else:
         raise ValueError("Нужна классификация слоёв или готовый by_category.")
     print("Типы после правки имён слоёв:")
@@ -1891,11 +1957,13 @@ def run_pipeline(
         json_path=str(out / f"{source.stem}_underlay.json"),
         blend_path=str(out / f"{source.stem}_underlay.blend"),
         run_blender=run_blender,
+        lock_groups=lock_groups and by_category is not None,
     )
     return {
         "dxf": str(source),
         "layers": len(layers),
         "by_category": groups,
+        "layers_json": str(layers_json) if layers_json else "",
         "underlay": underlay,
     }
 
@@ -1908,6 +1976,7 @@ def export_blender_underlay(
     json_path: str | Path | None = None,
     blend_path: str | Path | None = None,
     run_blender: bool = True,
+    lock_groups: bool = False,
 ) -> dict[str, Any]:
     """
     Каждый слой AutoCAD становится отдельной коллекцией. Без выдавливания:
@@ -1918,7 +1987,9 @@ def export_blender_underlay(
     json_output = Path(json_path or OUTPUT_DIR / f"{source.stem}_underlay.json")
     blend_output = Path(blend_path or OUTPUT_DIR / f"{source.stem}_underlay.blend")
 
-    pieces = extract_classified_hatches(document, by_category, include_blocks=include_blocks)
+    pieces = extract_classified_hatches(
+        document, by_category, include_blocks=include_blocks, lock_groups=lock_groups,
+    )
     from_blocks = sum(1 for piece in pieces if piece.from_block)
     print(
         f"HATCH для подложки: {len(pieces)} "

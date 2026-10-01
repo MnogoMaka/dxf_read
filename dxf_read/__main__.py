@@ -30,13 +30,36 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="JSON с PipelineSettings: радиус, пороги, модель, ODA",
     )
+    parser.add_argument(
+        "--classify-only",
+        action="store_true",
+        help="Только разобрать слои и записать JSON, без подложки",
+    )
+    parser.add_argument(
+        "--groups",
+        default=None,
+        help="JSON с подтверждённым by_category. Модель повторно не вызывается",
+    )
     parsed = parser.parse_args(sys.argv[1:] if argv is None else argv)
     source = Path(parsed.source) if parsed.source else resolve_path(DEFAULT_SOURCE)
+    confirmed = None
+    if parsed.groups:
+        payload = json.loads(Path(parsed.groups).read_text(encoding="utf-8"))
+        confirmed = payload.get("by_category", payload)
+    pipeline_kwargs = {
+        "run_blender": not parsed.no_blender and not parsed.classify_only,
+        "classify_only": parsed.classify_only,
+        "by_category": confirmed,
+        "lock_groups": confirmed is not None,
+    }
     if parsed.settings:
         with use_settings(_settings_from_file(Path(parsed.settings))):
-            result = run_pipeline(source, run_blender=not parsed.no_blender)
+            result = run_pipeline(source, **pipeline_kwargs)
     else:
-        result = run_pipeline(source, run_blender=not parsed.no_blender)
+        result = run_pipeline(source, **pipeline_kwargs)
+    if parsed.classify_only:
+        print(f"LAYERS_JSON={result.get('layers_json') or ''}")
+        return
     json_path = result["underlay"].get("json")
     print("Готово:")
     print(f"  DXF: {result['dxf']}")
