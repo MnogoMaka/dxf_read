@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import difflib
+import http.client
 import json
 import logging
 import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
+import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -358,6 +363,7 @@ def select_target_layers(
     selection = LayerSelection(model=model)
     allowed = {normalize_name(name): name for name in layer_names}
     used: set[str] = set()
+    _ensure_model_awake(model, base_url, api_key)
 
     for batch in _chunks(list(layer_names), batch_size):
         reply = _request_chat_completion(
@@ -491,6 +497,183 @@ def _parse_selection(reply: str) -> dict[str, list[str]]:
     return result
 
 
+# Спящий воркер роутера молчит 2–5 минут и поднимается от запроса, как модель на Hugging Face.
+_MODEL_WAKE_BUDGET_S = 360.0
+_MODEL_PROBE_TIMEOUT_S = 25.0
+_CONNECTION_ERRORS = (
+    http.client.RemoteDisconnected, ConnectionError, TimeoutError,
+    urllib.error.URLError, OSError,
+)
+
+
+def _status(text: str) -> None:
+    """Строка для панели Blender. Остальной журнал туда не попадает."""
+    print(f"STATUS={text}", flush=True)
+
+
+def _llm_headers(api_key: str) -> dict[str, str]:
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "DWGREADER/1.0",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _llm_ssl_context() -> ssl.SSLContext:
+    """TLS 1.2. OpenSSL 3.5 в Blender 5.2 на TLS 1.3 рвёт ответ роутера."""
+    context = ssl.create_default_context()
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
+class _IPv4HTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS по IPv4. На macOS IPv6 до роутера часто рвётся без ответа."""
+
+    def connect(self) -> None:
+        port = self.port or 443
+        infos = socket.getaddrinfo(self.host, port, socket.AF_INET, socket.SOCK_STREAM)
+        last_error: OSError | None = None
+        for family, socktype, proto, _canon, address in infos:
+            sock = socket.socket(family, socktype, proto)
+            if self.timeout is not None:
+                sock.settimeout(self.timeout)
+            try:
+                sock.connect(address)
+            except OSError as error:
+                sock.close()
+                last_error = error
+                continue
+            context = self._context or _llm_ssl_context()
+            self.sock = context.wrap_socket(sock, server_hostname=self.host)
+            return
+        raise last_error or OSError(f"Нет IPv4-адреса для {self.host}")
+
+
+class _RouterHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self) -> None:
+        super().__init__(context=_llm_ssl_context())
+
+    def https_open(self, req):
+        # Python 3.12 передаёт только context, 3.11 ещё и check_hostname.
+        kwargs: dict[str, Any] = {"context": self._context}
+        if hasattr(self, "_check_hostname"):
+            kwargs["check_hostname"] = self._check_hostname
+        return self.do_open(_IPv4HTTPSConnection, req, **kwargs)
+
+
+def _open_json(url: str, body: bytes, headers: dict[str, str], timeout: float):
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    opener = urllib.request.build_opener(_RouterHTTPSHandler())
+    return opener.open(request, timeout=timeout)
+
+
+def _decode_curl_body(url: str, raw: bytes) -> dict[str, Any]:
+    payload, _, status_raw = raw.rpartition(b"\n")
+    try:
+        status = int(status_raw.decode("ascii").strip())
+    except ValueError:
+        payload = raw
+        status = 200
+    if status >= 400:
+        raise urllib.error.HTTPError(url, status, payload.decode("utf-8", "replace")[:300], hdrs=None, fp=None)
+    return json.loads(payload.decode("utf-8"))
+
+
+def _post_json_curl(url: str, body: bytes, headers: dict[str, str], timeout: float) -> dict[str, Any]:
+    """Запасной POST через curl. Обходит OpenSSL, встроенный в Blender."""
+    curl = shutil.which("curl")
+    if not curl:
+        raise FileNotFoundError("curl")
+    command = [
+        curl, "-4", "--http1.1", "--tls-max", "1.2", "-sS",
+        "--max-time", str(max(1, int(timeout))),
+        "-X", "POST", url, "--data-binary", "@-",
+        "-w", "\n%{http_code}",
+    ]
+    for key, value in headers.items():
+        command.extend(["-H", f"{key}: {value}"])
+    completed = subprocess.run(
+        command, input=body, capture_output=True, timeout=timeout + 5, check=False,
+    )
+    raw = completed.stdout
+    if raw.lstrip().startswith(b"{") or raw.lstrip().startswith(b"["):
+        try:
+            return _decode_curl_body(url, raw)
+        except (json.JSONDecodeError, urllib.error.HTTPError):
+            if completed.returncode == 0:
+                raise
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()[:400]
+        raise ConnectionError(detail or f"curl завершился с кодом {completed.returncode}")
+    return _decode_curl_body(url, raw)
+
+
+def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float) -> dict[str, Any]:
+    """Один POST JSON по IPv4 и TLS 1.2. При обрыве соединения пробует curl."""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    try:
+        response = _open_json(url, body, headers, timeout)
+        with response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        raise
+    except _CONNECTION_ERRORS as error:
+        try:
+            return _post_json_curl(url, body, headers, timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as curl_error:
+            raise ConnectionError(
+                f"Не удалось обратиться к модели по адресу {url}: {error}\n"
+                "Проверьте адрес LLM_BASE_URL и доступность сервера."
+            ) from curl_error
+
+
+def _ensure_model_awake(model: str, base_url: str, api_key: str) -> None:
+    """Ждёт, пока спящая модель поднимется. Короткий запрос будит воркер, панель показывает время."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = _llm_headers(api_key)
+    probe = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ok"}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "stream": False,
+    }
+    body = json.dumps(probe).encode("utf-8")
+    _status("Проверка модели")
+    started = time.monotonic()
+    deadline = started + _MODEL_WAKE_BUDGET_S
+    last_error: Exception | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            response = _open_json(url, body, headers, min(_MODEL_PROBE_TIMEOUT_S, remaining))
+            with response:
+                response.read()
+        except urllib.error.HTTPError:
+            _status("Модель запущена. Классификация слоёв")
+            return
+        except _CONNECTION_ERRORS as error:
+            last_error = error
+        else:
+            _status("Модель запущена. Классификация слоёв")
+            return
+        if time.monotonic() >= deadline:
+            break
+        elapsed = int(time.monotonic() - started)
+        minutes, seconds = divmod(elapsed, 60)
+        _status(f"Модель спит, ждём запуска: {minutes}:{seconds:02d}. Обычно 2–5 мин")
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+    raise ConnectionError(
+        f"Модель не поднялась за 6 минут: {last_error}. Обычно запуск занимает 2–5 минут."
+    )
+
+
 def _request_chat_completion(
     system: str, user: str, model: str,
     base_url: str | None = None, api_key: str | None = None, timeout: float | None = None,
@@ -508,38 +691,26 @@ def _request_chat_completion(
         "stream": False,
         "response_format": {"type": "json_object"},
     }
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    request = urllib.request.Request(
-        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers, method="POST",
-    )
+    headers = _llm_headers(api_key)
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        data = _post_json(url, payload, headers, timeout)
     except urllib.error.HTTPError as error:
         # Старые серверы не принимают response_format — повторяем без него.
         if error.code in {400, 422} and "response_format" in payload:
             payload.pop("response_format", None)
-            request = urllib.request.Request(
-                url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers=headers, method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+            try:
+                data = _post_json(url, payload, headers, timeout)
+            except urllib.error.HTTPError as again:
+                raise ConnectionError(
+                    f"Не удалось обратиться к модели по адресу {url}: {again}\n"
+                    "Проверьте адрес LLM_BASE_URL и имя модели."
+                ) from again
         else:
             raise ConnectionError(
                 f"Не удалось обратиться к модели по адресу {url}: {error}\n"
-                "Проверьте, что сервер запущен, и задайте LLM_BASE_URL и LLM_MODEL."
+                "Проверьте адрес LLM_BASE_URL и имя модели."
             ) from error
-    except urllib.error.URLError as error:
-        raise ConnectionError(
-            f"Не удалось обратиться к модели по адресу {url}: {error}\n"
-            "Проверьте, что сервер запущен, и задайте LLM_BASE_URL и LLM_MODEL."
-        ) from error
 
     choice = data["choices"][0]
     text = _message_text(choice.get("message"))
@@ -1215,7 +1386,6 @@ def _iter_shapely_polygons(geometry: BaseGeometry) -> Iterator[ShapelyPolygon]:
 
 def _cluster_hatch_pieces(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
     """Оставляет одно пятно площадки.
-
     В DWG часто два мира: участок и ситуационный план / легенда в сотнях
     метров в стороне. Берём связную группу в радиусе SITE_CLUSTER_RADIUS_M
     с наибольшей площадью дорог, газонов и зданий — не самое большое
@@ -1320,9 +1490,7 @@ def _polygon_patch(polygon: ShapelyPolygon, color: tuple[float, float, float], m
 def arrange_hatch_faces_by_layer(
     pieces: Sequence[HatchPiece],
 ) -> list[tuple[BaseGeometry, str, str]]:
-    """Arrangement, как в функции 4, но грань помнит слой AutoCAD.
-
-    Нужно, чтобы в Blender каждый DXF-слой стал отдельной коллекцией.
+    """Arrangement  но грань помнит слой AutoCAD.
     """
     clustered = _cluster_hatch_pieces(pieces)
     labeled: list[tuple[ShapelyPolygon, str, str]] = []
@@ -1497,8 +1665,28 @@ def _find_blender() -> Path | None:
     return max(candidates, default=None)
 
 
+def _oda_search_roots() -> list[Path]:
+    roots = list(ODA_SEARCH_ROOTS)
+    if sys.platform == "darwin":
+        roots.extend((Path("/Applications"), Path.home() / "Applications"))
+    elif sys.platform.startswith("linux"):
+        roots.extend((Path("/usr/bin"), Path("/usr/local/bin"), Path.home()))
+    return roots
+
+
+def _iter_oda_binaries(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    found: list[Path] = []
+    found.extend(root.glob("ODAFileConverter*/ODAFileConverter.exe"))
+    found.extend(root.glob("ODAFileConverter.exe"))
+    found.extend(root.glob("ODAFileConverter*.app/Contents/MacOS/ODAFileConverter"))
+    found.extend(root.glob("ODAFileConverter"))
+    return [path for path in found if path.is_file()]
+
+
 def find_oda_converter(explicit: str | Path | None = None) -> Path:
-    """Ищет ODAFileConverter.exe (DWG → DXF)."""
+    """Ищет ODA File Converter: .exe в Windows, .app на macOS."""
     if explicit:
         path = Path(explicit)
         if not path.is_file():
@@ -1507,13 +1695,11 @@ def find_oda_converter(explicit: str | Path | None = None) -> Path:
     if ODA_CONVERTER and Path(ODA_CONVERTER).is_file():
         return Path(ODA_CONVERTER)
     candidates: list[Path] = []
-    for root in ODA_SEARCH_ROOTS:
-        if root.is_dir():
-            candidates.extend(root.glob("ODAFileConverter*/ODAFileConverter.exe"))
-            candidates.extend(root.glob("ODAFileConverter.exe"))
+    for root in _oda_search_roots():
+        candidates.extend(_iter_oda_binaries(root))
     if not candidates:
         raise FileNotFoundError(
-            "Не найден ODAFileConverter.exe. Установите ODA File Converter "
+            "Не найден ODA File Converter. Установите его "
             "или задайте ODA_CONVERTER / аргумент oda_exe."
         )
     return max(candidates, key=lambda item: item.stat().st_mtime)
@@ -1591,6 +1777,7 @@ def convert_dwg_to_dxf(
             str(converter), str(incoming), str(outgoing),
             DXF_VERSION, "DXF", "0", "1", "*.DWG",
         ]
+        _status("Конвертация DWG в DXF")
         print("ODA:", converter)
         result = _run_hidden(command)
         if result.returncode != 0:
@@ -1629,6 +1816,7 @@ def open_drawing(
         dxf_path = convert_dwg_to_dxf(source, dxf_dir, oda_exe)
     else:
         raise ValueError(f"Нужен .dwg или .dxf, получено: {source.suffix}")
+    _status("Чтение чертежа")
     document = ezdxf.readfile(str(dxf_path))
     print(f"Чертёж прочитан: {dxf_path}")
     return document
@@ -1663,9 +1851,19 @@ def run_pipeline(
     if by_category is not None:
         groups = refine_layer_groups(by_category, layers)
     elif classify:
-        selection = select_target_layers(layers)
+        llm_down = False
+        try:
+            selection = select_target_layers(layers)
+        except ConnectionError as error:
+            llm_down = True
+            _status("Модель не поднялась. Отбор слоёв по именам")
+            print(f"Модель недоступна, слои отбираются по именам: {error}")
+            selection = LayerSelection(model=cfg.llm_model)
         groups = refine_layer_groups(selection.by_category, layers)
         selection.by_category = groups
+        if llm_down:
+            kept = {name for names in groups.values() for name in names}
+            selection.rejected = sorted(set(layers) - kept)
         print("Отобрано по категориям:")
         for category, names in groups.items():
             print(f"  {category}: {names}")
@@ -1715,6 +1913,7 @@ def export_blender_underlay(
     Каждый слой AutoCAD становится отдельной коллекцией. Без выдавливания:
     HATCH через earcut режется на треугольники в Z=0.
     """
+    _status("Сборка подложки")
     source = _drawing_path(document)
     json_output = Path(json_path or OUTPUT_DIR / f"{source.stem}_underlay.json")
     blend_output = Path(blend_path or OUTPUT_DIR / f"{source.stem}_underlay.blend")

@@ -42,8 +42,8 @@ def resolve_path(value: str | Path) -> Path:
 
 
 #сервисы (.env)
-LLM_MODEL = env("LLM_MODEL", "google/gemma-4-e4b")
-LLM_BASE_URL = env("LLM_BASE_URL", "http://127.0.0.1:1234/v1")
+LLM_MODEL = env("LLM_MODEL", "qwen/qwen3-vl-30b-a3b-instruct")
+LLM_BASE_URL = env("LLM_BASE_URL", "https://llm-router.cxm.dev/v1/")
 LLM_API_KEY = env("LLM_API_KEY", "")
 DEFAULT_SOURCE = env("DEFAULT_SOURCE", "input_dwg/ПЗУ Касимовская 33 (1).dwg")
 BLENDER = env("BLENDER")

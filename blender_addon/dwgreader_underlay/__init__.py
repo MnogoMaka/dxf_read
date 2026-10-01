@@ -35,6 +35,7 @@ bl_info = {
 }
 
 MARKER = "UNDERLAY_JSON="
+EMPTY_MARKER = "UNDERLAY_EMPTY="
 PIP_PACKAGES = ("ezdxf", "shapely", "numpy", "mapbox-earcut")
 WINGET_ODA_ID = "ODA.ODAFileConverter"
 JUNK_TOKENS = (
@@ -70,33 +71,72 @@ def _engine_dir() -> Path:
     raise FileNotFoundError("В аддоне нет пакета dxf_read")
 
 
+def _python_folders() -> list[Path]:
+    folders = [Path(sys.prefix) / "bin", Path(sys.prefix)]
+    binary = Path(getattr(bpy.app, "binary_path", "") or "")
+    if not binary:
+        return folders
+    # macOS: Blender.app/Contents/MacOS/Blender → Contents/Resources/4.x/python/bin
+    resources = binary.parent.parent / "Resources"
+    if resources.is_dir():
+        folders.extend(resources.glob("*/python/bin"))
+    folders.extend(binary.parent.glob("*/python/bin"))
+    return folders
+
+
+def _is_python_binary(path: Path) -> bool:
+    name = path.name.lower()
+    if not path.is_file() or "config" in name:
+        return False
+    return name.startswith("python") and not name.endswith((".dll", ".dylib", ".so"))
+
+
 def _blender_python() -> Path:
-    prefix = Path(sys.prefix)
-    for folder in (prefix / "bin", prefix):
-        for name in ("python.exe", "python3.exe", "python3", "python"):
-            candidate = folder / name
-            if candidate.is_file():
-                return candidate
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for folder in _python_folders():
+        if not folder.is_dir():
+            continue
+        for candidate in folder.iterdir():
+            resolved = candidate.resolve()
+            if resolved in seen or not _is_python_binary(candidate):
+                continue
+            seen.add(resolved)
+            found.append(candidate)
+    found.sort(key=lambda path: (not path.name.lower().startswith("python3."), path.name.lower()))
+    if found:
+        return found[0]
     raise FileNotFoundError(
         "Не найден Python рядом с Blender. Библиотеки ставятся его pip."
     )
 
 
-def _oda_installed(prefs=None) -> bool:
-    """Есть ли уже ODAFileConverter.exe: путь из настроек или стандартные папки."""
-    if prefs is not None and prefs.oda_converter.strip():
-        return Path(bpy.path.abspath(prefs.oda_converter.strip())).is_file()
-    roots = (
+def _oda_roots() -> tuple[Path, ...]:
+    if sys.platform == "darwin":
+        return (Path("/Applications"), Path.home() / "Applications")
+    if sys.platform.startswith("linux"):
+        return (Path("/usr/bin"), Path("/usr/local/bin"), Path.home())
+    return (
         Path(r"C:\Program Files\ODA"),
         Path(r"C:\Program Files (x86)\ODA"),
         Path(r"C:\Program Files"),
     )
-    for root in roots:
+
+
+def _oda_installed(prefs=None) -> bool:
+    """Есть ли ODA File Converter: путь из настроек или стандартные папки системы."""
+    if prefs is not None and prefs.oda_converter.strip():
+        return Path(bpy.path.abspath(prefs.oda_converter.strip())).is_file()
+    for root in _oda_roots():
         if not root.is_dir():
             continue
-        if any(root.glob("ODAFileConverter*/ODAFileConverter.exe")):
-            return True
-        if any(root.glob("ODAFileConverter.exe")):
+        patterns = (
+            "ODAFileConverter*/ODAFileConverter.exe",
+            "ODAFileConverter.exe",
+            "ODAFileConverter*.app/Contents/MacOS/ODAFileConverter",
+            "ODAFileConverter",
+        )
+        if any(path.is_file() for pattern in patterns for path in root.glob(pattern)):
             return True
     return False
 
@@ -194,6 +234,7 @@ def _python_env() -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(
         part for part in (str(_vendor_dir()), str(_engine_dir()), env.get("PYTHONPATH", "")) if part
     )
@@ -214,7 +255,7 @@ class DWGREADER_AddonPreferences(AddonPreferences):
 
     oda_converter: StringProperty(
         name="ODA File Converter",
-        description="ODAFileConverter.exe. Пусто — искать в Program Files. Нужен только для DWG",
+        description="Файл ODA File Converter. Пусто — искать в Program Files или /Applications. Нужен только для DWG",
         subtype="FILE_PATH",
         default="",
     )
@@ -227,11 +268,11 @@ class DWGREADER_AddonPreferences(AddonPreferences):
     llm_model: StringProperty(
         name="Модель",
         description="Имя модели на OpenAI-совместимом сервере",
-        default="google/gemma-4-e4b",
+        default="qwen/qwen3-vl-30b-a3b-instruct",
     )
     llm_base_url: StringProperty(
         name="Адрес модели",
-        default="http://127.0.0.1:1234/v1",
+        default="https://llm-router.cxm.dev/v1/",
     )
     llm_api_key: StringProperty(
         name="Ключ API",
@@ -368,7 +409,7 @@ class DWGREADER_OT_install_deps(Operator):
 class DWGREADER_OT_install_oda(Operator):
     bl_idname = "dwgreader.install_oda"
     bl_label = "Установить ODA File Converter"
-    bl_description = "Ставит ODA File Converter через winget, если его ещё нет в системе"
+    bl_description = "Ставит ODA File Converter, если его ещё нет: winget в Windows, страница загрузки на Mac"
 
     _timer = None
     _proc = None
@@ -380,15 +421,23 @@ class DWGREADER_OT_install_oda(Operator):
         return not context.window_manager.dwgreader_busy
 
     def invoke(self, context, event):
+        if _oda_installed(_addon_prefs(context)):
+            self.report({"INFO"}, "ODA File Converter уже установлен")
+            return {"CANCELLED"}
+        if sys.platform == "darwin":
+            import webbrowser
+            webbrowser.open("https://www.opendesign.com/guestfiles/oda_file_converter")
+            self.report(
+                {"INFO"},
+                "Открыта загрузка ODA. Поставьте приложение в /Applications и запустите импорт снова",
+            )
+            return {"FINISHED"}
         if os.name != "nt":
-            self.report({"ERROR"}, "Установка через winget доступна только в Windows")
+            self.report({"ERROR"}, "Скачайте ODA File Converter с сайта Open Design Alliance и укажите путь в настройках")
             return {"CANCELLED"}
         winget = shutil.which("winget")
         if not winget:
             self.report({"ERROR"}, "winget не найден. Нужны Windows 10 или 11 с App Installer")
-            return {"CANCELLED"}
-        if _oda_installed(_addon_prefs(context)):
-            self.report({"INFO"}, "ODA File Converter уже установлен")
             return {"CANCELLED"}
         command = [
             winget, "install", "--id", WINGET_ODA_ID, "-e",
@@ -549,7 +598,14 @@ def _start_process(operator, context, command, cwd: Path, env: dict, title: str,
         operator.report({"ERROR"}, str(exc))
         return {"CANCELLED"}
 
-    state = {"status": title, "tail": [], "json": "", "log": log_path or (cwd / "dwgreader_import.log")}
+    state = {
+        "status": title,
+        "tail": [],
+        "json": "",
+        "empty": "",
+        "log": log_path or (cwd / "dwgreader_import.log"),
+        "status_locked": False,
+    }
     operator._state = state
     operator._proc = proc
     context.window_manager.dwgreader_busy = True
@@ -570,7 +626,12 @@ def _start_process(operator, context, command, cwd: Path, env: dict, title: str,
                 del tail[:-40]
                 if line.startswith(MARKER):
                     state["json"] = line[len(MARKER):].strip()
-                elif line:
+                elif line.startswith(EMPTY_MARKER):
+                    state["empty"] = line[len(EMPTY_MARKER):].strip()
+                elif line.startswith("STATUS="):
+                    state["status"] = line[len("STATUS="):].strip()[:180]
+                    state["status_locked"] = True
+                elif line and not state["status_locked"]:
                     state["status"] = line[:180]
         finally:
             log_file.close()
@@ -612,6 +673,12 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
         thread.join(timeout=2)
     state = operator._state or {}
     operator._stop(context, kill=False)
+
+    if build and state.get("empty"):
+        message = str(state["empty"])
+        context.scene.dwgreader_status = message[:180]
+        operator.report({"WARNING"}, message)
+        return {"FINISHED"}
 
     if build:
         if proc.returncode != 0 or not state.get("json"):
@@ -671,6 +738,16 @@ def register() -> None:
     )
     bpy.types.Scene.dwgreader_status = StringProperty(name="Статус", default="")
     bpy.types.WindowManager.dwgreader_busy = BoolProperty(name="Идёт импорт", default=False)
+    try:
+        addon = bpy.context.preferences.addons.get(__package__ or __name__)
+    except Exception:
+        addon = None
+    if addon is not None:
+        prefs = addon.preferences
+        if prefs.llm_model in {"", "google/gemma-4-e4b"}:
+            prefs.llm_model = "qwen/qwen3-vl-30b-a3b-instruct"
+        if prefs.llm_base_url in {"", "http://127.0.0.1:1234/v1"}:
+            prefs.llm_base_url = "https://llm-router.cxm.dev/v1/"
 
 
 def unregister() -> None:

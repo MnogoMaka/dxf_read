@@ -43,7 +43,15 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  JSON: {json_path}")
     print(f"  BLEND: {result['underlay'].get('blend')}")
     if parsed.no_blender and not json_path:
-        raise SystemExit("Подложка не собрана: в выбранных слоях нет заливок.")
+        groups = result.get("by_category") or {}
+        listed = [
+            f"{category}: {', '.join(names)}"
+            for category, names in groups.items()
+            if names
+        ]
+        detail = "; ".join(listed) if listed else "ни один слой не отнесён к площадке"
+        print(f"UNDERLAY_EMPTY=В выбранных слоях нет заливок. Отобрано: {detail}")
+        return
     if json_path:
         print(f"UNDERLAY_JSON={json_path}")
 
