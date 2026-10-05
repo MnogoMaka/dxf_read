@@ -21,13 +21,14 @@ import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 
+from . import placement
 from .build_scene import build
 
 
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 2, 0),
+    "version": (1, 3, 7),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF → проверка слоёв → благоустройство в сцене",
@@ -48,6 +49,11 @@ LAYER_CATEGORIES = (
     ("fence", "Ограждения", "Заборы и ограды"),
 )
 CATEGORY_IDS = {item[0] for item in LAYER_CATEGORIES}
+GEOMETRY_SOURCES = (
+    ("fills", "Заливки", "Полигоны из штриховок и заливок"),
+    ("curves", "Контуры", "Полигоны из полилиний и других контуров"),
+    ("both", "Заливки и контуры", "Оба источника сразу"),
+)
 PIP_PACKAGES = ("ezdxf", "shapely", "numpy", "mapbox-earcut")
 WINGET_ODA_ID = "ODA.ODAFileConverter"
 JUNK_TOKENS = (
@@ -230,6 +236,7 @@ def _settings_payload(prefs, source: Path) -> dict:
         "generic_fill_associate_m": float(prefs.generic_fill_associate_m),
         "min_arrangement_area_m2": float(prefs.min_arrangement_area_m2),
         "flattening_distance_m": float(prefs.flattening_distance_m),
+        "cut_vegetation": bool(prefs.cut_vegetation),
         "batch_size": int(prefs.batch_size),
         "llm_timeout": float(prefs.llm_timeout),
         "fill_polyline_tokens": _tokens(prefs.fill_polyline_tokens),
@@ -312,6 +319,14 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         min=1.0,
         soft_max=400000.0,
     )
+    layer_part_gap_m: FloatProperty(
+        name="Зазор частей слоя, м",
+        description="Полигоны одного слоя дальше этого зазора становятся отдельными объектами. Ближе остаются вместе. Учитывается при следующей сборке подложки",
+        default=10.0,
+        min=0.0,
+        soft_max=500.0,
+        precision=1,
+    )
     generic_fill_associate_m: FloatProperty(
         name="Привязка заливки слоя 0, м",
         description="SOLID на слое 0 относится к зданию, если центр внутри контура и не дальше этого допуска",
@@ -335,6 +350,11 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         soft_max=1.0,
         precision=3,
     )
+    cut_vegetation: BoolProperty(
+        name="Вырезать деревья и кусты",
+        description="Контуры деревьев и кустов прорезают газоны и покрытия. Выключено — площадки остаются целыми, зелень лежит своим слоем",
+        default=False,
+    )
     fill_polyline_tokens: StringProperty(
         name="Полилинии-заливки",
         description="Замкнутая полилиния становится пятном, если в имени слоя есть один из фрагментов. Через запятую",
@@ -345,6 +365,12 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         description="Слой отбрасывается, если в хвосте имени есть один из фрагментов. Через запятую",
         default=JUNK_TOKENS,
     )
+    library_dir: StringProperty(
+        name="Библиотека моделей",
+        description="Папка с catalog.json и отдельным GLB на каждую модель",
+        subtype="DIR_PATH",
+        default="",
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -353,6 +379,7 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         if not _oda_installed(self):
             layout.operator("dwgreader.install_oda", icon="IMPORT")
         layout.prop(self, "output_dir")
+        layout.prop(self, "library_dir")
 
         services = layout.box()
         services.label(text="Классификация слоёв")
@@ -374,9 +401,11 @@ class DWGREADER_AddonPreferences(AddonPreferences):
 
 def _draw_geometry(layout, prefs) -> None:
     layout.prop(prefs, "site_cluster_radius_m")
+    layout.prop(prefs, "layer_part_gap_m")
     layout.prop(prefs, "generic_fill_associate_m")
     layout.prop(prefs, "min_arrangement_area_m2")
     layout.prop(prefs, "flattening_distance_m")
+    layout.prop(prefs, "cut_vegetation")
 
 
 class DWGREADER_OT_install_deps(Operator):
@@ -728,7 +757,7 @@ class DWGREADER_OT_generate(Operator):
             encoding="utf-8",
         )
         return _launch_pipeline(
-            self, context, ["--groups", str(groups_path)],
+            self, context, ["--groups", str(groups_path), "--geometry", scene.dwgreader_geometry],
             "Сборка благоустройства…",
             "build",
         )
@@ -795,6 +824,8 @@ class DWGREADER_PT_panel(Panel):
             step2.operator("dwgreader.include_layer", icon="ADD")
             step2.separator()
             step2.label(text="3. Генерация")
+            step2.label(text="Из чего строить полигоны")
+            step2.prop(scene, "dwgreader_geometry", expand=True)
             generate = step2.row()
             generate.scale_y = 1.3
             generate.operator(
@@ -804,6 +835,8 @@ class DWGREADER_PT_panel(Panel):
             )
         elif reviewed:
             layout.label(text="Слои от другого файла. Разберите чертёж заново")
+
+        placement.draw_panel(layout, context)
 
         if scene.dwgreader_status:
             layout.label(text=scene.dwgreader_status)
@@ -892,6 +925,11 @@ def _stop_process(operator, context, kill: bool) -> None:
         proc.kill()
     operator._proc = None
     context.window_manager.dwgreader_busy = False
+    for window in context.window_manager.windows:
+        try:
+            window.cursor_modal_restore()
+        except Exception:
+            pass
 
 
 def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool = False, mode: str = ""):
@@ -969,7 +1007,9 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
 
 
 def build_underlay(json_path: Path) -> int:
-    return build(json_path)
+    prefs = _addon_prefs(bpy.context)
+    gap = float(getattr(prefs, "layer_part_gap_m", 10.0) or 10.0) if prefs is not None else 10.0
+    return build(json_path, gap)
 
 
 CLASSES = (
@@ -987,9 +1027,42 @@ CLASSES = (
 )
 
 
+_LAYER_PENDING = False
+
+
+def _activate_listed_layer(self, context):
+    global _LAYER_PENDING
+    if _LAYER_PENDING or context is None:
+        return
+    _LAYER_PENDING = True
+
+    def _later():
+        global _LAYER_PENDING
+        _LAYER_PENDING = False
+        current = bpy.context
+        if current is None or getattr(current, "mode", "OBJECT") != "OBJECT":
+            return None
+        try:
+            meshes = placement._listed_layer_meshes(current)
+        except Exception:
+            return None
+        if not meshes:
+            return None
+        obj = meshes[0]
+        for item in list(getattr(current, "selected_objects", []) or []):
+            item.select_set(False)
+        obj.hide_set(False)
+        obj.select_set(True)
+        current.view_layer.objects.active = obj
+        return None
+
+    bpy.app.timers.register(_later, first_interval=0.05)
+
+
 def register() -> None:
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    placement.register()
     bpy.types.Scene.dwgreader_source = StringProperty(
         name="Чертёж",
         description="Файл DWG или DXF",
@@ -998,9 +1071,15 @@ def register() -> None:
     )
     bpy.types.Scene.dwgreader_status = StringProperty(name="Статус", default="")
     bpy.types.Scene.dwgreader_classified = StringProperty(name="Разобранный чертёж", default="")
+    bpy.types.Scene.dwgreader_geometry = EnumProperty(
+        name="Полигоны",
+        description="Из чего собирать площадки перед генерацией",
+        items=GEOMETRY_SOURCES,
+        default="fills",
+    )
     bpy.types.Scene.dwgreader_selected = CollectionProperty(type=DWGREADER_LayerItem)
     bpy.types.Scene.dwgreader_ignored = CollectionProperty(type=DWGREADER_LayerItem)
-    bpy.types.Scene.dwgreader_selected_index = IntProperty(default=0)
+    bpy.types.Scene.dwgreader_selected_index = IntProperty(default=0, update=_activate_listed_layer)
     bpy.types.Scene.dwgreader_ignored_index = IntProperty(default=0)
     bpy.types.WindowManager.dwgreader_busy = BoolProperty(name="Идёт импорт", default=False)
     try:
@@ -1013,15 +1092,21 @@ def register() -> None:
             prefs.llm_model = "qwen/qwen3-vl-30b-a3b-instruct"
         if prefs.llm_base_url in {"", "http://127.0.0.1:1234/v1"}:
             prefs.llm_base_url = "https://llm-router.cxm.dev/v1/"
+        if not str(prefs.library_dir or "").strip():
+            candidate = Path(r"c:\Users\user\PycharmProjects\DWGREADER\maf_blender_models")
+            if (candidate / "catalog.json").is_file():
+                prefs.library_dir = str(candidate)
 
 
 def unregister() -> None:
+    placement.unregister()
     del bpy.types.WindowManager.dwgreader_busy
     del bpy.types.Scene.dwgreader_ignored_index
     del bpy.types.Scene.dwgreader_selected_index
     del bpy.types.Scene.dwgreader_ignored
     del bpy.types.Scene.dwgreader_selected
     del bpy.types.Scene.dwgreader_classified
+    del bpy.types.Scene.dwgreader_geometry
     del bpy.types.Scene.dwgreader_status
     del bpy.types.Scene.dwgreader_source
     for cls in reversed(CLASSES):

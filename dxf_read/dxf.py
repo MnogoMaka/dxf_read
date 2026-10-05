@@ -34,6 +34,7 @@ from shapely.strtree import STRtree
 from shapely.validation import make_valid
 
 from . import config
+from .arrangement import bounded_faces
 from .config import (
     ARRANGEMENT_PRIORITY,
     BLENDER,
@@ -1175,6 +1176,193 @@ def extract_classified_hatches(
     return pieces
 
 
+def _category_lookup(
+    by_category: Mapping[str, Sequence[str]],
+    lock_groups: bool,
+    document: Drawing,
+    match_leaf: bool = False,
+):
+    """Имя слоя → категория. При lock_groups подсказки по хвосту имени не добавляют слои.
+
+    match_leaf для контуров: выбранное имя захватывает xref и копию «_Ном._пера»
+    с тем же хвостом. Заливки по-прежнему берут только точное имя.
+    """
+    if lock_groups:
+        exact: dict[str, str] = {}
+        leaves: dict[str, str] = {}
+        for category, names in by_category.items():
+            if not _is_drawable_category(category):
+                continue
+            for name in names:
+                exact[normalize_name(name)] = category
+                if match_leaf:
+                    leaves.setdefault(layer_leaf(name), category)
+
+        def category_of(layer: str) -> str | None:
+            found = exact.get(normalize_name(layer))
+            if found:
+                return found
+            if not match_leaf:
+                return None
+            return leaves.get(layer_leaf(layer))
+
+        layer_to_category = dict(exact)
+        if match_leaf:
+            for layer in document.layers:
+                name = str(layer.dxf.name)
+                category = category_of(name)
+                if category:
+                    layer_to_category[normalize_name(name)] = category
+        return category_of, layer_to_category
+
+    all_names = [str(layer.dxf.name) for layer in document.layers]
+    groups = refine_layer_groups(by_category, all_names)
+    layer_to_category: dict[str, str] = {}
+    for category, names in groups.items():
+        for name in names:
+            layer_to_category[normalize_name(name)] = category
+            layer_to_category.setdefault(layer_leaf(name), category)
+
+    def category_of(layer: str) -> str | None:
+        return _category_for_layer(layer, layer_to_category)
+
+    return category_of, layer_to_category
+
+
+def extract_curve_pieces(
+    document: Drawing,
+    by_category: Mapping[str, Sequence[str]],
+    include_blocks: bool = True,
+    lock_groups: bool = False,
+) -> list[HatchPiece]:
+    """Замкнутые грани из контуров выбранных слоёв."""
+    category_of, layer_to_category = _category_lookup(
+        by_category, lock_groups, document, match_leaf=True,
+    )
+    scale = 1.0
+    max_span = config.settings().max_contour_span_m
+    site_segments: list[tuple[tuple[float, float], tuple[float, float], str]] = []
+    plant_segments: list[tuple[tuple[float, float], tuple[float, float], str]] = []
+    skipped_frames = 0
+    cut_plants = bool(config.settings().cut_vegetation)
+
+    def take(entity: DXFEntity, layer: str) -> None:
+        nonlocal skipped_frames
+        category = category_of(layer)
+        if category is None or entity.dxftype() not in CURVE_TYPES:
+            return
+        bucket = plant_segments if category == "vegetation" and not cut_plants else site_segments
+        for points, closed in _flattened_paths(entity, scale):
+            if len(points) < 2:
+                continue
+            if _path_span(points) > max_span:
+                skipped_frames += 1
+                continue
+            pairs = list(zip(points, points[1:]))
+            if closed and len(points) >= 3:
+                pairs.append((points[-1], points[0]))
+            for start, end in pairs:
+                bucket.append(((start[0], start[1]), (end[0], end[1]), layer))
+
+    for entity in document.modelspace():
+        layer = str(entity.dxf.layer)
+        take(entity, layer)
+        if not include_blocks or not isinstance(entity, Insert):
+            continue
+        insert_category = category_of(layer)
+        for child, child_layer, _block_path in _iter_block_content(entity):
+            if category_of(child_layer) is None and insert_category and is_generic_block_layer(child_layer):
+                take(child, layer)
+            else:
+                take(child, child_layer)
+
+    def pieces_from(segments: list[tuple[tuple[float, float], tuple[float, float], str]]) -> list[HatchPiece]:
+        nonlocal skipped_frames
+        if not segments:
+            return []
+        faces = bounded_faces(segments, config.settings().flattening_distance_m)
+        minimum = config.settings().min_arrangement_area_m2
+        found: list[HatchPiece] = []
+        for outer, holes, lengths in faces:
+            layer = _layer_by_boundary(lengths, layer_to_category)
+            category = category_of(layer) if layer else None
+            if not layer or not category:
+                continue
+            if _path_span(outer) > max_span:
+                skipped_frames += 1
+                continue
+            ring = [(point[0], point[1], 0.0) for point in outer]
+            if len(ring) < 3:
+                continue
+            hole_rings = [[(point[0], point[1], 0.0) for point in hole] for hole in holes]
+            polygon = ShapelyPolygon(
+                [(point[0], point[1]) for point in ring],
+                [[(point[0], point[1]) for point in hole] for hole in hole_rings],
+            )
+            if polygon.area < minimum:
+                continue
+            found.append(HatchPiece(category=category, layer=layer, vertices=ring, holes=hole_rings))
+        return found
+
+    pieces = pieces_from(site_segments)
+    pieces.extend(pieces_from(plant_segments))
+    pieces = _keep_compact_copies(pieces, max_span * 0.5)
+    print(
+        f"Контуры: отрезков {len(site_segments) + len(plant_segments)}, граней {len(pieces)}, "
+        f"рамок пропущено {skipped_frames}"
+    )
+    extract_curve_pieces.skipped_frames = skipped_frames
+    return pieces
+
+
+def _keep_compact_copies(pieces: list[HatchPiece], radius: float) -> list[HatchPiece]:
+    """Одна копия площадки. Листы «Ном.пера» повторяют контур в десятках километров."""
+    if len(pieces) < 2:
+        return pieces
+    radius_sq = radius * radius
+    clusters: list[list[HatchPiece]] = []
+    remaining = list(pieces)
+    while remaining:
+        group = [remaining.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            next_remaining: list[HatchPiece] = []
+            centers = [_centroid_xy(item.vertices) for item in group]
+            for piece in remaining:
+                cx, cy = _centroid_xy(piece.vertices)
+                if any((cx - ox) ** 2 + (cy - oy) ** 2 <= radius_sq for ox, oy in centers):
+                    group.append(piece)
+                    changed = True
+                else:
+                    next_remaining.append(piece)
+            remaining = next_remaining
+        clusters.append(group)
+    return max(clusters, key=lambda group: sum(_ring_area(item.vertices) for item in group))
+
+
+def _path_span(points: Sequence[Sequence[float]]) -> float:
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    if not xs:
+        return 0.0
+    return max(max(xs) - min(xs), max(ys) - min(ys))
+
+
+def _layer_by_boundary(lengths: Mapping[str, float], layer_to_category: Mapping[str, str]) -> str:
+    best_layer = ""
+    best_length = -1.0
+    best_priority = -1
+    for layer, length in lengths.items():
+        category = layer_to_category.get(normalize_name(layer), "none")
+        priority = ARRANGEMENT_PRIORITY.get(category, 0)
+        if length > best_length + 1e-6 or (abs(length - best_length) <= 1e-6 and priority > best_priority):
+            best_layer = layer
+            best_length = length
+            best_priority = priority
+    return best_layer
+
+
 def _assign_generic_fills_to_buildings(
     pieces: list[HatchPiece],
     orphans: Sequence[tuple[DXFEntity, str, tuple[str, ...]]],
@@ -1511,11 +1699,46 @@ def _polygon_patch(polygon: ShapelyPolygon, color: tuple[float, float, float], m
 def arrange_hatch_faces_by_layer(
     pieces: Sequence[HatchPiece],
 ) -> list[tuple[BaseGeometry, str, str]]:
-    """Arrangement  но грань помнит слой AutoCAD.
+    """Arrangement, но грань помнит слой AutoCAD.
+
+    По умолчанию контуры деревьев и кустов не режут газоны и покрытия:
+    зелень добавляется своим слоем поверх целой площадки.
     """
     clustered = _cluster_hatch_pieces(pieces)
+    if config.settings().cut_vegetation:
+        return _arrange_piece_polygons(clustered)
+    base = [piece for piece in clustered if piece.category != "vegetation"]
+    symbols = [piece for piece in clustered if piece.category == "vegetation"]
+    arranged = _arrange_piece_polygons(base)
+    extra: list[tuple[BaseGeometry, str, str]] = []
+    for piece in symbols:
+        for polygon in _piece_polygons(piece):
+            extra.append((polygon, piece.category, piece.layer))
+    if not extra:
+        return arranged
+    return _merge_arranged([*arranged, *extra])
+
+
+def _merge_arranged(
+    items: Sequence[tuple[BaseGeometry, str, str]],
+) -> list[tuple[BaseGeometry, str, str]]:
+    merged: dict[str, list[BaseGeometry]] = {}
+    category_of: dict[str, str] = {}
+    for geometry, category, layer in items:
+        merged.setdefault(layer, []).append(geometry)
+        category_of.setdefault(layer, category)
+    return [
+        (unary_union(geoms), category_of[layer], layer)
+        for layer, geoms in merged.items()
+        if geoms
+    ]
+
+
+def _arrange_piece_polygons(
+    pieces: Sequence[HatchPiece],
+) -> list[tuple[BaseGeometry, str, str]]:
     labeled: list[tuple[ShapelyPolygon, str, str]] = []
-    for piece in clustered:
+    for piece in pieces:
         for polygon in _piece_polygons(piece):
             if polygon.area >= config.settings().min_arrangement_area_m2:
                 labeled.append((polygon, piece.category, piece.layer))
@@ -1536,16 +1759,7 @@ def arrange_hatch_faces_by_layer(
         faces = []
 
     if not faces:
-        merged: dict[str, list[BaseGeometry]] = {}
-        category_of: dict[str, str] = {}
-        for polygon, category, layer in labeled:
-            merged.setdefault(layer, []).append(polygon)
-            category_of.setdefault(layer, category)
-        return [
-            (unary_union(geoms), category_of[layer], layer)
-            for layer, geoms in merged.items()
-            if geoms
-        ]
+        return _merge_arranged([(polygon, category, layer) for polygon, category, layer in labeled])
 
     sources = [polygon for polygon, _category, _layer in labeled]
     tree = STRtree(sources)
@@ -1566,17 +1780,7 @@ def arrange_hatch_faces_by_layer(
             continue
         _priority, category, layer = max(covering, key=lambda item: item[0])
         arranged.append((face, category, layer))
-
-    merged_faces: dict[str, list[BaseGeometry]] = {}
-    category_of = {}
-    for face, category, layer in arranged:
-        merged_faces.setdefault(layer, []).append(face)
-        category_of.setdefault(layer, category)
-    return [
-        (unary_union(geoms), category_of[layer], layer)
-        for layer, geoms in merged_faces.items()
-        if geoms
-    ]
+    return _merge_arranged(arranged)
 
 
 def _earcut_polygon(polygon: ShapelyPolygon) -> tuple[Any, Any]:
@@ -1891,11 +2095,13 @@ def run_pipeline(
     by_category: Mapping[str, Sequence[str]] | None = None, # пример by_category={"building": ["ГП_Здания", "ГП_Крыльца"],"pavement": ["ГП_Тротуар"],"green": ["ГП_Газон"],}
     lock_groups: bool = False,
     classify_only: bool = False,
+    geometry_source: str = "fills",
     draw_preview: bool = False,
     run_blender: bool = True,
 ) -> dict[str, Any]:
     """Полный пайплайн. classify_only останавливается после списка слоёв."""
     cfg = config.settings()
+    source_mode = geometry_source if geometry_source in {"fills", "curves", "both"} else "fills"
     oda = oda_exe if oda_exe is not None else (cfg.oda_converter or None)
     out = _result_dir()
     document = open_drawing(path, dxf_dir=out / "_dxf", oda_exe=oda or None)
@@ -1938,6 +2144,7 @@ def run_pipeline(
                 "layers": len(layers),
                 "by_category": groups,
                 "layers_json": str(layers_json),
+                "geometry_source": source_mode,
                 "underlay": {"layers": 0, "json": None, "blend": None},
             }
     else:
@@ -1958,12 +2165,14 @@ def run_pipeline(
         blend_path=str(out / f"{source.stem}_underlay.blend"),
         run_blender=run_blender,
         lock_groups=lock_groups and by_category is not None,
+        geometry_source=source_mode,
     )
     return {
         "dxf": str(source),
         "layers": len(layers),
         "by_category": groups,
         "layers_json": str(layers_json) if layers_json else "",
+        "geometry_source": source_mode,
         "underlay": underlay,
     }
 
@@ -1977,26 +2186,37 @@ def export_blender_underlay(
     blend_path: str | Path | None = None,
     run_blender: bool = True,
     lock_groups: bool = False,
+    geometry_source: str = "fills",
 ) -> dict[str, Any]:
     """
     Каждый слой AutoCAD становится отдельной коллекцией. Без выдавливания:
     HATCH через earcut режется на треугольники в Z=0.
     """
-    _status("Сборка подложки")
+    source_mode = geometry_source if geometry_source in {"fills", "curves", "both"} else "fills"
+    _status({
+        "fills": "Сборка подложки из заливок",
+        "curves": "Сборка подложки из контуров",
+        "both": "Сборка подложки из заливок и контуров",
+    }[source_mode])
     source = _drawing_path(document)
     json_output = Path(json_path or OUTPUT_DIR / f"{source.stem}_underlay.json")
     blend_output = Path(blend_path or OUTPUT_DIR / f"{source.stem}_underlay.blend")
 
-    pieces = extract_classified_hatches(
-        document, by_category, include_blocks=include_blocks, lock_groups=lock_groups,
-    )
+    pieces: list[HatchPiece] = []
+    extract_curve_pieces.skipped_frames = 0
+    if source_mode in {"fills", "both"}:
+        pieces.extend(extract_classified_hatches(
+            document, by_category, include_blocks=include_blocks, lock_groups=lock_groups,
+        ))
+    if source_mode in {"curves", "both"}:
+        pieces.extend(extract_curve_pieces(
+            document, by_category, include_blocks=include_blocks, lock_groups=lock_groups,
+        ))
     from_blocks = sum(1 for piece in pieces if piece.from_block)
-    print(
-        f"HATCH для подложки: {len(pieces)} "
-        f"(Модель {len(pieces) - from_blocks}, INSERT {from_blocks})"
-    )
+    print(f"Фигур для подложки: {len(pieces)}")
+    skipped_frames = int(getattr(extract_curve_pieces, "skipped_frames", 0) or 0)
     if not pieces:
-        return {"layers": 0, "json": None, "blend": None}
+        return {"layers": 0, "json": None, "blend": None, "skipped_frames": skipped_frames}
 
     faces = arrange_hatch_faces_by_layer(pieces)
     origin = _geometry_origin(
@@ -2031,7 +2251,15 @@ def export_blender_underlay(
         json.dump(payload, file, ensure_ascii=False)
     print(f"JSON подложки: {json_output}")
 
-    blender = _find_blender() if run_blender else None
+    if not run_blender:
+        return {
+            "layers": len(layers_payload),
+            "json": str(json_output),
+            "blend": None,
+            "from_blocks": from_blocks,
+        }
+
+    blender = _find_blender()
     script = UNDERLAY_SCRIPT
     if blender is None:
         print(

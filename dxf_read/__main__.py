@@ -40,6 +40,12 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="JSON с подтверждённым by_category. Модель повторно не вызывается",
     )
+    parser.add_argument(
+        "--geometry",
+        choices=("fills", "curves", "both"),
+        default="fills",
+        help="Из чего строить полигоны: заливки, контуры или оба источника",
+    )
     parsed = parser.parse_args(sys.argv[1:] if argv is None else argv)
     source = Path(parsed.source) if parsed.source else resolve_path(DEFAULT_SOURCE)
     confirmed = None
@@ -51,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
         "classify_only": parsed.classify_only,
         "by_category": confirmed,
         "lock_groups": confirmed is not None,
+        "geometry_source": parsed.geometry,
     }
     if parsed.settings:
         with use_settings(_settings_from_file(Path(parsed.settings))):
@@ -73,7 +80,17 @@ def main(argv: list[str] | None = None) -> None:
             if names
         ]
         detail = "; ".join(listed) if listed else "ни один слой не отнесён к площадке"
-        print(f"UNDERLAY_EMPTY=В выбранных слоях нет заливок. Отобрано: {detail}")
+        geometry = str(result.get("geometry_source") or "fills")
+        skipped_frames = int((result.get("underlay") or {}).get("skipped_frames") or 0)
+        if geometry == "curves" and skipped_frames:
+            empty_text = "В выбранных слоях только рамки листа, замкнутых площадок нет"
+        else:
+            empty_text = {
+                "fills": "В выбранных слоях нет заливок",
+                "curves": "Контуры выбранных слоёв не замкнулись в площадки",
+                "both": "В выбранных слоях нет ни заливок, ни замкнутых контуров",
+            }.get(geometry, "В выбранных слоях нет заливок")
+        print(f"UNDERLAY_EMPTY={empty_text}. Отобрано: {detail}")
         return
     if json_path:
         print(f"UNDERLAY_JSON={json_path}")

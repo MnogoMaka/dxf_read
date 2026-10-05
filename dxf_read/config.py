@@ -63,6 +63,8 @@ ROOT_COLLECTION = "SITE_UNDERLAY"
 #геометрия
 FLATTENING_DISTANCE_M = 0.02
 MIN_ARRANGEMENT_AREA_M2 = 0.05
+# Рамка листа и копии «Ном.пера» бывают десятки километров. Площадка меньше.
+MAX_CONTOUR_SPAN_M = 8000.0
 SITE_CLUSTER_RADIUS_M = 400000.0
 # Слой 0 / HATCH: SOLID-заливка внутри контура стен здания.
 GENERIC_FILL_ASSOCIATE_M = 15.0
@@ -209,6 +211,8 @@ class PipelineSettings:
     generic_fill_associate_m: float = 15.0
     min_arrangement_area_m2: float = 0.05
     flattening_distance_m: float = 0.02
+    max_contour_span_m: float = 8000.0
+    cut_vegetation: bool = False
     batch_size: int = 600
     llm_timeout: float = 300.0
     fill_polyline_tokens: tuple[str, ...] = ("ЗАЛИВ", "ЗАПОЛН", "ПЯТН")
@@ -236,6 +240,8 @@ def settings() -> PipelineSettings:
         generic_fill_associate_m=GENERIC_FILL_ASSOCIATE_M,
         min_arrangement_area_m2=MIN_ARRANGEMENT_AREA_M2,
         flattening_distance_m=FLATTENING_DISTANCE_M,
+        max_contour_span_m=MAX_CONTOUR_SPAN_M,
+        cut_vegetation=False,
         batch_size=DEFAULT_BATCH_SIZE,
         fill_polyline_tokens=FILL_POLYLINE_TOKENS,
         junk_layer_tokens=JUNK_LAYER_TOKENS,

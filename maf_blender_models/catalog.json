@@ -1,0 +1,98 @@
+[
+  {
+    "id": "tree_01",
+    "family": "tree",
+    "placement": "scatter",
+    "file": "Дерево .glb",
+    "name": "Дерево",
+    "footprint": [7.18, 7.18, 5.33]
+  },
+  {
+    "id": "tree_spruce",
+    "family": "tree",
+    "placement": "scatter",
+    "file": "Елка.glb",
+    "name": "Ель",
+    "footprint": [10.61, 10.61, 5.06]
+  },
+  {
+    "id": "bush_01",
+    "family": "bush",
+    "placement": "scatter",
+    "file": "Куст.glb",
+    "name": "Куст",
+    "footprint": [4.64, 4.64, 1.29]
+  },
+  {
+    "id": "bench_01",
+    "family": "bench",
+    "placement": "linear",
+    "file": "лавочка.glb",
+    "name": "Лавка",
+    "footprint": [1.82, 0.68, 0.87]
+  },
+  {
+    "id": "lounger_01",
+    "family": "bench",
+    "placement": "linear",
+    "file": "лежак.glb",
+    "name": "Лежак",
+    "footprint": [7.15, 3.35, 2.82]
+  },
+  {
+    "id": "urn_01",
+    "family": "urn",
+    "placement": "point",
+    "file": "урна.glb",
+    "name": "Урна",
+    "footprint": [0.4, 0.26, 0.78]
+  },
+  {
+    "id": "play_01",
+    "family": "playground",
+    "placement": "area",
+    "file": "Детский комплекс_1.glb",
+    "name": "Детский комплекс 1",
+    "footprint": [6.13, 1.61, 2.84]
+  },
+  {
+    "id": "play_02",
+    "family": "playground",
+    "placement": "area",
+    "file": "Детский комплекс_2.glb",
+    "name": "Детский комплекс 2",
+    "footprint": [2.81, 4.18, 2.5]
+  },
+  {
+    "id": "play_03",
+    "family": "playground",
+    "placement": "area",
+    "file": "Детский комплекс_3.glb",
+    "name": "Детский комплекс 3",
+    "footprint": [1.4, 1.4, 2.57]
+  },
+  {
+    "id": "play_big",
+    "family": "playground",
+    "placement": "area",
+    "file": "детский спортивный комплекс большой .glb",
+    "name": "Спортивный комплекс",
+    "footprint": [9.38, 11.26, 5.98]
+  },
+  {
+    "id": "swing_01",
+    "family": "playground",
+    "placement": "area",
+    "file": "качель .glb",
+    "name": "Качели",
+    "footprint": [3.71, 6.13, 2.64]
+  },
+  {
+    "id": "swing_round",
+    "family": "playground",
+    "placement": "area",
+    "file": "качель круглая.glb",
+    "name": "Круглые качели",
+    "footprint": [1.51, 1.51, 0.87]
+  }
+]

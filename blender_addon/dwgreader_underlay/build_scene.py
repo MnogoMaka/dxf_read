@@ -6,15 +6,28 @@ import json
 from pathlib import Path
 
 import bpy
+from mathutils import Vector
+
+from .placement_math import split_far_parts
 
 
 ROOT_NAME = "SITE_UNDERLAY"
+# Пятна ближе этого зазора остаются одним объектом. Рамка и соседний чертёж уходят в свой.
+LAYER_PART_GAP_M = 10.0
 
 
 def safe_name(text: str, fallback: str = "NO_LAYER") -> str:
     value = str(text or "").replace("\n", " ").replace("/", "_").replace("\\", "_").strip()
     value = value.strip(".") or fallback
     return value[:63]
+
+
+def part_object_name(base: str, index: int, count: int) -> str:
+    if count <= 1:
+        return safe_name(base)
+    suffix = f"_{index}"
+    stem = safe_name(base)[: 63 - len(suffix)]
+    return f"{stem}{suffix}"
 
 
 def ensure_collection(name: str, parent: bpy.types.Collection) -> bpy.types.Collection:
@@ -79,6 +92,22 @@ def ensure_material(category: str, color: list[float]) -> bpy.types.Material:
     return material
 
 
+def relax_view_clip(context: bpy.types.Context, span: float = 0.0) -> None:
+    """Дальняя плоскость вида по умолчанию 1000 м. Рамка участка в километрах иначе пустая."""
+    clip_end = max(1_000_000.0, float(span) * 8.0)
+    screen = context.screen
+    screens = [screen] if screen is not None else list(bpy.data.screens)
+    for item in screens:
+        for area in item.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type != "VIEW_3D":
+                    continue
+                space.clip_start = 0.01
+                space.clip_end = clip_end
+
+
 def apply_plan_viewport() -> None:
     """Solid + плоский свет + цвет материала. Сетка и фон темы остаются как в Blender."""
     for screen in bpy.data.screens:
@@ -98,36 +127,60 @@ def apply_plan_viewport() -> None:
 
 
 def frame_collection(context: bpy.types.Context, root: bpy.types.Collection) -> None:
+    """Кадр вида без bpy.ops: вызов view_selected из модальной генерации оставлял скролл панели мёртвым."""
     layer_objects = set(context.view_layer.objects)
     for obj in layer_objects:
         obj.select_set(False)
 
-    def select_tree(collection: bpy.types.Collection) -> None:
+    mins: Vector | None = None
+    maxs: Vector | None = None
+
+    def walk(collection: bpy.types.Collection) -> None:
+        nonlocal mins, maxs
         for obj in collection.objects:
             if obj.name in layer_objects:
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
+            if obj.bound_box is None:
+                continue
+            for corner in obj.bound_box:
+                world = obj.matrix_world @ Vector(corner)
+                if mins is None or maxs is None:
+                    mins = Vector(world)
+                    maxs = Vector(world)
+                else:
+                    mins.x, mins.y, mins.z = min(mins.x, world.x), min(mins.y, world.y), min(mins.z, world.z)
+                    maxs.x, maxs.y, maxs.z = max(maxs.x, world.x), max(maxs.y, world.y), max(maxs.z, world.z)
         for child in collection.children:
-            select_tree(child)
+            walk(child)
 
-    select_tree(root)
-    if context.view_layer.objects.active is None:
+    walk(root)
+    if mins is None or maxs is None or context.view_layer.objects.active is None:
         return
+    size = maxs - mins
+    span = max(size.x, size.y, size.z)
+    relax_view_clip(context, span)
     screen = context.screen
-    if screen is None:
-        return
-    for area in screen.areas:
-        if area.type != "VIEW_3D":
-            continue
-        region = next((item for item in area.regions if item.type == "WINDOW"), None)
-        if region is None:
-            continue
-        with context.temp_override(area=area, region=region):
-            bpy.ops.view3d.view_selected()
-        return
+    screens = [screen] if screen is not None else list(bpy.data.screens)
+    center = (mins + maxs) * 0.5
+    for item in screens:
+        for area in item.areas:
+            if area.type != "VIEW_3D":
+                continue
+            region = next((region for region in area.regions if region.type == "WINDOW"), None)
+            space = area.spaces.active
+            region_3d = space.region_3d if space.type == "VIEW_3D" else None
+            if region is None or region_3d is None or region.height <= 0:
+                continue
+            aspect = region.width / region.height
+            half_height = max(size.y * 0.5, (size.x * 0.5) / aspect, 1.0)
+            region_3d.view_location = center
+            region_3d.view_distance = half_height * (2.4 if region_3d.view_perspective == "PERSP" else 1.15)
+            region_3d.update()
+            return
 
 
-def build(json_path: Path) -> int:
+def build(json_path: Path, part_gap_m: float = LAYER_PART_GAP_M) -> int:
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     root_name = str(payload.get("root_collection") or ROOT_NAME)
     origin = payload.get("origin") or [0.0, 0.0]
@@ -151,28 +204,33 @@ def build(json_path: Path) -> int:
         collection = ensure_collection(collection_name, category_root)
 
         vertices = [tuple(point) for point in layer.get("vertices") or []]
-        faces = [tuple(face) for face in layer.get("faces") or []]
+        faces = [tuple(int(index) for index in face) for face in layer.get("faces") or []]
         if len(vertices) < 3 or not faces:
             continue
 
-        mesh = bpy.data.meshes.new(f"HATCH_{collection_name}")
-        mesh.from_pydata(vertices, [], faces)
-        mesh.update()
-        obj = bpy.data.objects.new(collection_name, mesh)
-        collection.objects.link(obj)
-
+        parts = split_far_parts(vertices, faces, float(part_gap_m))
         material = ensure_material(category, color)
-        obj.data.materials.append(material)
         rgb = (list(color) + [0.55, 0.55, 0.55])[:3]
-        obj.color = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
-        obj["dxf_layer"] = dxf_layer
-        obj["category"] = category
-        obj.lock_location = (True, True, True)
-        obj.lock_rotation = (True, True, True)
-        obj.lock_scale = (True, True, True)
-        built += 1
+        color_rgba = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
+        for part_index, (part_vertices, part_faces) in enumerate(parts, start=1):
+            object_name = part_object_name(collection_name, part_index, len(parts))
+            mesh = bpy.data.meshes.new(f"HATCH_{object_name}")
+            mesh.from_pydata(part_vertices, [], part_faces)
+            mesh.update()
+            obj = bpy.data.objects.new(object_name, mesh)
+            collection.objects.link(obj)
+            obj.data.materials.append(material)
+            obj.color = color_rgba
+            obj["dxf_layer"] = dxf_layer
+            obj["category"] = category
+            obj["part"] = part_index
+            obj.lock_location = (True, True, True)
+            obj.lock_rotation = (True, True, True)
+            obj.lock_scale = (True, True, True)
+            built += 1
 
     apply_plan_viewport()
+    relax_view_clip(bpy.context)
     try:
         frame_collection(bpy.context, root)
     except Exception:
