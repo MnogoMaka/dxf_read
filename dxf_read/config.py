@@ -213,6 +213,8 @@ class PipelineSettings:
     flattening_distance_m: float = 0.02
     max_contour_span_m: float = 8000.0
     cut_vegetation: bool = False
+    scene_scale: float = 1.0
+    origin_mode: str = "mass"
     batch_size: int = 600
     llm_timeout: float = 300.0
     fill_polyline_tokens: tuple[str, ...] = ("ЗАЛИВ", "ЗАПОЛН", "ПЯТН")
@@ -242,6 +244,8 @@ def settings() -> PipelineSettings:
         flattening_distance_m=FLATTENING_DISTANCE_M,
         max_contour_span_m=MAX_CONTOUR_SPAN_M,
         cut_vegetation=False,
+        scene_scale=1.0,
+        origin_mode="mass",
         batch_size=DEFAULT_BATCH_SIZE,
         fill_polyline_tokens=FILL_POLYLINE_TOKENS,
         junk_layer_tokens=JUNK_LAYER_TOKENS,

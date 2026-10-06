@@ -188,8 +188,19 @@ def split_far_parts(
     clustered: dict[int, list[int]] = {}
     for index, group in enumerate(groups):
         clustered.setdefault(find(index), []).extend(group)
+    return _sub_meshes(vertices, faces, list(clustered.values()))
+
+
+def _sub_meshes(
+    vertices: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    face_sets: list[list[int]],
+) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]]:
+    """Сетки по наборам граней, слева направо (min x, затем min y)."""
     parts: list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]] = []
-    for face_indices in clustered.values():
+    for face_indices in face_sets:
+        if not face_indices:
+            continue
         remap: dict[int, int] = {}
         part_vertices: list[tuple[float, float, float]] = []
         part_faces: list[tuple[int, ...]] = []
@@ -204,6 +215,30 @@ def split_far_parts(
         parts.append((part_vertices, part_faces))
     parts.sort(key=lambda item: (min(vertex[0] for vertex in item[0]), min(vertex[1] for vertex in item[0])))
     return parts
+
+
+def split_polygons(
+    vertices: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    polygon_faces: list[int] | None = None,
+) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]]:
+    """Каждый замкнутый полигон слоя — своя сетка.
+
+    polygon_faces — число треугольников каждого полигона по порядку граней.
+    Без него полигоном считается связный по рёбрам кусок сетки.
+    """
+    if not faces:
+        return []
+    counts = [int(count) for count in (polygon_faces or []) if int(count) > 0]
+    if counts and sum(counts) == len(faces):
+        face_sets: list[list[int]] = []
+        start = 0
+        for count in counts:
+            face_sets.append(list(range(start, start + count)))
+            start += count
+    else:
+        face_sets = face_groups(faces)
+    return _sub_meshes(vertices, faces, face_sets)
 
 
 def convex_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:

@@ -21,5 +21,8 @@ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
     zf.writestr("dwgreader_underlay/dxf_read/", "")
     pack(zf, addon, "dwgreader_underlay")
     pack(zf, root / "dxf_read", "dwgreader_underlay/dxf_read")
+    zf.writestr("dwgreader_underlay/icons/", "")
+    for icon in sorted((addon / "icons").glob("*.png")):
+        zf.write(icon, f"dwgreader_underlay/icons/{icon.name}")
 
 print(zip_path)

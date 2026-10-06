@@ -8,7 +8,7 @@ from pathlib import Path
 import bpy
 from mathutils import Vector
 
-from .placement_math import split_far_parts
+from .placement_math import split_far_parts, split_polygons
 
 
 ROOT_NAME = "SITE_UNDERLAY"
@@ -51,14 +51,19 @@ def unlink_tree(collection: bpy.types.Collection) -> None:
             bpy.data.meshes.remove(mesh)
 
 
-def reset_root(name: str) -> bpy.types.Collection:
+def remove_root(name: str) -> None:
     old = bpy.data.collections.get(name)
-    if old is not None:
-        unlink_tree(old)
-        for scene in bpy.data.scenes:
-            if old.name in scene.collection.children:
-                scene.collection.children.unlink(old)
-        bpy.data.collections.remove(old)
+    if old is None:
+        return
+    unlink_tree(old)
+    for scene in bpy.data.scenes:
+        if old.name in scene.collection.children:
+            scene.collection.children.unlink(old)
+    bpy.data.collections.remove(old)
+
+
+def reset_root(name: str) -> bpy.types.Collection:
+    remove_root(name)
     root = bpy.data.collections.new(name)
     bpy.context.scene.collection.children.link(root)
     return root
@@ -180,7 +185,23 @@ def frame_collection(context: bpy.types.Context, root: bpy.types.Collection) -> 
             return
 
 
-def build(json_path: Path, part_gap_m: float = LAYER_PART_GAP_M) -> int:
+SPLIT_MODES = ("layer", "polygon", "gap")
+
+
+def layer_parts(layer: dict, vertices, faces, split_mode: str, part_gap_m: float):
+    if split_mode == "layer":
+        return [(vertices, faces)]
+    if split_mode == "polygon":
+        return split_polygons(vertices, faces, layer.get("polygon_faces"))
+    return split_far_parts(vertices, faces, float(part_gap_m))
+
+
+def build(
+    json_path: Path,
+    part_gap_m: float = LAYER_PART_GAP_M,
+    split_mode: str = "gap",
+    by_type: bool = True,
+) -> int:
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     root_name = str(payload.get("root_collection") or ROOT_NAME)
     origin = payload.get("origin") or [0.0, 0.0]
@@ -188,6 +209,10 @@ def build(json_path: Path, part_gap_m: float = LAYER_PART_GAP_M) -> int:
     root["dxf_source"] = str(payload.get("source") or "")
     root["origin_x"] = float(origin[0])
     root["origin_y"] = float(origin[1])
+    root["scale"] = float(payload.get("scale") or 1.0)
+    root["split_mode"] = split_mode
+    if split_mode not in SPLIT_MODES:
+        split_mode = "gap"
 
     used_names: set[str] = set()
     built = 0
@@ -195,20 +220,20 @@ def build(json_path: Path, part_gap_m: float = LAYER_PART_GAP_M) -> int:
         dxf_layer = str(layer.get("dxf_layer") or f"layer_{index}")
         category = str(layer.get("category") or "pavement")
         color = layer.get("color") or [0.55, 0.55, 0.55]
-        category_root = ensure_collection(safe_name(category, "type"), root)
+        parent = ensure_collection(safe_name(category, "type"), root) if by_type else root
 
         collection_name = safe_name(dxf_layer)
-        if collection_name in used_names:
+        if collection_name in used_names or bpy.data.collections.get(collection_name) is not None:
             collection_name = safe_name(f"{dxf_layer}_{index}")
         used_names.add(collection_name)
-        collection = ensure_collection(collection_name, category_root)
+        collection = ensure_collection(collection_name, parent)
 
         vertices = [tuple(point) for point in layer.get("vertices") or []]
         faces = [tuple(int(index) for index in face) for face in layer.get("faces") or []]
         if len(vertices) < 3 or not faces:
             continue
 
-        parts = split_far_parts(vertices, faces, float(part_gap_m))
+        parts = layer_parts(layer, vertices, faces, split_mode, part_gap_m)
         material = ensure_material(category, color)
         rgb = (list(color) + [0.55, 0.55, 0.55])[:3]
         color_rgba = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
@@ -224,6 +249,7 @@ def build(json_path: Path, part_gap_m: float = LAYER_PART_GAP_M) -> int:
             obj["dxf_layer"] = dxf_layer
             obj["category"] = category
             obj["part"] = part_index
+            obj["geometry"] = str(layer.get("geometry") or "")
             obj.lock_location = (True, True, True)
             obj.lock_rotation = (True, True, True)
             obj.lock_scale = (True, True, True)

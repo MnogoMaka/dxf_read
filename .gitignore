@@ -9,3 +9,4 @@ output_dxf
 output_old
 .env.example
 .env
+actual_node

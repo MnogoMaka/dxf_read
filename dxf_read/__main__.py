@@ -49,15 +49,18 @@ def main(argv: list[str] | None = None) -> None:
     parsed = parser.parse_args(sys.argv[1:] if argv is None else argv)
     source = Path(parsed.source) if parsed.source else resolve_path(DEFAULT_SOURCE)
     confirmed = None
+    per_layer = None
     if parsed.groups:
         payload = json.loads(Path(parsed.groups).read_text(encoding="utf-8"))
         confirmed = payload.get("by_category", payload)
+        per_layer = payload.get("geometry_by_layer") if "by_category" in payload else None
     pipeline_kwargs = {
         "run_blender": not parsed.no_blender and not parsed.classify_only,
         "classify_only": parsed.classify_only,
         "by_category": confirmed,
         "lock_groups": confirmed is not None,
         "geometry_source": parsed.geometry,
+        "geometry_by_layer": per_layer,
     }
     if parsed.settings:
         with use_settings(_settings_from_file(Path(parsed.settings))):

@@ -377,6 +377,69 @@ def _zone_from_object(obj: bpy.types.Object, edit: bool) -> tuple[list[tuple[flo
     return vertices, faces, f"{obj.name}:{area:.1f}:{sample}"
 
 
+def _placement_source(obj: bpy.types.Object) -> bool:
+    """Библиотека и уже расставленные копии не являются зоной."""
+    return _under_collection(obj, LIBRARY_NAME) or _under_collection(obj, ROOT_NAME)
+
+
+def scene_zone_names() -> set[str]:
+    """Имена полигонов, по которым можно расставлять: объект, коллекция или dxf_layer."""
+    names: set[str] = set()
+
+    def walk(collection: bpy.types.Collection) -> None:
+        if collection.name in {LIBRARY_NAME, ROOT_NAME}:
+            return
+        names.add(collection.name)
+        for obj in collection.objects:
+            if obj.type != "MESH" or _placement_source(obj):
+                continue
+            names.add(obj.name)
+            stored = str(obj.get("dxf_layer") or "")
+            if stored:
+                names.add(stored)
+        for child in collection.children:
+            walk(child)
+
+    scene = bpy.context.scene if bpy.context else None
+    if scene is not None:
+        walk(scene.collection)
+    return names
+
+
+def _meshes_named(layer_name: str) -> list[bpy.types.Object]:
+    """Сетки сцены с именем слоя: подложка или любая другая модель."""
+    found: list[bpy.types.Object] = []
+    seen: set[str] = set()
+    target = layer_name[:63]
+
+    def take(obj: bpy.types.Object) -> None:
+        if obj.type != "MESH" or obj.name in seen or _placement_source(obj):
+            return
+        stored = str(obj.get("dxf_layer") or "")
+        if stored == layer_name or obj.name == target:
+            seen.add(obj.name)
+            found.append(obj)
+
+    def walk(collection: bpy.types.Collection) -> None:
+        if collection.name in {LIBRARY_NAME, ROOT_NAME}:
+            return
+        named = collection.name == layer_name or collection.name == target
+        for obj in collection.objects:
+            if named:
+                if obj.type == "MESH" and obj.name not in seen and not _placement_source(obj):
+                    seen.add(obj.name)
+                    found.append(obj)
+            else:
+                take(obj)
+        for child in collection.children:
+            walk(child)
+
+    scene = bpy.context.scene if bpy.context else None
+    if scene is not None:
+        walk(scene.collection)
+    return found
+
+
 def _listed_layer_meshes(context) -> list[bpy.types.Object]:
     """Слой, подсвеченный в списке плагина: клик по строке не выбирает объект в 3D-виде."""
     scene = getattr(context, "scene", None)
@@ -389,37 +452,21 @@ def _listed_layer_meshes(context) -> list[bpy.types.Object]:
     layer_name = str(items[index].layer_name or "").strip()
     if not layer_name:
         return []
-    root = bpy.data.collections.get(UNDERLAY_NAME)
-    if root is None:
-        return []
-    found: list[bpy.types.Object] = []
-
-    def walk(collection: bpy.types.Collection) -> None:
-        for obj in collection.objects:
-            if obj.type != "MESH":
-                continue
-            stored = str(obj.get("dxf_layer") or "")
-            if stored == layer_name or obj.name == layer_name[:63]:
-                found.append(obj)
-        for child in collection.children:
-            walk(child)
-
-    walk(root)
-    return found
+    return _meshes_named(layer_name)
 
 
 def _single_underlay_mesh(context) -> bpy.types.Object | None:
-    """Один полигон в 3D-виде. После сборки выделены все слои сразу — это не выбор зоны."""
+    """Один выделенный полигон. Много выделенных сразу — это не выбор зоны."""
     active = context.active_object
-    if active is None or active.type != "MESH" or not _under_collection(active, UNDERLAY_NAME):
-        return None
     selected = [
         obj for obj in context.selected_objects
-        if obj.type == "MESH" and _under_collection(obj, UNDERLAY_NAME)
+        if obj.type == "MESH" and not _placement_source(obj)
     ]
-    if len(selected) > 1:
+    if len(selected) != 1:
         return None
-    return active
+    if active is not None and active.type == "MESH" and active in selected:
+        return active
+    return selected[0]
 
 
 def _selected_zones(context) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]], str, float]]:
@@ -435,19 +482,17 @@ def _selected_zones(context) -> list[tuple[list[tuple[float, float, float]], lis
         if not objects:
             objects = [
                 obj for obj in context.selected_objects
-                if obj.type == "MESH" and _under_collection(obj, UNDERLAY_NAME)
+                if obj.type == "MESH" and not _placement_source(obj)
             ]
     zones = []
     for obj in objects:
-        if obj is None or obj.type != "MESH":
+        if obj is None or obj.type != "MESH" or _placement_source(obj):
             continue
-        if not _under_collection(obj, UNDERLAY_NAME):
-            raise PlacementError("Нужен полигон из подложки")
         vertices, faces, key = _zone_from_object(obj, edit and obj == context.active_object)
         height = sum(vertex[2] for vertex in vertices) / len(vertices)
         zones.append((vertices, faces, key, height))
     if not zones:
-        raise PlacementError("Выберите слой в списке или полигон подложки в 3D-виде")
+        raise PlacementError("Выберите слой в списке или полигон в 3D-виде")
     if edit:
         bpy.ops.object.mode_set(mode="OBJECT")
     return zones
@@ -495,8 +540,6 @@ _PLANT_UI_SEEN = False
 
 
 def _plant_target_ready(context) -> bool:
-    if bpy.data.collections.get(UNDERLAY_NAME) is None:
-        return False
     if _single_underlay_mesh(context) is not None:
         return True
     return bool(_listed_layer_meshes(context))
@@ -596,7 +639,7 @@ def _on_plant_update(self, context):
     if getattr(scene, "dwgreader_place_mode", "plantings") != "plantings":
         return
     if not _plant_target_ready(context):
-        _status(context, "Выберите слой в списке или полигон подложки в 3D-виде")
+        _status(context, "Выберите слой в списке или полигон в 3D-виде")
         return
     _PLANT_PENDING = True
 
@@ -638,7 +681,7 @@ class DWGREADER_OT_place_plantings(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _busy(context) and bpy.data.collections.get(UNDERLAY_NAME) is not None
+        return not _busy(context)
 
     def execute(self, context):
         try:
@@ -663,7 +706,7 @@ class DWGREADER_OT_place_benches(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _busy(context) and bpy.data.collections.get(UNDERLAY_NAME) is not None
+        return not _busy(context)
 
     def invoke(self, context, event):
         if context.area is None or context.area.type != "VIEW_3D":
@@ -809,13 +852,15 @@ def _underlay_hit(context, event) -> tuple[bpy.types.Object, int] | None:
         coord = (event.mouse_x - region.x, event.mouse_y - region.y)
     origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, coord)
     direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
-    root = bpy.data.collections.get(UNDERLAY_NAME)
-    if root is None:
+    scene = context.scene
+    if scene is None:
         return None
     best: tuple[float, bpy.types.Object, int] | None = None
 
     def walk(collection: bpy.types.Collection) -> None:
         nonlocal best
+        if collection.name in {LIBRARY_NAME, ROOT_NAME}:
+            return
         for obj in collection.objects:
             if obj.type != "MESH" or obj.data is None or not obj.data.polygons:
                 continue
@@ -834,7 +879,7 @@ def _underlay_hit(context, event) -> tuple[bpy.types.Object, int] | None:
         for child in collection.children:
             walk(child)
 
-    walk(root)
+    walk(scene.collection)
     if best is None:
         return None
     return best[1], best[2]
@@ -848,7 +893,7 @@ class DWGREADER_OT_place_playground(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _busy(context) and bpy.data.collections.get(UNDERLAY_NAME) is not None
+        return not _busy(context)
 
     def execute(self, context):
         try:
@@ -898,7 +943,7 @@ class DWGREADER_OT_place_playground(Operator):
             return {"RUNNING_MODAL"}
         hit = _underlay_hit(context, event)
         if hit is None:
-            _status(context, "Кликните по полигону подложки")
+            _status(context, "Кликните по полигону")
             return {"RUNNING_MODAL"}
         obj, face_index = hit
         try:
@@ -931,7 +976,7 @@ class DWGREADER_OT_place_playground(Operator):
                 vertices, faces = _island_mesh(vertices, faces, groups[0])
             note = _place_playground_on(context, vertices, faces, key)
         if not note:
-            raise PlacementError("Выберите полигон подложки")
+            raise PlacementError("Выберите полигон")
         return note
 
 
@@ -1127,7 +1172,7 @@ def _mode_items(self, context):
 def draw_panel(layout, context) -> None:
     prefs = _prefs(context)
     box = layout.box()
-    box.label(text="4. Расстановка")
+    box.label(text="Озеленение и МАФ", icon="OUTLINER_OB_CURVES")
     if prefs is None:
         box.label(text="Нет настроек аддона")
         return
@@ -1137,17 +1182,24 @@ def draw_panel(layout, context) -> None:
     except PlacementError as exc:
         box.label(text=str(exc))
         return
-    if bpy.data.collections.get(UNDERLAY_NAME) is None:
-        box.label(text="Сначала соберите подложку")
-        return
     global _PLANT_UI_SEEN
     _PLANT_UI_SEEN = True
     scene = context.scene
     try:
-        box.prop(scene, "dwgreader_place_mode", expand=True)
+        tabs = box.row()
+        tabs.scale_y = 1.2
+        tabs.prop(scene, "dwgreader_place_mode", expand=True)
         mode = scene.dwgreader_place_mode
         if mode == "plantings":
-            box.label(text="Деревья и кусты встают на весь выбранный слой")
+            box.label(text="Слой или выделенный полигон любой модели")
+            if len(scene.dwgreader_selected):
+                box.template_list(
+                    "DWGREADER_UL_place_layers", "place",
+                    scene, "dwgreader_selected",
+                    scene, "dwgreader_selected_index",
+                    rows=5,
+                )
+            box.label(text="Можно выделить любой полигон в 3D-виде")
             box.prop(scene, "dwgreader_tree_model", text="Дерево")
             box.prop(scene, "dwgreader_bush_model", text="Куст")
             box.prop(scene, "dwgreader_tree_share")
