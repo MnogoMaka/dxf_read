@@ -1032,7 +1032,7 @@ def refine_layer_groups(
     by_category: Mapping[str, Sequence[str]],
     all_layers: Sequence[str] | None = None,
 ) -> dict[str, list[str]]:
-    """Правит группы ИИ: хвост имени важнее ответа модели. Добавляет явные слои."""
+    """Сохраняет тип, который прислала модель. По имени дополняются только слои без типа."""
     refined: dict[str, list[str]] = {}
     seen: set[str] = set()
     for category, names in by_category.items():
@@ -1041,7 +1041,7 @@ def refine_layer_groups(
             if name in seen or is_junk_layer(name):
                 continue
             seen.add(name)
-            guessed = infer_layer_category(name) or mapped
+            guessed = mapped or infer_layer_category(name)
             if guessed in TARGET_OBJECT_TYPES:
                 refined.setdefault(guessed, []).append(name)
     for name in all_layers or ():
@@ -1055,12 +1055,12 @@ def refine_layer_groups(
 
 
 def _category_for_layer(layer: str, layer_to_category: Mapping[str, str]) -> str | None:
-    guessed = infer_layer_category(layer)
-    if guessed:
-        return guessed
     key = normalize_name(layer)
     if key in layer_to_category:
         return layer_to_category[key]
+    guessed = infer_layer_category(layer)
+    if guessed:
+        return guessed
     return layer_to_category.get(layer_leaf(layer))
 
 
@@ -1198,8 +1198,8 @@ def _category_lookup(
 ):
     """Имя слоя → категория. При lock_groups подсказки по хвосту имени не добавляют слои.
 
-    match_leaf для контуров: выбранное имя захватывает xref и копию «_Ном._пера»
-    с тем же хвостом. Заливки по-прежнему берут только точное имя.
+    match_leaf захватывает xref и копию «_Ном._пера» с тем же хвостом.
+    Подтверждённый список слоёв передаёт match_leaf=False: строится только отмеченное имя.
     """
     if lock_groups:
         exact: dict[str, str] = {}
@@ -1259,7 +1259,22 @@ def _curve_pieces_from_segments(
     if not segments:
         return [], 0
     skipped = 0
-    faces = bounded_faces(segments, config.settings().flattening_distance_m)
+    cfg = config.settings()
+    snap_tolerance = max(float(cfg.contour_snap_tolerance_m), 0.0)
+    arrangement_mode = str(cfg.contour_arrangement_mode or "layer")
+    segment_groups: list[list[tuple[tuple[float, float], tuple[float, float], str]]]
+    if arrangement_mode == "combined":
+        segment_groups = [segments]
+    else:
+        by_layer: dict[str, list[tuple[tuple[float, float], tuple[float, float], str]]] = {}
+        for segment in segments:
+            by_layer.setdefault(normalize_name(segment[2]), []).append(segment)
+        segment_groups = list(by_layer.values())
+    faces = [
+        face
+        for group in segment_groups
+        for face in bounded_faces(group, snap_tolerance)
+    ]
     minimum = config.settings().min_arrangement_area_m2
     max_span = config.settings().max_contour_span_m
     found: list[HatchPiece] = []
@@ -1285,29 +1300,67 @@ def _curve_pieces_from_segments(
     return found, skipped
 
 
+def _fill_contour_piece(
+    category: str,
+    layer: str,
+    outer: Sequence[Sequence[float]],
+    holes: Sequence[Sequence[Sequence[float]]],
+    max_span: float,
+    minimum: float,
+    handle: str = "",
+    block_path: tuple[str, ...] = (),
+) -> HatchPiece | None:
+    """Граница заливки как готовый полигон контурной сборки. Дырки остаются дырками."""
+    ring = _ring_xyz(outer)
+    if len(ring) < 3 or _path_span(ring) > max_span:
+        return None
+    hole_rings = []
+    for hole in holes:
+        hole_ring = _ring_xyz(hole)
+        if len(hole_ring) >= 3 and _path_span(hole_ring) <= max_span:
+            hole_rings.append(hole_ring)
+    try:
+        polygon = ShapelyPolygon(
+            [(point[0], point[1]) for point in ring],
+            [[(point[0], point[1]) for point in hole] for hole in hole_rings],
+        )
+    except Exception:
+        return None
+    if polygon.is_empty or polygon.area < minimum:
+        return None
+    return HatchPiece(category, layer, ring, hole_rings, handle, block_path)
+
+
 def extract_curve_pieces(
     document: Drawing,
     by_category: Mapping[str, Sequence[str]],
     include_blocks: bool = True,
     lock_groups: bool = False,
+    fill_boundary_layers: Sequence[str] | None = None,
 ) -> list[HatchPiece]:
-    """Замкнутые грани из контуров выбранных слоёв."""
+    """Замкнутые грани из контуров выбранных слоёв.
+
+    fill_boundary_layers — слои, которые рисуются именно контурами.
+    Для них граница штриховки добавляется к линиям, если включена галочка.
+    """
     category_of, layer_to_category = _category_lookup(
-        by_category, lock_groups, document, match_leaf=True,
+        by_category, lock_groups, document, match_leaf=not lock_groups,
     )
     scale = 1.0
     max_span = config.settings().max_contour_span_m
     site_segments: list[tuple[tuple[float, float], tuple[float, float], str]] = []
     plant_segments: list[tuple[tuple[float, float], tuple[float, float], str]] = []
+    fill_contours: list[HatchPiece] = []
     skipped_frames = 0
-    cut_plants = bool(config.settings().cut_vegetation)
+    minimum = config.settings().min_arrangement_area_m2
+    boundary_layers = {normalize_name(name) for name in (fill_boundary_layers or ())}
 
     def take(entity: DXFEntity, layer: str) -> None:
         nonlocal skipped_frames
         category = category_of(layer)
         if category is None or entity.dxftype() not in CURVE_TYPES:
             return
-        bucket = plant_segments if category == "vegetation" and not cut_plants else site_segments
+        bucket = plant_segments if _is_overlay(category, layer) else site_segments
         for points, closed in _flattened_paths(entity, scale):
             if len(points) < 2:
                 continue
@@ -1320,22 +1373,42 @@ def extract_curve_pieces(
             for start, end in pairs:
                 bucket.append(((start[0], start[1]), (end[0], end[1]), layer))
 
+    def take_fill_boundary(entity: DXFEntity, layer: str) -> None:
+        nonlocal skipped_frames
+        if not config.settings().contour_from_fills or normalize_name(layer) not in boundary_layers:
+            return
+        category = category_of(layer)
+        entity_type = entity.dxftype()
+        if category is None or (entity_type not in FILL_TYPES and entity_type not in QUAD_TYPES):
+            return
+        handle = str(entity.dxf.get("handle", "") or "")
+        for outer, holes in _fill_rings(entity, scale):
+            if _path_span(outer) > max_span:
+                skipped_frames += 1
+                continue
+            piece = _fill_contour_piece(category, layer, outer, holes, max_span, minimum, handle)
+            if piece is not None:
+                fill_contours.append(piece)
+
     for entity in document.modelspace():
         layer = str(entity.dxf.layer)
         take(entity, layer)
+        take_fill_boundary(entity, layer)
         if not include_blocks or not isinstance(entity, Insert):
             continue
         insert_category = category_of(layer)
         for child, child_layer, _block_path in _iter_block_content(entity):
             if category_of(child_layer) is None and insert_category and is_generic_block_layer(child_layer):
                 take(child, layer)
+                take_fill_boundary(child, layer)
             else:
                 take(child, child_layer)
+                take_fill_boundary(child, child_layer)
 
     site_pieces, skipped_site = _curve_pieces_from_segments(site_segments, category_of, layer_to_category)
     plant_pieces, skipped_plant = _curve_pieces_from_segments(plant_segments, category_of, layer_to_category)
     skipped_frames += skipped_site + skipped_plant
-    pieces = site_pieces + plant_pieces
+    pieces = site_pieces + plant_pieces + fill_contours
     pieces = _keep_compact_copies(pieces, max_span * 0.5)
     print(
         f"Контуры: отрезков {len(site_segments) + len(plant_segments)}, граней {len(pieces)}, "
@@ -1737,19 +1810,84 @@ def _polygon_patch(polygon: ShapelyPolygon, color: tuple[float, float, float], m
     )
 
 
+def _is_overlay(category: str | None, layer: str) -> bool:
+    """Тип «МАФ» и слои «Площадки» не вырезают землю, пока галочка вырезания выключена."""
+    if config.settings().cut_vegetation:
+        return False
+    if category == "furniture":
+        return True
+    return "ПЛОЩАДК" in layer_leaf(layer)
+
+
+def _without_symbol_holes(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
+    """Дырка газона или покрытия, совпавшая с МАФ или площадкой, перестаёт быть дыркой."""
+    symbols = [
+        polygon
+        for piece in pieces
+        if _is_overlay(piece.category, piece.layer)
+        for polygon in _piece_polygons(piece)
+    ]
+    if not symbols:
+        return list(pieces)
+    tree = STRtree(symbols)
+    cleaned: list[HatchPiece] = []
+    for piece in pieces:
+        if _is_overlay(piece.category, piece.layer) or not piece.holes:
+            cleaned.append(piece)
+            continue
+        kept: list[list[tuple[float, float, float]]] = []
+        for hole in piece.holes:
+            ring = [(float(point[0]), float(point[1])) for point in hole]
+            if len(ring) < 3:
+                continue
+            try:
+                hole_polygon = ShapelyPolygon(ring)
+                if not hole_polygon.is_valid:
+                    hole_polygon = make_valid(hole_polygon)
+            except Exception:
+                kept.append(hole)
+                continue
+            area = float(hole_polygon.area)
+            if area <= 0:
+                continue
+            drop = False
+            try:
+                hits = tree.query(hole_polygon)
+            except Exception:
+                hits = []
+            for index in hits:
+                try:
+                    overlap = float(hole_polygon.intersection(symbols[int(index)]).area)
+                except Exception:
+                    continue
+                if overlap >= area * 0.5:
+                    drop = True
+                    break
+            if not drop:
+                kept.append(hole)
+        if len(kept) == len(piece.holes):
+            cleaned.append(piece)
+            continue
+        cleaned.append(HatchPiece(
+            piece.category, piece.layer, piece.vertices, kept, piece.handle, piece.block_path,
+        ))
+    return cleaned
+
+
 def arrange_hatch_faces_by_layer(
     pieces: Sequence[HatchPiece],
 ) -> list[tuple[BaseGeometry, str, str]]:
     """Arrangement, но грань помнит слой AutoCAD.
 
-    По умолчанию контуры деревьев и кустов не режут газоны и покрытия:
-    зелень добавляется своим слоем поверх целой площадки.
+    По умолчанию слой типа «МАФ» и слой с «Площадки» в имени не режут газоны и покрытия:
+    они добавляются своим слоем поверх целой площадки.
     """
+    pieces = _without_symbol_holes(pieces)
     clustered = _cluster_hatch_pieces(pieces)
-    if config.settings().cut_vegetation:
+    symbols = [piece for piece in clustered if _is_overlay(piece.category, piece.layer)]
+    if not symbols:
         return _arrange_piece_polygons(clustered)
-    base = [piece for piece in clustered if piece.category != "vegetation"]
-    symbols = [piece for piece in clustered if piece.category == "vegetation"]
+    base = [piece for piece in clustered if not _is_overlay(piece.category, piece.layer)]
     arranged = _arrange_piece_polygons(base)
     extra: list[tuple[BaseGeometry, str, str]] = []
     for piece in symbols:
@@ -2441,9 +2579,8 @@ def pieces_from_cache(
                 pieces.append(HatchPiece(chosen, stored_layer, outer_xyz, hole_xyz, handle, block_path))
     if any(curve_groups.values()):
         category_of, layer_to_category = _category_lookup(
-            curve_groups, True, None, match_leaf=True, known_layers=known,
+            curve_groups, True, None, match_leaf=False, known_layers=known,
         )
-        cut_plants = bool(config.settings().cut_vegetation)
         site: list[tuple[tuple[float, float], tuple[float, float], str]] = []
         plants: list[tuple[tuple[float, float], tuple[float, float], str]] = []
         for layer, insert_layer, x1, y1, x2, y2 in payload.get("curves") or []:
@@ -2459,14 +2596,38 @@ def pieces_from_cache(
             if category is None:
                 continue
             segment = ((float(x1), float(y1)), (float(x2), float(y2)), resolved)
-            if category == "vegetation" and not cut_plants:
+            if _is_overlay(category, resolved):
                 plants.append(segment)
             else:
                 site.append(segment)
+        max_span = config.settings().max_contour_span_m
+        minimum = config.settings().min_arrangement_area_m2
         curve_pieces, _skipped = _curve_pieces_from_segments(site, category_of, layer_to_category)
         plant_pieces, _plant_skipped = _curve_pieces_from_segments(plants, category_of, layer_to_category)
-        max_span = config.settings().max_contour_span_m
-        pieces.extend(_keep_compact_copies(curve_pieces + plant_pieces, max_span * 0.5))
+        fill_contours: list[HatchPiece] = []
+        if config.settings().contour_from_fills:
+            for kind, layer, insert_layer, _solid, handle, outer, holes in payload.get("fills") or []:
+                if kind not in {"h", "q"}:
+                    continue
+                resolved = str(layer)
+                if (
+                    insert_layer
+                    and category_of(resolved) is None
+                    and category_of(str(insert_layer))
+                    and is_generic_block_layer(resolved)
+                ):
+                    resolved = str(insert_layer)
+                category = category_of(resolved)
+                if category is None or per_layer.get(normalize_name(resolved), source_mode) != "curves":
+                    continue
+                if _path_span(outer) > max_span:
+                    continue
+                piece = _fill_contour_piece(
+                    category, resolved, outer, holes or [], max_span, minimum, str(handle or ""),
+                )
+                if piece is not None:
+                    fill_contours.append(piece)
+        pieces.extend(_keep_compact_copies(curve_pieces + plant_pieces + fill_contours, max_span * 0.5))
     return pieces
 
 
@@ -2653,8 +2814,15 @@ def export_blender_underlay(
             document, fill_groups, include_blocks=include_blocks, lock_groups=lock_groups,
         ))
     if curve_groups:
+        boundary_layers = [
+            name
+            for names in by_category.values()
+            for name in names
+            if per_layer.get(normalize_name(name), source_mode) == "curves"
+        ]
         pieces.extend(extract_curve_pieces(
             document, curve_groups, include_blocks=include_blocks, lock_groups=lock_groups,
+            fill_boundary_layers=boundary_layers,
         ))
     from_blocks = sum(1 for piece in pieces if piece.from_block)
     print(f"Фигур для подложки: {len(pieces)}")

@@ -41,7 +41,7 @@ from .build_scene import build, remove_root
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 4, 2),
+    "version": (1, 4, 12),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF → проверка слоёв → благоустройство в сцене",
@@ -79,6 +79,10 @@ ORIGIN_MODES = (
     ("mass", "Центр масс площадок", "Ноль сцены в центре масс площадок участка"),
     ("bbox", "Центр габарита", "Ноль сцены в центре габарита построенной геометрии"),
     ("zero", "Начало чертежа (0,0)", "Координаты как в AutoCAD. Далёкие от нуля координаты Blender показывает с дрожанием"),
+)
+CONTOUR_ARRANGEMENT_MODES = (
+    ("layer", "Отдельно по слоям", "Сначала замыкать линии каждого слоя отдельно. Рекомендуется"),
+    ("combined", "Совместно", "Линии разных выбранных слоёв могут вместе образовать полигон"),
 )
 SPLIT_MODES = (
     ("layer", "Один объект на слой", "Все полигоны слоя AutoCAD в одном объекте"),
@@ -272,6 +276,9 @@ def _settings_payload(prefs, source: Path) -> dict:
         "generic_fill_associate_m": float(prefs.generic_fill_associate_m),
         "min_arrangement_area_m2": float(prefs.min_arrangement_area_m2),
         "flattening_distance_m": float(prefs.flattening_distance_m),
+        "contour_snap_tolerance_m": float(prefs.contour_snap_tolerance_m),
+        "contour_arrangement_mode": str(prefs.contour_arrangement_mode),
+        "contour_from_fills": bool(prefs.contour_from_fills),
         "cut_vegetation": bool(prefs.cut_vegetation),
         "scene_scale": float(prefs.scene_scale),
         "origin_mode": str(prefs.origin_mode),
@@ -388,9 +395,28 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         soft_max=1.0,
         precision=3,
     )
+    contour_snap_tolerance_m: FloatProperty(
+        name="Соединение контуров, м",
+        description="Концы линий не дальше этого расстояния считаются одной точкой",
+        default=0.02,
+        min=0.0,
+        soft_max=1.0,
+        precision=3,
+    )
+    contour_arrangement_mode: EnumProperty(
+        name="Сборка контуров",
+        description="Объединять линии отдельно по слоям или совместно",
+        items=CONTOUR_ARRANGEMENT_MODES,
+        default="layer",
+    )
+    contour_from_fills: BoolProperty(
+        name="Контуры из заливок",
+        description="В режиме «Контуры» граница штриховки тоже собирается в полигон, даже если отдельной линии на слое нет",
+        default=False,
+    )
     cut_vegetation: BoolProperty(
-        name="Вырезать деревья и кусты",
-        description="Контуры деревьев и кустов прорезают газоны и покрытия. Выключено — площадки остаются целыми, зелень лежит своим слоем",
+        name="Вырезать полигоны под МАФ и площадками",
+        description="Выключено: слой типа «МАФ» и слой с «Площадки» в имени лежат поверх целого газона и покрытия. Включено: их контур вырезает землю",
         default=False,
     )
     scene_scale: FloatProperty(
@@ -428,13 +454,6 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         description="Слой отбрасывается, если в хвосте имени есть один из фрагментов. Через запятую",
         default=JUNK_TOKENS,
     )
-    library_dir: StringProperty(
-        name="Библиотека моделей",
-        description="Папка с catalog.json и отдельным GLB на каждую модель",
-        subtype="DIR_PATH",
-        default="",
-    )
-
     def draw(self, context):
         layout = self.layout
         layout.operator("dwgreader.install_deps", icon="IMPORT")
@@ -442,7 +461,6 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         if not _oda_installed(self):
             layout.operator("dwgreader.install_oda", icon="IMPORT")
         layout.prop(self, "output_dir")
-        layout.prop(self, "library_dir")
 
         services = layout.box()
         services.label(text="Классификация слоёв")
@@ -470,7 +488,8 @@ def _draw_geometry(layout, prefs) -> None:
     layout.prop(prefs, "generic_fill_associate_m")
     layout.prop(prefs, "min_arrangement_area_m2")
     layout.prop(prefs, "flattening_distance_m")
-    layout.prop(prefs, "cut_vegetation")
+    layout.prop(prefs, "contour_snap_tolerance_m")
+    layout.prop(prefs, "contour_arrangement_mode")
 
 
 def _draw_split(layout, prefs) -> None:
@@ -1304,6 +1323,11 @@ def _draw_step_objects(layout, context, prefs) -> None:
         f"{_objects_text(summary['recognized_objects'])} в {_layers_text(summary['recognized'])}."
     )
     box.prop(scene, "dwgreader_geometry", text="Отрисовка")
+    if prefs is not None:
+        fills_only = scene.dwgreader_geometry == "fills"
+        contour_option = box.row()
+        contour_option.enabled = not fills_only
+        contour_option.prop(prefs, "contour_from_fills")
     row = box.row(align=True)
     row.prop(scene, "dwgreader_filter", text="", icon="VIEWZOOM")
     row.operator("dwgreader.mark_layers", text="Все").state = True
@@ -1340,6 +1364,7 @@ def _draw_step_objects(layout, context, prefs) -> None:
         col = params.column()
         col.use_property_split = True
         col.use_property_decorate = False
+        col.prop(prefs, "cut_vegetation")
         _draw_split(col, prefs)
 
     nav = layout.row(align=True)
@@ -1749,10 +1774,6 @@ def register() -> None:
             prefs.llm_model = "qwen/qwen3-vl-30b-a3b-instruct"
         if prefs.llm_base_url in {"", "http://127.0.0.1:1234/v1"}:
             prefs.llm_base_url = "https://llm-router.cxm.dev/v1/"
-        if not str(prefs.library_dir or "").strip():
-            candidate = Path(r"c:\Users\user\PycharmProjects\DWGREADER\maf_blender_models")
-            if (candidate / "catalog.json").is_file():
-                prefs.library_dir = str(candidate)
 
 
 def unregister() -> None:

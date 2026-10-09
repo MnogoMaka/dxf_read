@@ -15,8 +15,8 @@ def main() -> None:
     failed: list[str] = []
 
     for index, dwg in enumerate(drawings, start=1):
-        if 'СПОЗУ Рычагова 22_дом_17_10_24' not in dwg.name:
-            continue
+        # if 'СПОЗУ Рычагова 22_дом_17_10_24' not in dwg.name:
+        #     continue
         print(f"\n[{index}/{len(drawings)}] {dwg.name}")
         try:
             result = run_pipeline(dwg)

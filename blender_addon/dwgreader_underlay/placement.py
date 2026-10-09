@@ -1,7 +1,6 @@
 """Расстановка деревьев, лавок и площадок по подложке.
 
-Модели читаются из папки с catalog.json, по одному GLB на объект.
-Общий файл библиотеки не используется.
+Модели лежат в папке library рядом с аддоном: catalog.json и отдельный GLB на объект.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ from .placement_math import (
     orientation_angle,
     polygon_area_xy,
     polygon_centroid_xy,
-    rank_playgrounds,
     scatter_points,
 )
 
@@ -53,22 +51,22 @@ def _prefs(context):
     return addon.preferences if addon is not None else None
 
 
+def bundled_library() -> Path:
+    return Path(__file__).resolve().parent / "library"
+
+
 def library_path(context) -> Path | None:
-    prefs = _prefs(context)
-    if prefs is None:
-        return None
-    raw = str(prefs.library_dir or "").strip()
-    if not raw:
-        return None
-    path = Path(bpy.path.abspath(raw))
-    return path if path.is_dir() else None
+    folder = bundled_library()
+    if (folder / "catalog.json").is_file():
+        return folder
+    return None
 
 
 def load_catalog(context) -> list[dict]:
     global _CATALOG, _CATALOG_STAMP
     folder = library_path(context)
     if folder is None:
-        raise PlacementError("Укажите папку библиотеки с catalog.json")
+        raise PlacementError("В аддоне нет библиотеки моделей")
     catalog_path = folder / "catalog.json"
     if not catalog_path.is_file():
         raise PlacementError("В папке библиотеки нет catalog.json")
@@ -171,7 +169,7 @@ def _import_mesh(context, asset: dict) -> bpy.types.Object:
         return existing
     folder = library_path(context)
     if folder is None:
-        raise PlacementError("Укажите папку библиотеки")
+        raise PlacementError("В аддоне нет библиотеки моделей")
     filepath = folder / asset["file"]
     if not filepath.is_file():
         raise PlacementError(f"Нет файла модели: {asset['file']}")
@@ -455,28 +453,68 @@ def _listed_layer_meshes(context) -> list[bpy.types.Object]:
     return _meshes_named(layer_name)
 
 
-def _single_underlay_mesh(context) -> bpy.types.Object | None:
-    """Один выделенный полигон. Много выделенных сразу — это не выбор зоны."""
-    active = context.active_object
-    selected = [
-        obj for obj in context.selected_objects
-        if obj.type == "MESH" and not _placement_source(obj)
-    ]
-    if len(selected) != 1:
-        return None
-    if active is not None and active.type == "MESH" and active in selected:
+_LAST_ZONE = ""
+_PLANT_OWNER = object()
+
+
+def _context_active_object(context):
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is not None and view_layer.objects.active is not None:
+        return view_layer.objects.active
+    return getattr(context, "active_object", None)
+
+
+def _remember_zone(obj: bpy.types.Object | None) -> None:
+    global _LAST_ZONE
+    if obj is not None and obj.type == "MESH" and not _placement_source(obj):
+        _LAST_ZONE = obj.name
+
+
+def _track_clicked_zone() -> None:
+    context = bpy.context
+    if context is None:
+        return
+    _remember_zone(_context_active_object(context))
+
+
+def _active_zone_mesh(context) -> bpy.types.Object | None:
+    """Полигон, который пользователь кликнул. Соседние выделенные объекты не берём."""
+    active = _context_active_object(context)
+    if active is not None and active.type == "MESH" and not _placement_source(active):
+        _remember_zone(active)
         return active
-    return selected[0]
+    return None
 
 
-def _selected_zones(context) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]], str, float]]:
+def _slider_zone_mesh(context) -> bpy.types.Object | None:
+    """Ползунок меняет только полигон последнего клика, не весь слой из списка."""
+    picked = _active_zone_mesh(context)
+    if picked is not None:
+        return picked
+    remembered = bpy.data.objects.get(_LAST_ZONE) if _LAST_ZONE else None
+    if remembered is not None and remembered.type == "MESH" and not _placement_source(remembered):
+        return remembered
+    return None
+
+
+def _single_underlay_mesh(context) -> bpy.types.Object | None:
+    return _active_zone_mesh(context)
+
+
+def _selected_zones(
+    context,
+    only: bpy.types.Object | None = None,
+    allow_layer_fallback: bool = True,
+) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]], str, float]]:
     edit = context.mode == "EDIT_MESH"
-    active = context.active_object
-    picked = _single_underlay_mesh(context)
-    if edit:
+    active = _context_active_object(context)
+    picked = only if only is not None else _active_zone_mesh(context)
+    if edit and only is None:
         objects = [active]
     elif picked is not None:
         objects = [picked]
+    elif not allow_layer_fallback:
+        raise PlacementError("Выберите полигон в 3D-виде")
     else:
         objects = _listed_layer_meshes(context)
         if not objects:
@@ -537,12 +575,28 @@ def _replace_owned(collection: bpy.types.Collection, zone_key: str) -> None:
 _PLANT_LOCK = False
 _PLANT_PENDING = False
 _PLANT_UI_SEEN = False
+_PLANT_TARGET = ""
 
 
 def _plant_target_ready(context) -> bool:
-    if _single_underlay_mesh(context) is not None:
-        return True
-    return bool(_listed_layer_meshes(context))
+    return _slider_zone_mesh(context) is not None
+
+
+def _model_scale(context, prop: str) -> float:
+    return max(float(getattr(context.scene, prop, 1.0) or 1.0), 0.05)
+
+
+def _scale_placed(kind: str, scale: float) -> None:
+    root = bpy.data.collections.get(ROOT_NAME)
+    if root is None:
+        return
+    for obj in root.all_objects:
+        if kind == "linear" and obj.get("placement") == "linear":
+            for child in obj.children:
+                if child.type == "MESH":
+                    child.scale = (scale, scale, scale)
+        elif obj.get("placement") == kind and obj.type == "MESH":
+            obj.scale = (scale, scale, scale)
 
 
 def _pick_plant(rng: random.Random, trees: list[dict], bushes: list[dict], share: float) -> dict:
@@ -553,9 +607,9 @@ def _pick_plant(rng: random.Random, trees: list[dict], bushes: list[dict], share
     return pool[rng.randrange(len(pool))]
 
 
-def _run_plantings(context) -> tuple[int, str]:
+def _run_plantings(context, only: bpy.types.Object | None = None, allow_layer_fallback: bool = True) -> tuple[int, str]:
     """Копии моделей, как у лавок. Геоноды в окне Blender оставляли слой пустым."""
-    zones = _selected_zones(context)
+    zones = _selected_zones(context, only=only, allow_layer_fallback=allow_layer_fallback)
     density = float(context.scene.dwgreader_density) / 100.0
     share = float(context.scene.dwgreader_tree_share) / 100.0
     seed = int(context.scene.dwgreader_seed)
@@ -569,7 +623,7 @@ def _run_plantings(context) -> tuple[int, str]:
         bush_assets = [asset for asset in bush_assets if asset["id"] == bush_choice]
     if not tree_assets and not bush_assets:
         raise PlacementError("В каталоге нет выбранных деревьев и кустов")
-    scale = max(float(getattr(context.scene, "dwgreader_plant_scale", 1.0) or 1.0), 0.05)
+    scale = _model_scale(context, "dwgreader_plant_scale")
     sources: dict[str, bpy.types.Object] = {}
 
     def source_for(asset: dict) -> bpy.types.Object:
@@ -630,16 +684,21 @@ def _run_plantings(context) -> tuple[int, str]:
 
 
 def _on_plant_update(self, context):
-    global _PLANT_PENDING
-    if _PLANT_LOCK or _PLANT_PENDING or not _PLANT_UI_SEEN or context is None or _busy(context):
+    global _PLANT_PENDING, _PLANT_TARGET
+    if _PLANT_LOCK or not _PLANT_UI_SEEN or context is None or _busy(context):
         return
     scene = getattr(context, "scene", None)
     if scene is None:
         return
     if getattr(scene, "dwgreader_place_mode", "plantings") != "plantings":
         return
-    if not _plant_target_ready(context):
-        _status(context, "Выберите слой в списке или полигон в 3D-виде")
+    zone = _slider_zone_mesh(context)
+    if zone is None:
+        _status(context, "Выберите полигон в 3D-виде")
+        return
+    _remember_zone(zone)
+    _PLANT_TARGET = zone.name
+    if _PLANT_PENDING:
         return
     _PLANT_PENDING = True
 
@@ -647,11 +706,14 @@ def _on_plant_update(self, context):
         global _PLANT_LOCK, _PLANT_PENDING
         _PLANT_PENDING = False
         current = bpy.context
-        if current is None or _PLANT_LOCK or _busy(current) or not _plant_target_ready(current):
+        if current is None or _PLANT_LOCK or _busy(current):
+            return None
+        zone_now = bpy.data.objects.get(_PLANT_TARGET) if _PLANT_TARGET else None
+        if zone_now is None or zone_now.type != "MESH" or _placement_source(zone_now):
             return None
         _PLANT_LOCK = True
         try:
-            _count, note = _run_plantings(current)
+            _count, note = _run_plantings(current, only=zone_now, allow_layer_fallback=False)
             _status(current, note)
         except PlacementError as exc:
             _status(current, str(exc))
@@ -804,18 +866,15 @@ def _place_playground_on(
     if rectangle is None:
         raise PlacementError("У зоны нет габарита")
     zone_width, zone_depth, edge_angle, rect_center = rectangle
-    fitting, excess = rank_playgrounds(zone_width, zone_depth, catalog)
-    if not fitting:
-        extra = 0.0 if excess is None else excess
-        raise PlacementError(f"Нет модели, которая влезает. Ближайшая больше на {extra:.1f} м")
+    asset_id = str(getattr(context.scene, "dwgreader_play_asset", "") or "")
+    asset = next((item for item in catalog if item["id"] == asset_id), None)
+    if asset is None:
+        asset = catalog[0]
     center = polygon_centroid_xy(vertices, faces)
     if center is None:
         center = (rect_center[0], rect_center[1], 0.0)
     collection = _placement_collection("playgrounds")
-    _replace_owned(collection, key)
-    ids = [item[0] for item in fitting]
-    rotations = [orientation_angle(edge_angle, item[1]) for item in fitting]
-    asset = _asset(context, ids[0])
+    rotation = orientation_angle(edge_angle, _playground_orientation(zone_width, zone_depth, asset))
     source = _import_mesh(context, asset)
     obj = source.copy()
     obj.data = source.data
@@ -824,17 +883,18 @@ def _place_playground_on(
     obj.hide_select = False
     obj.name = f"PLAY_{asset['id']}"
     obj.location = center
-    obj.rotation_euler = (0.0, 0.0, rotations[0])
+    obj.rotation_euler = (0.0, 0.0, rotation)
+    obj.scale = (_model_scale(context, "dwgreader_play_scale"),) * 3
     obj["placement"] = "area"
     obj["family"] = "playground"
     obj["asset_id"] = asset["id"]
     obj["zone_key"] = key
-    obj["fit_ids"] = ",".join(ids)
-    obj["fit_rotations"] = ",".join(f"{angle:.6f}" for angle in rotations)
-    obj["fit_index"] = 0
+    obj["zone_width"] = zone_width
+    obj["zone_depth"] = zone_depth
+    obj["edge_angle"] = edge_angle
     collection.objects.link(obj)
     obj.hide_set(False)
-    return f"Площадка: {asset['name']}, полигон {zone_width:.1f}×{zone_depth:.1f} м"
+    return f"Площадка добавлена: {asset['name']}, полигон {zone_width:.1f}×{zone_depth:.1f} м"
 
 
 def _underlay_hit(context, event) -> tuple[bpy.types.Object, int] | None:
@@ -887,8 +947,8 @@ def _underlay_hit(context, event) -> tuple[bpy.types.Object, int] | None:
 
 class DWGREADER_OT_place_playground(Operator):
     bl_idname = "dwgreader.place_playground"
-    bl_label = "Подобрать площадку"
-    bl_description = "Ставит комплекс в центр выбранного полигона. Если в слое их несколько — кликните по нужному"
+    bl_label = "Поставить площадку"
+    bl_description = "Добавляет модель в центр выбранного полигона. Уже стоящие площадки остаются"
     bl_options = {"UNDO"}
 
     @classmethod
@@ -1018,36 +1078,48 @@ def _placement_target(context) -> bpy.types.Object | None:
     return None
 
 
+def _playground_orientation(zone_width: float, zone_depth: float, asset: dict) -> str:
+    width, depth = float(asset["footprint"][0]), float(asset["footprint"][1])
+    excess_a = max(width - zone_width, depth - zone_depth, 0.0)
+    excess_b = max(width - zone_depth, depth - zone_width, 0.0)
+    return "A" if excess_a <= excess_b else "B"
+
+
 def _replace_playground(context, obj: bpy.types.Object) -> None:
-    ids = [item for item in str(obj.get("fit_ids") or "").split(",") if item]
-    rotations = [float(item) for item in str(obj.get("fit_rotations") or "").split(",") if item]
-    if len(ids) < 2 or len(rotations) != len(ids):
-        raise PlacementError("Для этой зоны другой подходящей модели нет")
-    index = (int(obj.get("fit_index") or 0) + 1) % len(ids)
-    asset = _asset(context, ids[index])
+    asset_id = str(getattr(context.scene, "dwgreader_play_asset", "") or "")
+    asset = _asset(context, asset_id)
+    if asset["family"] != "playground":
+        raise PlacementError("Выберите модель площадки в списке")
     source = _import_mesh(context, asset)
     obj.data = source.data
-    obj.rotation_euler = (0.0, 0.0, rotations[index])
     obj["asset_id"] = asset["id"]
-    obj["fit_index"] = index
     obj.name = f"PLAY_{asset['id']}"
+    obj.scale = (_model_scale(context, "dwgreader_play_scale"),) * 3
+    if "edge_angle" in obj.keys():
+        rotation = orientation_angle(
+            float(obj["edge_angle"]),
+            _playground_orientation(float(obj["zone_width"]), float(obj["zone_depth"]), asset),
+        )
+        obj.rotation_euler = (0.0, 0.0, rotation)
     _status(context, f"Площадка заменена: {asset['name']}")
 
 
 def _replace_benches(context, parent: bpy.types.Object) -> None:
     family = list(_assets(context, "bench"))
-    if len(family) < 2:
-        raise PlacementError("В каталоге одна лавка, заменять нечем")
-    current = str(parent.get("asset_id") or "")
-    ids = [asset["id"] for asset in family]
-    index = (ids.index(current) + 1) % len(ids) if current in ids else 0
-    asset = family[index]
+    if not family:
+        raise PlacementError("В каталоге нет лавок")
+    asset_id = str(getattr(context.scene, "dwgreader_bench_asset", "") or "")
+    asset = next((item for item in family if item["id"] == asset_id), None)
+    if asset is None:
+        raise PlacementError("Выберите модель лавки в списке")
     source = _import_mesh(context, asset)
     children = [child for child in parent.children if child.type == "MESH"]
     if not children:
         raise PlacementError("У отрезка нет лавок")
+    scale = _model_scale(context, "dwgreader_bench_scale")
     for child in children:
         child.data = source.data
+        child.scale = (scale, scale, scale)
     parent["asset_id"] = asset["id"]
     _status(context, f"Лавки заменены: {asset['name']}")
 
@@ -1092,6 +1164,7 @@ def _place_benches(context, start: tuple[float, float], end: tuple[float, float]
         inst.parent = parent
         inst.location = (point[0], point[1], 0.0)
         inst.rotation_euler = (0.0, 0.0, angle)
+        inst.scale = (_model_scale(context, "dwgreader_bench_scale"),) * 3
         inst["asset_id"] = asset["id"]
         collection.objects.link(inst)
     return len(points)
@@ -1151,6 +1224,28 @@ _tree_model_items = _family_model_items("tree", "Нет деревьев в ка
 _bush_model_items = _family_model_items("bush", "Нет кустов в каталоге")
 
 
+def _play_items(self, context):
+    try:
+        assets = _assets(context, "playground")
+    except PlacementError:
+        assets = []
+    if not assets:
+        return [("none", "Нет площадок в каталоге", "")]
+    return [(asset["id"], asset["name"], asset["file"]) for asset in assets]
+
+
+def _on_bench_scale(self, context):
+    if context is None:
+        return
+    _scale_placed("linear", max(float(self.dwgreader_bench_scale), 0.05))
+
+
+def _on_play_scale(self, context):
+    if context is None:
+        return
+    _scale_placed("area", max(float(self.dwgreader_play_scale), 0.05))
+
+
 def _bench_items(self, context):
     try:
         assets = _assets(context, "bench")
@@ -1176,7 +1271,6 @@ def draw_panel(layout, context) -> None:
     if prefs is None:
         box.label(text="Нет настроек аддона")
         return
-    box.prop(prefs, "library_dir", text="Библиотека")
     try:
         load_catalog(context)
     except PlacementError as exc:
@@ -1191,7 +1285,7 @@ def draw_panel(layout, context) -> None:
         tabs.prop(scene, "dwgreader_place_mode", expand=True)
         mode = scene.dwgreader_place_mode
         if mode == "plantings":
-            box.label(text="Слой или выделенный полигон любой модели")
+            box.label(text="Посадки ставятся на активный полигон")
             if len(scene.dwgreader_selected):
                 box.template_list(
                     "DWGREADER_UL_place_layers", "place",
@@ -1205,17 +1299,20 @@ def draw_panel(layout, context) -> None:
             box.prop(scene, "dwgreader_tree_share")
             box.prop(scene, "dwgreader_density")
             box.prop(scene, "dwgreader_seed")
-            box.prop(scene, "dwgreader_plant_scale")
+            box.prop(scene, "dwgreader_plant_scale", text="Размер деревьев и кустов")
             box.operator("dwgreader.place_plantings", text="Расставить", icon="OUTLINER_OB_CURVES")
         elif mode == "benches":
             box.prop(scene, "dwgreader_bench_asset", text="Модель")
             box.prop(scene, "dwgreader_bench_step")
+            box.prop(scene, "dwgreader_bench_scale", text="Размер лавок и лежаков")
             box.operator("dwgreader.place_benches", text="Указать отрезок", icon="CURVE_PATH")
-            box.operator("dwgreader.replace_model", text="Заменить модель", icon="FILE_REFRESH")
+            box.operator("dwgreader.replace_model", text="Заменить на выбранную", icon="FILE_REFRESH")
         else:
-            box.label(text="Кликните по полигону. Модель встанет в его центр")
-            box.operator("dwgreader.place_playground", text="Подобрать", icon="MESH_PLANE")
-            box.operator("dwgreader.replace_model", text="Заменить модель", icon="FILE_REFRESH")
+            box.label(text="Каждое «Поставить» добавляет модель в центр полигона")
+            box.prop(scene, "dwgreader_play_asset", text="Модель")
+            box.prop(scene, "dwgreader_play_scale", text="Размер площадки")
+            box.operator("dwgreader.place_playground", text="Поставить", icon="MESH_PLANE")
+            box.operator("dwgreader.replace_model", text="Заменить на выбранную", icon="FILE_REFRESH")
     except Exception as exc:
         box.label(text=str(exc))
 
@@ -1231,6 +1328,12 @@ CLASSES = (
 def register() -> None:
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    bpy.msgbus.subscribe_rna(
+        key=(bpy.types.LayerObjects, "active"),
+        owner=_PLANT_OWNER,
+        args=(),
+        notify=_track_clicked_zone,
+    )
     bpy.types.Scene.dwgreader_place_mode = EnumProperty(
         name="Режим",
         items=_mode_items,
@@ -1238,7 +1341,7 @@ def register() -> None:
     )
     bpy.types.Scene.dwgreader_tree_share = FloatProperty(
         name="Доля деревьев, %",
-        description="Остальное — кусты. Меняет уже выбранный слой подложки",
+        description="Остальное — кусты. Меняет посадки на полигоне, выбранном в 3D-виде",
         default=30.0,
         min=0.0,
         max=100.0,
@@ -1287,10 +1390,34 @@ def register() -> None:
         name="Лавка",
         items=_bench_items,
     )
+    bpy.types.Scene.dwgreader_bench_scale = FloatProperty(
+        name="Размер лавок и лежаков",
+        description="Во сколько раз увеличить или уменьшить лавку и лежак",
+        default=1.0,
+        min=0.1,
+        soft_max=4.0,
+        update=_on_bench_scale,
+    )
+    bpy.types.Scene.dwgreader_play_asset = EnumProperty(
+        name="Площадка",
+        items=_play_items,
+    )
+    bpy.types.Scene.dwgreader_play_scale = FloatProperty(
+        name="Размер площадки",
+        description="Во сколько раз увеличить или уменьшить площадку",
+        default=1.0,
+        min=0.1,
+        soft_max=4.0,
+        update=_on_play_scale,
+    )
 
 
 def unregister() -> None:
+    bpy.msgbus.clear_by_owner(_PLANT_OWNER)
     for name in (
+        "dwgreader_play_scale",
+        "dwgreader_play_asset",
+        "dwgreader_bench_scale",
         "dwgreader_bench_asset",
         "dwgreader_bench_step",
         "dwgreader_plant_scale",

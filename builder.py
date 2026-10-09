@@ -24,5 +24,10 @@ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
     zf.writestr("dwgreader_underlay/icons/", "")
     for icon in sorted((addon / "icons").glob("*.png")):
         zf.write(icon, f"dwgreader_underlay/icons/{icon.name}")
+    zf.writestr("dwgreader_underlay/library/", "")
+    library = root / "maf_blender_models"
+    for model in sorted(library.iterdir()):
+        if model.is_file() and model.suffix.lower() in {".glb", ".json"}:
+            zf.write(model, f"dwgreader_underlay/library/{model.name}")
 
 print(zip_path)

@@ -62,6 +62,7 @@ ROOT_COLLECTION = "SITE_UNDERLAY"
 
 #геометрия
 FLATTENING_DISTANCE_M = 0.02
+CONTOUR_SNAP_TOLERANCE_M = 0.02
 MIN_ARRANGEMENT_AREA_M2 = 0.05
 # Рамка листа и копии «Ном.пера» бывают десятки километров. Площадка меньше.
 MAX_CONTOUR_SPAN_M = 8000.0
@@ -211,6 +212,9 @@ class PipelineSettings:
     generic_fill_associate_m: float = 15.0
     min_arrangement_area_m2: float = 0.05
     flattening_distance_m: float = 0.02
+    contour_snap_tolerance_m: float = 0.02
+    contour_arrangement_mode: str = "layer"
+    contour_from_fills: bool = False
     max_contour_span_m: float = 8000.0
     cut_vegetation: bool = False
     scene_scale: float = 1.0
@@ -242,6 +246,9 @@ def settings() -> PipelineSettings:
         generic_fill_associate_m=GENERIC_FILL_ASSOCIATE_M,
         min_arrangement_area_m2=MIN_ARRANGEMENT_AREA_M2,
         flattening_distance_m=FLATTENING_DISTANCE_M,
+        contour_snap_tolerance_m=CONTOUR_SNAP_TOLERANCE_M,
+        contour_arrangement_mode="layer",
+        contour_from_fills=False,
         max_contour_span_m=MAX_CONTOUR_SPAN_M,
         cut_vegetation=False,
         scene_scale=1.0,
