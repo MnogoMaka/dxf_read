@@ -26,7 +26,7 @@ def _reload_stale_modules() -> None:
     """Установка zip выгружает сам пакет, а подмодули старой версии остаются в sys.modules."""
     import importlib
 
-    for name in ("placement_math", "build_scene", "placement"):
+    for name in ("placement_math", "build_scene", "placement", "chatgpt_auth", "building_export"):
         module = sys.modules.get(f"{__name__}.{name}")
         if module is not None:
             importlib.reload(module)
@@ -34,17 +34,17 @@ def _reload_stale_modules() -> None:
 
 _reload_stale_modules()
 
-from . import placement
-from .build_scene import build, remove_root
+from . import building_export, chatgpt_auth, placement
+from .build_scene import SHEET_GAP_M, build, drop_objects, frame_objects, remove_root, sheet_groups, sheet_size
 
 
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 4, 12),
+    "version": (1, 4, 31),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
-    "description": "DXF → проверка слоёв → благоустройство в сцене",
+    "description": "DXF, жилой дом и расстановка благоустройства в сцене",
     "category": "Import-Export",
 }
 
@@ -93,8 +93,9 @@ SCREENS = (
     ("home", "Инструменты", ""),
     ("import", "Импорт DXF", ""),
     ("place", "Озеленение и МАФ", ""),
+    ("building", "Здание", ""),
 )
-PIP_PACKAGES = ("ezdxf", "shapely", "numpy", "mapbox-earcut")
+PIP_PACKAGES = ("ezdxf", "shapely", "numpy", "mapbox-earcut", "PyJWT[crypto]")
 WINGET_ODA_ID = "ODA.ODAFileConverter"
 JUNK_TOKENS = (
     "НОМ._ПЕРА, LABEL_, POINTS_GRID, POINTS_GRADE, NULL_WORKS, "
@@ -201,7 +202,8 @@ def _oda_installed(prefs=None) -> bool:
 
 def _deps_ready() -> bool:
     vendor = _vendor_dir()
-    return all((vendor / name).exists() for name in ("ezdxf", "shapely", "mapbox_earcut", "numpy"))
+    names = ("ezdxf", "shapely", "mapbox_earcut", "numpy", "jwt", "cryptography")
+    return all((vendor / name).exists() for name in names)
 
 
 def _addon_prefs(context):
@@ -288,13 +290,12 @@ def _settings_payload(prefs, source: Path) -> dict:
         "junk_layer_tokens": _tokens(prefs.junk_layer_tokens),
         "llm_model": prefs.llm_model.strip(),
         "llm_base_url": prefs.llm_base_url.strip(),
-        "llm_api_key": prefs.llm_api_key,
         "oda_converter": oda,
         "output_dir": str(_output_dir(prefs, source)),
     }
 
 
-def _python_env() -> dict[str, str]:
+def _python_env(prefs=None, force_api: bool = False) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
@@ -302,7 +303,34 @@ def _python_env() -> dict[str, str]:
     env["PYTHONPATH"] = os.pathsep.join(
         part for part in (str(_vendor_dir()), str(_engine_dir()), env.get("PYTHONPATH", "")) if part
     )
+    env.pop("DWGREADER_CHATGPT_ACCESS_TOKEN", None)
+    env.pop("DWGREADER_CHATGPT_MODEL", None)
+    env.pop("DWGREADER_FORCE_API", None)
+    if prefs is None:
+        return env
+    key = (prefs.llm_api_key or "").strip()
+    if key:
+        env["LLM_API_KEY"] = key
+    else:
+        env.pop("LLM_API_KEY", None)
+    if force_api:
+        env["DWGREADER_FORCE_API"] = "1"
+        return env
+    env.update(chatgpt_auth.child_credentials(getattr(prefs, "chatgpt_model", "")))
     return env
+
+
+def _chatgpt_block_reason(prefs) -> str:
+    """Пустая строка — можно звать план ChatGPT. Иначе разбор запускать нельзя."""
+    profile = chatgpt_auth.public_profile()
+    if profile is None or not profile.get("sharing"):
+        return ""
+    slug = (getattr(prefs, "chatgpt_model", "") or chatgpt_auth.saved_model() or "").strip()
+    if not slug or slug == "none":
+        return "Модель ChatGPT не выбрана. Список моделей ещё не загрузился — повторите через несколько секунд."
+    if not chatgpt_auth.ensure_access():
+        return chatgpt_auth.last_notice() or "Сессия ChatGPT не дала токен доступа"
+    return ""
 
 
 def _redraw(context) -> None:
@@ -312,6 +340,43 @@ def _redraw(context) -> None:
     for area in screen.areas:
         if area.type == "VIEW_3D":
             area.tag_redraw()
+
+
+def _chatgpt_model_items(self, context):
+    models = chatgpt_auth.cached_models()
+    items = [
+        (item["slug"], item.get("display_name") or item["slug"], "")
+        for item in models
+        if item.get("slug")
+    ]
+    current = getattr(self, "chatgpt_model", "") or chatgpt_auth.saved_model()
+    if current and current != "none" and current not in {item[0] for item in items}:
+        items.insert(0, (current, current, ""))
+    if not items:
+        items = [("none", "Модели появятся после входа", "")]
+    return items
+
+
+def _on_chatgpt_model(self, context):
+    chatgpt_auth.remember_model(getattr(self, "chatgpt_model", ""))
+
+
+def _draw_chatgpt(layout, prefs) -> None:
+    profile = chatgpt_auth.public_profile()
+    if profile is None:
+        layout.operator("dwgreader.chatgpt_login", text="Продолжить с ChatGPT")
+        return
+    box = layout.box()
+    box.label(text=profile["email"] or "ChatGPT", icon="USER")
+    if profile["sharing"]:
+        box.label(text="Используется план ChatGPT")
+        if prefs is not None:
+            box.prop(prefs, "chatgpt_model", text="Модель")
+    else:
+        box.label(text="План ChatGPT не разрешён, классификация пойдёт через API", icon="INFO")
+    actions = box.row(align=True)
+    actions.operator("dwgreader.chatgpt_login", text="Переподключить")
+    actions.operator("dwgreader.chatgpt_logout", text="Выйти")
 
 
 class DWGREADER_AddonPreferences(AddonPreferences):
@@ -359,7 +424,12 @@ class DWGREADER_AddonPreferences(AddonPreferences):
     )
     site_cluster_radius_m: FloatProperty(
         name="Радиус кластера, м",
-        description="В одном пятне остаются заливки не дальше этого радиуса друг от друга",
+        description=(
+            "До сборки оставляет одну группу заливок. Пятна, чьи центры ближе этого "
+            "расстояния по цепочке, считаются одним чертежом. В подложку попадает группа "
+            "с наибольшей площадью покрытий, газона и зданий. Остальные чертежи листа "
+            "отбрасываются. 400000 м почти ничего не отбрасывает"
+        ),
         default=400000.0,
         min=1.0,
         soft_max=400000.0,
@@ -415,8 +485,8 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         default=False,
     )
     cut_vegetation: BoolProperty(
-        name="Вырезать полигоны под МАФ и площадками",
-        description="Выключено: слой типа «МАФ» и слой с «Площадки» в имени лежат поверх целого газона и покрытия. Включено: их контур вырезает землю",
+        name="Вырезать полигоны под МАФ и посадками",
+        description="Выключено: слои типов «МАФ» и «Посадки» лежат поверх целого газона и покрытия. Включено: их контур вырезает землю",
         default=False,
     )
     scene_scale: FloatProperty(
@@ -454,16 +524,28 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         description="Слой отбрасывается, если в хвосте имени есть один из фрагментов. Через запятую",
         default=JUNK_TOKENS,
     )
+    chatgpt_model: EnumProperty(
+        name="Модель ChatGPT",
+        description="Модель плана ChatGPT для классификации слоёв",
+        items=_chatgpt_model_items,
+        update=_on_chatgpt_model,
+    )
+
     def draw(self, context):
         layout = self.layout
-        layout.operator("dwgreader.install_deps", icon="IMPORT")
+        row = layout.row(align=True)
+        row.operator("dwgreader.install_deps", icon="IMPORT")
+        if chatgpt_auth.public_profile() is None:
+            row.operator("dwgreader.chatgpt_login", text="Продолжить с ChatGPT")
+        else:
+            _draw_chatgpt(layout, self)
         layout.prop(self, "oda_converter")
         if not _oda_installed(self):
             layout.operator("dwgreader.install_oda", icon="IMPORT")
         layout.prop(self, "output_dir")
 
         services = layout.box()
-        services.label(text="Классификация слоёв")
+        services.label(text="Запасной API, если ChatGPT не подключён")
         services.prop(self, "llm_model")
         services.prop(self, "llm_base_url")
         services.prop(self, "llm_api_key")
@@ -536,6 +618,104 @@ class DWGREADER_OT_install_deps(Operator):
 
     def _stop(self, context, kill: bool) -> None:
         _stop_process(self, context, kill)
+
+
+class DWGREADER_OT_chatgpt_login(Operator):
+    bl_idname = "dwgreader.chatgpt_login"
+    bl_label = "Продолжить с ChatGPT"
+    bl_description = "Вход через браузер. Классификация слоёв пойдёт через план ChatGPT"
+
+    _timer = None
+    _thread = None
+    _job: chatgpt_auth.LoginJob | None = None
+
+    @classmethod
+    def poll(cls, context):
+        return not context.window_manager.dwgreader_busy
+
+    def invoke(self, context, event):
+        if not _deps_ready():
+            self.report({"ERROR"}, "Сначала нажмите «Установить библиотеки»")
+            return {"CANCELLED"}
+        try:
+            chatgpt_auth.ensure_token_checker()
+        except chatgpt_auth.AuthError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        job = chatgpt_auth.LoginJob()
+        self._job = job
+        self._thread = threading.Thread(target=job.run, daemon=True)
+        self._thread.start()
+        context.window_manager.dwgreader_busy = True
+        context.scene.dwgreader_status = "Вход в ChatGPT…"
+        self._timer = context.window_manager.event_timer_add(0.4, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type == "ESC":
+            self._finish(context, cancel=True)
+            return {"CANCELLED"}
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        job = self._job
+        if job is None or not job.done:
+            return {"RUNNING_MODAL"}
+        self._finish(context, cancel=False)
+        if job.email and not job.error:
+            self._remember_model(context, job)
+            self.report({"INFO"}, f"Вход выполнен: {job.email}")
+            context.scene.dwgreader_status = "Используется план ChatGPT" if job.sharing else "План ChatGPT не разрешён"
+            return {"FINISHED"}
+        if job.email and job.error:
+            self._remember_model(context, job)
+            self.report({"WARNING"}, job.error)
+            context.scene.dwgreader_status = job.error[:180]
+            return {"FINISHED"}
+        self.report({"ERROR"}, job.error or "Не удалось войти в ChatGPT")
+        context.scene.dwgreader_status = (job.error or "Не удалось войти в ChatGPT")[:180]
+        return {"CANCELLED"}
+
+    def _remember_model(self, context, job: chatgpt_auth.LoginJob) -> None:
+        prefs = _addon_prefs(context)
+        if prefs is None or not job.models:
+            return
+        slugs = [item["slug"] for item in job.models]
+        saved = chatgpt_auth.saved_model()
+        if saved in slugs:
+            prefs.chatgpt_model = saved
+        elif prefs.chatgpt_model not in slugs:
+            prefs.chatgpt_model = slugs[0]
+
+    def _finish(self, context, cancel: bool) -> None:
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        if cancel and self._job is not None:
+            self._job.cancel()
+        context.window_manager.dwgreader_busy = False
+        _redraw(context)
+
+
+class DWGREADER_OT_chatgpt_logout(Operator):
+    bl_idname = "dwgreader.chatgpt_logout"
+    bl_label = "Выйти"
+    bl_description = "Отзывает сессию ChatGPT на этом компьютере"
+
+    @classmethod
+    def poll(cls, context):
+        return not context.window_manager.dwgreader_busy
+
+    def execute(self, context):
+        try:
+            chatgpt_auth.sign_out()
+        except Exception:
+            self.report({"WARNING"}, "Локальная сессия очищена, отзыв на сервере не подтверждён")
+        else:
+            self.report({"INFO"}, "Выход из ChatGPT выполнен")
+        context.scene.dwgreader_status = "Классификация через API"
+        _redraw(context)
+        return {"FINISHED"}
 
 
 class DWGREADER_OT_install_oda(Operator):
@@ -832,7 +1012,7 @@ def _drawing_path(context) -> Path | None:
     return path
 
 
-def _launch_pipeline(operator, context, extra: list[str], title: str, mode: str):
+def _launch_pipeline(operator, context, extra: list[str], title: str, mode: str, force_api: bool = False):
     prefs = _addon_prefs(context)
     if prefs is None:
         operator.report({"ERROR"}, "Настройки аддона недоступны")
@@ -865,8 +1045,21 @@ def _launch_pipeline(operator, context, extra: list[str], title: str, mode: str)
         *extra,
     ]
     operator._mode = mode
+    if mode == "classify" and not force_api:
+        reason = _chatgpt_block_reason(prefs)
+        if reason:
+            context.scene.dwgreader_chatgpt_block = reason[:400]
+            context.scene.dwgreader_status = reason[:180]
+            operator.report({"WARNING"}, reason[:180])
+            _redraw(context)
+            return {"CANCELLED"}
+    context.scene.dwgreader_chatgpt_block = ""
+    env = _python_env(prefs, force_api=force_api)
+    notice = chatgpt_auth.last_notice()
+    if notice and not force_api:
+        operator.report({"WARNING"}, notice)
     return _start_process(
-        operator, context, command, cwd=engine, env=_python_env(),
+        operator, context, command, cwd=engine, env=env,
         title=title,
         log_path=out / "dwgreader_import.log",
     )
@@ -937,6 +1130,8 @@ def _fill_review(context, layers_path: Path) -> tuple[int, int]:
                     item.category = saved[1]
                 if saved[2] in {"fills", "curves", "both"}:
                     item.geometry = saved[2]
+            if row["fills"] <= 0 and row["curves"] > 0:
+                item.geometry = "curves"
             used_geometry.add(item.geometry)
         if len(used_geometry) > 1:
             scene.dwgreader_geometry = "per_layer"
@@ -966,11 +1161,15 @@ class DWGREADER_OT_classify(Operator):
     def poll(cls, context):
         return not context.window_manager.dwgreader_busy
 
+    force_api: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
+
     def invoke(self, context, event):
+        title = "Классификация через API…" if self.force_api else "Разбор чертежа и классификация слоёв…"
         return _launch_pipeline(
             self, context, ["--classify-only"],
-            "Разбор чертежа и классификация слоёв…",
+            title,
             "classify",
+            force_api=bool(self.force_api),
         )
 
     def modal(self, context, event):
@@ -988,16 +1187,27 @@ class DWGREADER_OT_classify(Operator):
 class DWGREADER_OT_mark_layers(Operator):
     bl_idname = "dwgreader.mark_layers"
     bl_label = "Отметить слои"
-    bl_description = "Поставить или снять галочку у всех слоёв, видимых в списке"
+    bl_description = "Отметить слои для построения"
     bl_options = {"INTERNAL", "UNDO"}
 
-    state: BoolProperty(default=True)
+    mode: EnumProperty(
+        items=(
+            ("all", "Выбрать все", "Поставить галочку у каждого слоя"),
+            ("none", "Снять все", "Снять галочку у каждого слоя"),
+            ("working", "Выбрать рабочие", "Оставить галочки только у слоёв, которым назначен тип"),
+        ),
+        default="all",
+    )
 
     def execute(self, context):
         scene = context.scene
         for item in scene.dwgreader_selected:
-            if _layer_visible(item, scene):
-                item.build = self.state
+            if self.mode == "all":
+                item.build = True
+            elif self.mode == "none":
+                item.build = False
+            else:
+                item.build = item.category not in {"", "none"}
         return {"FINISHED"}
 
 
@@ -1016,6 +1226,63 @@ class DWGREADER_OT_goto(Operator):
             scene.dwgreader_screen = self.screen
         if 1 <= self.step <= 3:
             scene.dwgreader_step = self.step
+        return {"FINISHED"}
+
+
+class DWGREADER_OT_sheet(Operator):
+    bl_idname = "dwgreader.sheet"
+    bl_label = "Чертёж на листе"
+    bl_description = "Показать чертёж, оставить только его или убрать"
+    bl_options = {"UNDO"}
+
+    index: IntProperty(default=0, min=0)
+    action: EnumProperty(
+        items=(
+            ("frame", "Показать", "Кадрировать вид на этот чертёж"),
+            ("keep", "Оставить", "Убрать остальные чертежи листа"),
+            ("drop", "Убрать", "Удалить объекты этого чертежа"),
+        ),
+    )
+
+    def execute(self, context):
+        root = bpy.data.collections.get(UNDERLAY_ROOT)
+        if root is None:
+            self.report({"ERROR"}, "Подложки в сцене нет")
+            return {"CANCELLED"}
+        groups = sheet_groups(root, context.scene.dwgreader_sheet_gap)
+        if self.index >= len(groups):
+            self.report({"ERROR"}, "Список чертежей изменился")
+            return {"CANCELLED"}
+        chosen = groups[self.index]
+        if self.action == "frame":
+            chosen_names = {obj.name for obj in chosen}
+            others = [obj for group in groups for obj in group if obj.name not in chosen_names]
+            frame_objects(context, chosen, others)
+            context.scene.dwgreader_sheet_shown = self.index
+            self.report({"INFO"}, f"Чертёж {self.index + 1}")
+            return {"FINISHED"}
+        context.scene.dwgreader_sheet_shown = -1
+        layer = context.view_layer.objects
+        keep_names = {obj.name for obj in chosen}
+        if self.action == "keep":
+            for obj in chosen:
+                if obj.name in layer:
+                    obj.hide_set(False)
+            others = [obj for group in groups for obj in group if obj.name not in keep_names]
+            count = drop_objects(others, root)
+            self.report({"INFO"}, f"Оставлен чертёж {self.index + 1}, убрано {count}")
+            return {"FINISHED"}
+        count = drop_objects(list(chosen), root)
+        for group in groups:
+            for obj in group:
+                try:
+                    name = obj.name
+                except ReferenceError:
+                    continue
+                if name in keep_names or name not in layer:
+                    continue
+                obj.hide_set(False)
+        self.report({"INFO"}, f"Убран чертёж {self.index + 1}: {count}")
         return {"FINISHED"}
 
 
@@ -1099,6 +1366,27 @@ def _start_ping() -> None:
     threading.Thread(target=_ping_worker, args=(parsed.hostname, port), daemon=True).start()
 
 
+def _restore_chatgpt_models():
+    """Сессия на диске переживает перезапуск. Список моделей подтягивается заново, если его ещё нет."""
+    state = _restore_chatgpt_models
+    state.tries = getattr(state, "tries", 0) + 1
+    profile = chatgpt_auth.public_profile()
+    if profile is None or not profile.get("sharing") or state.tries > 8:
+        return None
+    if state.tries == 1:
+        threading.Thread(target=chatgpt_auth.refresh_models, daemon=True).start()
+    models = chatgpt_auth.cached_models()
+    slugs = [item["slug"] for item in models if item.get("slug")]
+    if not slugs:
+        return 1.0
+    prefs = _addon_prefs(bpy.context)
+    saved = chatgpt_auth.saved_model()
+    if prefs is not None and prefs.chatgpt_model not in slugs:
+        prefs.chatgpt_model = saved if saved in slugs else slugs[0]
+    _redraw(bpy.context)
+    return None
+
+
 def _ping_timer():
     import time as clock
 
@@ -1119,8 +1407,8 @@ def _ping_timer():
 class DWGREADER_OT_generate(Operator):
     bl_idname = "dwgreader.generate_underlay"
     bl_label = "Построить"
-    bl_description = "Собрать подложку в сцене из отмеченных слоёв. Ctrl+Z отменяет весь импорт"
-    bl_options = {"UNDO"}
+    bl_description = "Собрать подложку в сцене из отмеченных слоёв. Прежняя подложка заменяется. Ctrl+Z отменяет весь импорт"
+    bl_options = set()
 
     _timer = None
     _proc = None
@@ -1232,6 +1520,13 @@ def _draw_home(layout, context) -> None:
     op = tile.operator("dwgreader.goto", text="Открыть")
     op.screen = "place"
 
+    tile = _tile(layout, "tile_building", "Здание · геометрические ноды", (
+        "Жилой дом собран нодами — поставит",
+        "его в сцену и выгрузит фасад в GLB.",
+    ))
+    op = tile.operator("dwgreader.goto", text="Открыть")
+    op.screen = "building"
+
     box = layout.box()
     row = box.row()
     row.enabled = False
@@ -1277,6 +1572,22 @@ def _draw_import(layout, context, prefs) -> None:
         _draw_step_result(layout, context)
 
 
+def _wrap_status(text: str, width: int = 42) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        piece = f"{current} {word}".strip()
+        if current and len(piece) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = piece
+    if current:
+        lines.append(current)
+    return lines or [text]
+
+
 def _draw_step_file(layout, context, prefs) -> None:
     scene = context.scene
     box = layout.box()
@@ -1286,21 +1597,17 @@ def _draw_step_file(layout, context, prefs) -> None:
         col = box.column()
         col.use_property_split = True
         col.use_property_decorate = False
-        col.prop(prefs, "scene_scale")
-        col.prop(prefs, "origin_mode")
-        params = box.box()
-        params.prop(
-            scene, "dwgreader_show_params",
-            text="Параметры разбора",
-            icon="TRIA_DOWN" if scene.dwgreader_show_params else "TRIA_RIGHT",
-            emboss=False,
-        )
-        if scene.dwgreader_show_params:
-            col = params.column()
-            col.use_property_split = True
-            col.use_property_decorate = False
-            _draw_geometry(col, prefs)
-            col.prop(prefs, "batch_size")
+        col.prop(prefs, "batch_size")
+    block = (scene.dwgreader_chatgpt_block or "").strip()
+    if block:
+        failed = box.box()
+        failed.label(text="ChatGPT не ответил", icon="ERROR")
+        for line in _wrap_status(block):
+            failed.label(text=line)
+        choice = failed.row(align=True)
+        choice.scale_y = 1.3
+        choice.operator("dwgreader.classify_layers", text="Повторить через ChatGPT").force_api = False
+        choice.operator("dwgreader.classify_layers", text="Получить ответ по API").force_api = True
     run = box.row()
     run.scale_y = 1.4
     run.operator("dwgreader.classify_layers", text="Анализировать чертёж", icon="VIEWZOOM")
@@ -1328,10 +1635,12 @@ def _draw_step_objects(layout, context, prefs) -> None:
         contour_option = box.row()
         contour_option.enabled = not fills_only
         contour_option.prop(prefs, "contour_from_fills")
-    row = box.row(align=True)
-    row.prop(scene, "dwgreader_filter", text="", icon="VIEWZOOM")
-    row.operator("dwgreader.mark_layers", text="Все").state = True
-    row.operator("dwgreader.mark_layers", text="Ничего").state = False
+    box.prop(scene, "dwgreader_filter", text="", icon="VIEWZOOM")
+    marks = box.row(align=True)
+    marks.operator("dwgreader.mark_layers", text="Снять все").mode = "none"
+    marks.operator("dwgreader.mark_layers", text="Выбрать все").mode = "all"
+    working = box.row(align=True)
+    working.operator("dwgreader.mark_layers", text="Выбрать рабочие").mode = "working"
 
     head = box.row(align=True)
     head.label(text="", icon="CHECKBOX_HLT")
@@ -1364,7 +1673,10 @@ def _draw_step_objects(layout, context, prefs) -> None:
         col = params.column()
         col.use_property_split = True
         col.use_property_decorate = False
+        col.prop(prefs, "scene_scale")
+        col.prop(prefs, "origin_mode")
         col.prop(prefs, "cut_vegetation")
+        _draw_geometry(col, prefs)
         _draw_split(col, prefs)
 
     nav = layout.row(align=True)
@@ -1381,6 +1693,58 @@ def _draw_step_objects(layout, context, prefs) -> None:
     note.scale_y = 0.75
     note.label(text="Галочки хранятся в сцене: повторный анализ")
     note.label(text="того же чертежа откроется с ними.")
+
+
+def _sheets_title(count: int) -> str:
+    tail = count % 100
+    if 11 <= tail <= 14:
+        word = "чертежей"
+    elif tail % 10 == 1:
+        word = "чертёж"
+    elif tail % 10 in (2, 3, 4):
+        word = "чертежа"
+    else:
+        word = "чертежей"
+    return f"На листе {count} {word}"
+
+
+def _draw_sheets(layout, context, root) -> None:
+    scene = context.scene
+    groups = sheet_groups(root, scene.dwgreader_sheet_gap)
+    box = layout.box()
+    box.label(text=_sheets_title(len(groups)), icon="MESH_GRID")
+    gap = box.column()
+    gap.use_property_split = True
+    gap.use_property_decorate = False
+    gap.prop(scene, "dwgreader_sheet_gap")
+    if len(groups) < 2:
+        note = box.column(align=True)
+        note.scale_y = 0.75
+        note.label(text="Всё попало в один чертёж. Если на листе их")
+        note.label(text="несколько, уменьшите зазор — части появятся списком.")
+        return
+    note = box.column(align=True)
+    note.scale_y = 0.75
+    note.label(text="Показать приближает вид. Оставить убирает остальные.")
+    for index, group in enumerate(groups[:12]):
+        width, height = sheet_size(group)
+        box.label(text=f"{index + 1} · {width:.0f} × {height:.0f} м · {len(group)}")
+        row = box.row(align=True)
+        show = row.operator(
+            "dwgreader.sheet",
+            text="Показан" if scene.dwgreader_sheet_shown == index else "Показать",
+            depress=scene.dwgreader_sheet_shown == index,
+        )
+        show.index = index
+        show.action = "frame"
+        keep = row.operator("dwgreader.sheet", text="Оставить")
+        keep.index = index
+        keep.action = "keep"
+        drop = row.operator("dwgreader.sheet", text="Убрать")
+        drop.index = index
+        drop.action = "drop"
+    if len(groups) > 12:
+        box.label(text=f"Ещё {len(groups) - 12}. Увеличьте зазор или уберите ближние.")
 
 
 def _draw_step_result(layout, context) -> None:
@@ -1403,6 +1767,7 @@ def _draw_step_result(layout, context) -> None:
     source = Path(str(root.get("dxf_source") or scene.dwgreader_source or "")).name
     if source:
         text.label(text=source)
+    _draw_sheets(layout, context, root)
 
     tree = layout.box()
     top = tree.row()
@@ -1442,6 +1807,25 @@ def _draw_place(layout, context) -> None:
     placement.draw_panel(layout, context)
 
 
+def _draw_building(layout, context) -> None:
+    _draw_back(layout, "Инструменты")
+    box = layout.box()
+    box.label(text="Здание · геометрические ноды", icon="HOME")
+    text = box.column(align=True)
+    text.scale_y = 0.8
+    text.label(text="Если выделен полигон, дом встаёт в его центр.")
+    text.label(text="Тип дома — в списке под кнопкой, не только номер.")
+    run = box.row()
+    run.scale_y = 1.3
+    run.operator("dwgreader.place_building", text="Поставить здание в сцену", icon="HOME")
+    building_export.draw_controls(layout, context)
+    layout.operator("dwgreader.export_building_glb", text="Экспорт выбранного в GLB", icon="EXPORT")
+    hint = layout.column(align=True)
+    hint.scale_y = 0.75
+    hint.label(text="Старый ряд заготовок можно удалить: это были")
+    hint.label(text="разные сохранённые варианты одного и того же дома.")
+
+
 class DWGREADER_PT_panel(Panel):
     bl_label = "Инструменты"
     bl_idname = "DWGREADER_PT_panel"
@@ -1455,11 +1839,14 @@ class DWGREADER_PT_panel(Panel):
         prefs = _addon_prefs(context)
         scene = context.scene
         _draw_setup(layout, prefs)
+        _draw_chatgpt(layout, prefs)
         screen = scene.dwgreader_screen
         if screen == "import":
             _draw_import(layout, context, prefs)
         elif screen == "place":
             _draw_place(layout, context)
+        elif screen == "building":
+            _draw_building(layout, context)
         else:
             _draw_home(layout, context)
         if scene.dwgreader_status:
@@ -1517,6 +1904,7 @@ def _start_process(operator, context, command, cwd: Path, env: dict, title: str,
         "json": "",
         "layers": "",
         "empty": "",
+        "chatgpt_need": "",
         "log": log_path or (cwd / "dwgreader_import.log"),
         "status_locked": False,
     }
@@ -1544,6 +1932,11 @@ def _start_process(operator, context, command, cwd: Path, env: dict, title: str,
                     state["layers"] = line[len(LAYERS_MARKER):].strip()
                 elif line.startswith(EMPTY_MARKER):
                     state["empty"] = line[len(EMPTY_MARKER):].strip()
+                elif line.startswith("CHATGPT_NEED="):
+                    reason = line[len("CHATGPT_NEED="):].strip()
+                    state["chatgpt_need"] = reason
+                    state["status"] = reason[:180]
+                    state["status_locked"] = True
                 elif line.startswith("STATUS="):
                     state["status"] = line[len("STATUS="):].strip()[:180]
                     state["status_locked"] = True
@@ -1596,6 +1989,13 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
     operator._stop(context, kill=False)
 
     if mode == "classify":
+        need = str(state.get("chatgpt_need") or "")
+        if need:
+            context.scene.dwgreader_chatgpt_block = need[:400]
+            context.scene.dwgreader_status = need[:180]
+            operator.report({"WARNING"}, need[:180])
+            _redraw(context)
+            return {"FINISHED"}
         layers_raw = str(state.get("layers") or "")
         layers_path = Path(layers_raw) if layers_raw else None
         if proc.returncode != 0 or layers_path is None or not layers_path.is_file():
@@ -1614,7 +2014,9 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
     if (build or mode == "build") and state.get("empty"):
         message = str(state["empty"])
         context.scene.dwgreader_status = message[:180]
+        _schedule_underlay_replace(context.scene.name, None, message)
         operator.report({"WARNING"}, message)
+        _redraw(context)
         return {"FINISHED"}
 
     if build or mode == "build":
@@ -1629,18 +2031,10 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
             context.scene.dwgreader_status = "JSON подложки не найден"
             operator.report({"ERROR"}, str(json_path))
             return {"CANCELLED"}
-        try:
-            count = build_underlay(json_path)
-        except Exception as exc:
-            context.scene.dwgreader_status = f"Ошибка сборки: {exc}"
-            operator.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        import time as clock
-
-        context.scene.dwgreader_build_seconds = max(clock.time() - _BUILD_STARTED, 0.0) if _BUILD_STARTED else 0.0
-        context.scene.dwgreader_step = 3
-        context.scene.dwgreader_status = f"Готово: объектов в сцене {count}"
-        operator.report({"INFO"}, f"Благоустройство собрано, объектов: {count}")
+        context.scene.dwgreader_status = "Замена подложки в сцене…"
+        _schedule_underlay_replace(context.scene.name, str(json_path))
+        operator.report({"INFO"}, "Подложка заменяется в сцене")
+        _redraw(context)
         return {"FINISHED"}
 
     if proc.returncode != 0:
@@ -1654,16 +2048,49 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
     return {"FINISHED"}
 
 
-def build_underlay(json_path: Path) -> int:
+def _schedule_underlay_replace(scene_name: str, json_path: str | None, empty_message: str | None = None) -> None:
+    """Сборка после завершения оператора. Иначе Blender откатывает удаление старой подложки."""
+
+    def run() -> None:
+        import time as clock
+
+        scene = bpy.data.scenes.get(scene_name)
+        if scene is None:
+            return None
+        try:
+            if not json_path:
+                remove_root(UNDERLAY_ROOT)
+                if empty_message:
+                    scene.dwgreader_status = empty_message[:180]
+                return None
+            count = build_underlay(Path(json_path), scene)
+        except Exception as exc:
+            scene.dwgreader_status = f"Ошибка сборки: {exc}"
+            return None
+        scene.dwgreader_build_seconds = max(clock.time() - _BUILD_STARTED, 0.0) if _BUILD_STARTED else 0.0
+        scene.dwgreader_step = 3
+        scene.dwgreader_status = f"Готово: объектов в сцене {count}"
+        try:
+            bpy.ops.ed.undo_push(message="Подложка DWG")
+        except Exception:
+            pass
+        return None
+
+    bpy.app.timers.register(run, first_interval=0.05)
+
+
+def build_underlay(json_path: Path, scene: bpy.types.Scene | None = None) -> int:
+    target = scene or bpy.context.scene
     prefs = _addon_prefs(bpy.context)
     if prefs is None:
-        return build(json_path)
+        return build(json_path, scene=target)
     gap = float(getattr(prefs, "layer_part_gap_m", 10.0))
     return build(
         json_path,
         gap,
         split_mode=str(getattr(prefs, "split_mode", "gap") or "gap"),
         by_type=bool(getattr(prefs, "by_type_collections", True)),
+        scene=target,
     )
 
 
@@ -1673,11 +2100,14 @@ CLASSES = (
     DWGREADER_UL_layers,
     DWGREADER_UL_place_layers,
     DWGREADER_OT_install_deps,
+    DWGREADER_OT_chatgpt_login,
+    DWGREADER_OT_chatgpt_logout,
     DWGREADER_OT_install_oda,
     DWGREADER_OT_pick_file,
     DWGREADER_OT_classify,
     DWGREADER_OT_mark_layers,
     DWGREADER_OT_goto,
+    DWGREADER_OT_sheet,
     DWGREADER_OT_open_chat,
     DWGREADER_OT_cancel_import,
     DWGREADER_OT_ping,
@@ -1723,6 +2153,7 @@ def register() -> None:
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     placement.register()
+    building_export.register()
     bpy.types.Scene.dwgreader_source = StringProperty(
         name="Чертёж",
         description="Файл DWG или DXF",
@@ -1759,11 +2190,23 @@ def register() -> None:
     bpy.types.Scene.dwgreader_show_params = BoolProperty(name="Параметры разбора", default=False)
     bpy.types.Scene.dwgreader_layer_memory = StringProperty(default="{}", options={"HIDDEN"})
     bpy.types.Scene.dwgreader_build_seconds = FloatProperty(default=0.0, options={"HIDDEN"})
+    bpy.types.Scene.dwgreader_chatgpt_block = StringProperty(default="", options={"HIDDEN"})
+    bpy.types.Scene.dwgreader_sheet_shown = IntProperty(default=-1, options={"HIDDEN"})
+    bpy.types.Scene.dwgreader_sheet_gap = FloatProperty(
+        name="Зазор чертежей, м",
+        description="Объекты подложки дальше этого зазора считаются разными чертежами на одном листе",
+        default=SHEET_GAP_M,
+        min=1.0,
+        soft_max=5000.0,
+        precision=0,
+    )
     bpy.types.WindowManager.dwgreader_busy = BoolProperty(name="Идёт импорт", default=False)
     global _PREVIEWS
     _PREVIEWS = previews.new()
     if not bpy.app.timers.is_registered(_ping_timer):
         bpy.app.timers.register(_ping_timer, first_interval=2.0, persistent=True)
+    if not bpy.app.timers.is_registered(_restore_chatgpt_models):
+        bpy.app.timers.register(_restore_chatgpt_models, first_interval=0.4)
     try:
         addon = bpy.context.preferences.addons.get(__package__ or __name__)
     except Exception:
@@ -1780,11 +2223,17 @@ def unregister() -> None:
     global _PREVIEWS
     if bpy.app.timers.is_registered(_ping_timer):
         bpy.app.timers.unregister(_ping_timer)
+    if bpy.app.timers.is_registered(_restore_chatgpt_models):
+        bpy.app.timers.unregister(_restore_chatgpt_models)
     if _PREVIEWS is not None:
         previews.remove(_PREVIEWS)
         _PREVIEWS = None
     placement.unregister()
+    building_export.unregister()
     for name in (
+        "dwgreader_sheet_shown",
+        "dwgreader_chatgpt_block",
+        "dwgreader_sheet_gap",
         "dwgreader_build_seconds",
         "dwgreader_layer_memory",
         "dwgreader_show_params",

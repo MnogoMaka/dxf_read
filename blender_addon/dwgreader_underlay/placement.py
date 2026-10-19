@@ -7,20 +7,20 @@ from __future__ import annotations
 
 import json
 import random
-from math import tau
+from math import hypot, pi, tau
 from pathlib import Path
 
 import bpy
-from bpy.props import EnumProperty, FloatProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
 from bpy.types import Operator
 from bpy_extras import view3d_utils
 from mathutils import Vector
 
 from .placement_math import (
-    bench_positions,
+    bench_path,
     face_groups,
-    forward_angle,
     minimum_rectangle,
+    mirrored_keep_from,
     orientation_angle,
     polygon_area_xy,
     polygon_centroid_xy,
@@ -161,10 +161,33 @@ def _ground_center(obj: bpy.types.Object) -> None:
     obj.data.update()
 
 
+def _drop_mirrored_half(obj: bpy.types.Object) -> None:
+    """Лежак в каталоге — две копии по разные стороны оси X. Оставляем одну и ставим её на линию."""
+    mesh = obj.data
+    if mesh is None or obj.type != "MESH":
+        return
+    cut = mirrored_keep_from([vertex.co.x for vertex in mesh.vertices])
+    if cut is None:
+        return
+    import bmesh
+
+    edited = bmesh.new()
+    edited.from_mesh(mesh)
+    doomed = [vertex for vertex in edited.verts if vertex.co.x < cut]
+    bmesh.ops.delete(edited, geom=doomed, context="VERTS")
+    edited.to_mesh(mesh)
+    edited.free()
+    mesh.update()
+    _ground_center(obj)
+
+
 def _import_mesh(context, asset: dict) -> bpy.types.Object:
     name = f"LIB_{asset['id']}"
     existing = bpy.data.objects.get(name)
     if existing is not None and existing.type == "MESH":
+        existing.rotation_mode = "XYZ"
+        if asset["id"] == "lounger_01":
+            _drop_mirrored_half(existing)
         _park_library_object(existing)
         return existing
     folder = library_path(context)
@@ -197,8 +220,11 @@ def _import_mesh(context, asset: dict) -> bpy.types.Object:
         bpy.ops.object.join()
     mesh_object = context.view_layer.objects.active
     _ground_center(mesh_object)
+    if asset["id"] == "lounger_01":
+        _drop_mirrored_half(mesh_object)
     mesh_object.name = name
     mesh_object.data.name = name
+    mesh_object.rotation_mode = "XYZ"
     mesh_object["asset_id"] = asset["id"]
     library = _collection(LIBRARY_NAME, None)
     for collection in list(mesh_object.users_collection):
@@ -759,11 +785,11 @@ class DWGREADER_OT_place_plantings(Operator):
 
 class DWGREADER_OT_place_benches(Operator):
     bl_idname = "dwgreader.place_benches"
-    bl_label = "Указать отрезок лавок"
-    bl_description = "Два клика: начало и конец. Лавки встают вдоль отрезка с заданным шагом"
+    bl_label = "Нарисовать линию лавок"
+    bl_description = "Клики задают линию, прямую или извилистую. Enter ставит лавки вдоль неё, Esc отменяет"
     bl_options = {"UNDO"}
 
-    start: tuple[float, float] | None = None
+    points: list[tuple[float, float]]
     hover: tuple[float, float] | None = None
 
     @classmethod
@@ -782,15 +808,17 @@ class DWGREADER_OT_place_benches(Operator):
         if float(context.scene.dwgreader_bench_step) < MIN_BENCH_STEP_M:
             self.report({"ERROR"}, "Шаг меньше 0,5 м")
             return {"CANCELLED"}
-        self.start = None
+        self.points = []
         self.hover = None
         self._area = context.area
         self._handle = bpy.types.SpaceView3D.draw_handler_add(_draw_segment, (self,), "WINDOW", "POST_VIEW")
         context.window_manager.modal_handler_add(self)
-        _status(context, "Лавки: укажите начало отрезка")
+        _status(context, "Лавки: кликайте по линии. Enter — поставить, Backspace — шаг назад")
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
+        if event.type in {"MIDDLEMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN", "TRACKPADZOOM", "NDOF_MOTION"}:
+            return {"PASS_THROUGH"}
         if event.type == "MOUSEMOVE":
             self.hover = _ground_point(context, event)
             if context.area is not None:
@@ -800,12 +828,24 @@ class DWGREADER_OT_place_benches(Operator):
             point = _ground_point(context, event)
             if point is None:
                 return {"RUNNING_MODAL"}
-            if self.start is None:
-                self.start = point
-                _status(context, "Лавки: укажите конец отрезка")
+            if self.points and hypot(point[0] - self.points[-1][0], point[1] - self.points[-1][1]) < 0.05:
+                return {"RUNNING_MODAL"}
+            self.points.append(point)
+            _status(context, f"Лавки: точек {len(self.points)}. Enter — поставить, Backspace — шаг назад")
+            return {"RUNNING_MODAL"}
+        if event.type == "BACK_SPACE" and event.value == "PRESS":
+            if self.points:
+                self.points.pop()
+            _status(context, f"Лавки: точек {len(self.points)}. Enter — поставить")
+            if context.area is not None:
+                context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+        if event.type in {"RET", "NUMPAD_ENTER", "SPACE"} and event.value == "PRESS":
+            if len(self.points) < 2:
+                _status(context, "Нужны хотя бы две точки линии")
                 return {"RUNNING_MODAL"}
             try:
-                count = _place_benches(context, self.start, point)
+                count = _place_benches(context, list(self.points))
             except PlacementError as exc:
                 self._finish_draw()
                 _status(context, str(exc))
@@ -814,9 +854,9 @@ class DWGREADER_OT_place_benches(Operator):
             self._finish_draw()
             _status(context, f"Лавки: {count} шт., шаг {context.scene.dwgreader_bench_step:.1f} м")
             return {"FINISHED"}
-        if event.type in {"RIGHTMOUSE", "ESC"}:
+        if event.type in {"RIGHTMOUSE", "ESC"} and event.value == "PRESS":
             self._finish_draw()
-            _status(context, "Отрезок лавок отменён")
+            _status(context, "Линия лавок отменена")
             return {"CANCELLED"}
         return {"RUNNING_MODAL"}
 
@@ -1124,37 +1164,39 @@ def _replace_benches(context, parent: bpy.types.Object) -> None:
     _status(context, f"Лавки заменены: {asset['name']}")
 
 
-def _place_benches(context, start: tuple[float, float], end: tuple[float, float]) -> int:
+def _place_benches(context, points: list[tuple[float, float]]) -> int:
     step = float(context.scene.dwgreader_bench_step)
     if step < MIN_BENCH_STEP_M:
         raise PlacementError("Шаг меньше 0,5 м")
+    if len(points) < 2:
+        raise PlacementError("Нужны хотя бы две точки линии")
     asset_id = str(context.scene.dwgreader_bench_asset or "")
     asset = _asset(context, asset_id)
     if asset["family"] != "bench":
-        raise PlacementError("Для отрезка нужна модель из семейства лавок")
-    points = bench_positions(start, end, step, asset["footprint"][1])
-    if not points:
-        raise PlacementError("Отрезок слишком короткий")
+        raise PlacementError("Для линии нужна модель из семейства лавок")
+    heading = str(getattr(context.scene, "dwgreader_bench_heading", "tangent") or "tangent")
+    turn = pi if bool(getattr(context.scene, "dwgreader_bench_flip", False)) else 0.0
+    placed = bench_path(points, step, float(asset["footprint"][1]), heading, turn)
+    if not placed:
+        raise PlacementError("Линия слишком короткая")
     source = _import_mesh(context, asset)
     collection = _placement_collection("benches")
-    key = f"{round(start[0], 2)}:{round(start[1], 2)}:{round(end[0], 2)}:{round(end[1], 2)}"
+    key = ":".join(f"{round(point[0], 2)},{round(point[1], 2)}" for point in points)
     _replace_owned(collection, key)
-    curve_data = bpy.data.curves.new(f"BENCH_LINE_{key}", "CURVE")
-    curve_data.dimensions = "3D"
-    curve_data.bevel_depth = 0.03
-    spline = curve_data.splines.new("POLY")
-    spline.points.add(1)
-    spline.points[0].co = (start[0], start[1], 0.0, 1.0)
-    spline.points[1].co = (end[0], end[1], 0.0, 1.0)
-    parent = bpy.data.objects.new(f"BENCH_{asset['id']}", curve_data)
+    parent = bpy.data.objects.new(f"BENCH_{asset['id']}", None)
+    parent.empty_display_type = "PLAIN_AXES"
+    parent.empty_display_size = 0.01
     parent["placement"] = "linear"
     parent["family"] = "bench"
     parent["asset_id"] = asset["id"]
     parent["zone_key"] = key
     parent["step"] = step
+    parent["heading"] = heading
     collection.objects.link(parent)
-    angle = forward_angle(end[0] - start[0], end[1] - start[1])
-    for index, point in enumerate(points):
+    parent.hide_set(True)
+    parent.hide_render = True
+    scale = _model_scale(context, "dwgreader_bench_scale")
+    for index, (x, y, angle) in enumerate(placed):
         inst = source.copy()
         inst.data = source.data
         inst.hide_viewport = False
@@ -1162,12 +1204,14 @@ def _place_benches(context, start: tuple[float, float], end: tuple[float, float]
         inst.hide_select = False
         inst.name = f"BENCH_{asset['id']}_{index}"
         inst.parent = parent
-        inst.location = (point[0], point[1], 0.0)
+        inst.matrix_parent_inverse.identity()
+        inst.location = (x, y, 0.0)
+        inst.rotation_mode = "XYZ"
         inst.rotation_euler = (0.0, 0.0, angle)
-        inst.scale = (_model_scale(context, "dwgreader_bench_scale"),) * 3
+        inst.scale = (scale, scale, scale)
         inst["asset_id"] = asset["id"]
         collection.objects.link(inst)
-    return len(points)
+    return len(placed)
 
 
 def _ground_point(context, event) -> tuple[float, float] | None:
@@ -1188,17 +1232,21 @@ def _ground_point(context, event) -> tuple[float, float] | None:
 
 
 def _draw_segment(operator) -> None:
-    if operator.start is None or operator.hover is None:
+    points = list(getattr(operator, "points", []) or [])
+    if operator.hover is not None:
+        points.append(operator.hover)
+    if len(points) < 2:
         return
     try:
         import gpu
         from gpu_extras.batch import batch_for_shader
 
+        line = []
+        for start, end in zip(points, points[1:]):
+            line.append((start[0], start[1], 0.05))
+            line.append((end[0], end[1], 0.05))
         shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-        batch = batch_for_shader(
-            shader, "LINES",
-            {"pos": [(operator.start[0], operator.start[1], 0.05), (operator.hover[0], operator.hover[1], 0.05)]},
-        )
+        batch = batch_for_shader(shader, "LINES", {"pos": line})
         shader.bind()
         shader.uniform_float("color", (0.95, 0.75, 0.2, 1.0))
         batch.draw(shader)
@@ -1259,7 +1307,7 @@ def _bench_items(self, context):
 def _mode_items(self, context):
     return (
         ("plantings", "Посадки", "Деревья и кусты по зоне"),
-        ("benches", "Лавки", "Модели вдоль отрезка"),
+        ("benches", "Лавки", "Модели вдоль нарисованной линии"),
         ("playgrounds", "Площадка", "Комплекс по габариту зоны"),
     )
 
@@ -1304,8 +1352,10 @@ def draw_panel(layout, context) -> None:
         elif mode == "benches":
             box.prop(scene, "dwgreader_bench_asset", text="Модель")
             box.prop(scene, "dwgreader_bench_step")
+            box.prop(scene, "dwgreader_bench_heading", text="Ориентация")
+            box.prop(scene, "dwgreader_bench_flip")
             box.prop(scene, "dwgreader_bench_scale", text="Размер лавок и лежаков")
-            box.operator("dwgreader.place_benches", text="Указать отрезок", icon="CURVE_PATH")
+            box.operator("dwgreader.place_benches", text="Нарисовать линию", icon="CURVE_PATH")
             box.operator("dwgreader.replace_model", text="Заменить на выбранную", icon="FILE_REFRESH")
         else:
             box.label(text="Каждое «Поставить» добавляет модель в центр полигона")
@@ -1390,6 +1440,20 @@ def register() -> None:
         name="Лавка",
         items=_bench_items,
     )
+    bpy.types.Scene.dwgreader_bench_heading = EnumProperty(
+        name="Ориентация",
+        description="По линии: длинная сторона вдоль пути, лавки стоят боком друг к другу. Одно направление: весь ряд смотрит в одну сторону",
+        items=(
+            ("tangent", "По линии", "Каждая лавка поворачивается по касательной и смотрит поперёк пути"),
+            ("uniform", "Одно направление", "Один поворот на всю линию, боком к отрезку от первой точки к последней"),
+        ),
+        default="tangent",
+    )
+    bpy.types.Scene.dwgreader_bench_flip = BoolProperty(
+        name="Развернуть",
+        description="Повернуть лавки на 180 градусов относительно выбранной ориентации",
+        default=False,
+    )
     bpy.types.Scene.dwgreader_bench_scale = FloatProperty(
         name="Размер лавок и лежаков",
         description="Во сколько раз увеличить или уменьшить лавку и лежак",
@@ -1418,6 +1482,8 @@ def unregister() -> None:
         "dwgreader_play_scale",
         "dwgreader_play_asset",
         "dwgreader_bench_scale",
+        "dwgreader_bench_flip",
+        "dwgreader_bench_heading",
         "dwgreader_bench_asset",
         "dwgreader_bench_step",
         "dwgreader_plant_scale",

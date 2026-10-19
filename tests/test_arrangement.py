@@ -228,24 +228,19 @@ class SymbolCutoutTests(unittest.TestCase):
         self.assertAlmostEqual(areas["Дорога"], 100.0, places=3)
         self.assertAlmostEqual(areas["Лавки"], 4.0, places=3)
 
-    def test_playground_layer_stays_on_top_of_whole_ground(self) -> None:
-        pieces = [
-            HatchPiece("green", "Газон", _ring(0, 0, 10), [_ring(4, 4, 2)]),
-            HatchPiece("pavement", "Детские площадки", _ring(4, 4, 2)),
-            HatchPiece("pavement", "Тротуар", _ring(20, 0, 10)),
-        ]
-        areas = _areas(pieces, cut=False)
-        self.assertAlmostEqual(areas["Газон"], 100.0, places=3)
-        self.assertAlmostEqual(areas["Детские площадки"], 4.0, places=3)
-        self.assertAlmostEqual(areas["Тротуар"], 100.0, places=3)
-
-    def test_playground_cuts_ground_when_cutout_is_on(self) -> None:
-        pieces = [
+    def test_overlay_follows_type_not_layer_name(self) -> None:
+        named = "Детские площадки"
+        as_pavement = _areas([
             HatchPiece("green", "Газон", _ring(0, 0, 10)),
-            HatchPiece("pavement", "Площадки", _ring(4, 4, 2)),
-        ]
-        areas = _areas(pieces, cut=True)
-        self.assertAlmostEqual(areas["Газон"], 96.0, places=3)
+            HatchPiece("pavement", named, _ring(4, 4, 2)),
+        ], cut=False)
+        as_maf = _areas([
+            HatchPiece("green", "Газон", _ring(0, 0, 10), [_ring(4, 4, 2)]),
+            HatchPiece("furniture", named, _ring(4, 4, 2)),
+        ], cut=False)
+        self.assertAlmostEqual(as_pavement["Газон"], 96.0, places=3)
+        self.assertAlmostEqual(as_maf["Газон"], 100.0, places=3)
+        self.assertAlmostEqual(as_maf[named], 4.0, places=3)
 
     def test_plain_pavement_still_cuts_ground(self) -> None:
         pieces = [
@@ -255,12 +250,21 @@ class SymbolCutoutTests(unittest.TestCase):
         areas = _areas(pieces, cut=False)
         self.assertAlmostEqual(areas["Газон"], 96.0, places=3)
 
-    def test_plantings_type_still_cuts_ground(self) -> None:
+    def test_plantings_stay_on_top_of_whole_ground(self) -> None:
         pieces = [
-            HatchPiece("green", "Газон", _ring(0, 0, 10)),
-            HatchPiece("vegetation", "Кусты", _ring(4, 4, 2)),
+            HatchPiece("green", "Газон", _ring(0, 0, 10), [_ring(4, 4, 2)]),
+            HatchPiece("vegetation", "Посадки", _ring(4, 4, 2)),
         ]
         areas = _areas(pieces, cut=False)
+        self.assertAlmostEqual(areas["Газон"], 100.0, places=3)
+        self.assertAlmostEqual(areas["Посадки"], 4.0, places=3)
+
+    def test_plantings_cut_ground_when_cutout_is_on(self) -> None:
+        pieces = [
+            HatchPiece("green", "Газон", _ring(0, 0, 10)),
+            HatchPiece("vegetation", "Посадки", _ring(4, 4, 2)),
+        ]
+        areas = _areas(pieces, cut=True)
         self.assertAlmostEqual(areas["Газон"], 96.0, places=3)
 
     def test_ai_maf_type_is_kept_when_layer_name_looks_like_pavement(self) -> None:

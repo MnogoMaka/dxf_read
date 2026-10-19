@@ -29,5 +29,14 @@ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
     for model in sorted(library.iterdir()):
         if model.is_file() and model.suffix.lower() in {".glb", ".json"}:
             zf.write(model, f"dwgreader_underlay/library/{model.name}")
+    building = root / "actual_node"
+    zf.writestr("dwgreader_underlay/building/", "")
+    blend = building / "Building 2.0.blend"
+    zf.write(blend, "dwgreader_underlay/building/Building 2.0.blend")
+    textures = building / "textures"
+    for path in textures.rglob("*"):
+        if not path.is_file() or path.suffix.lower() == ".psd":
+            continue
+        zf.write(path, f"dwgreader_underlay/building/{path.relative_to(building).as_posix()}")
 
 print(zip_path)

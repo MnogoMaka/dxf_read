@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from math import atan2, cos, hypot, sin
+from math import atan2, cos, hypot, pi, sin
 
 
 FIT_SLACK_M = 0.05
@@ -334,6 +334,11 @@ def forward_angle(dx: float, dy: float) -> float:
     return atan2(-dx, dy)
 
 
+def bench_facing(dx: float, dy: float) -> float:
+    """Длинная сторона лавки вдоль линии, взгляд поперёк неё: соседние стоят боком друг к другу."""
+    return forward_angle(dx, dy) + pi / 2
+
+
 def bench_positions(
     start: tuple[float, float],
     end: tuple[float, float],
@@ -359,3 +364,165 @@ def bench_positions(
         (start[0] + ux * (lead + index * step), start[1] + uy * (lead + index * step))
         for index in range(count)
     ]
+
+
+def mirrored_keep_from(xs: list[float]) -> float | None:
+    """Порог X второй копии модели. Вершины левее порога — дубль по другую сторону линии."""
+    if len(xs) < 8:
+        return None
+    ordered = sorted(xs)
+    low, high = ordered[0], ordered[-1]
+    span = high - low
+    if span < 0.5:
+        return None
+    best_gap = 0.0
+    best_cut: float | None = None
+    for left, right in zip(ordered, ordered[1:]):
+        gap = right - left
+        middle = (left + right) * 0.5
+        if middle < low + span * 0.25 or middle > high - span * 0.25:
+            continue
+        if gap > best_gap:
+            best_gap = gap
+            best_cut = right
+    if best_cut is None or best_gap < span * 0.08:
+        return None
+    kept = sum(1 for value in ordered if value >= best_cut)
+    if kept < len(ordered) * 0.2 or kept > len(ordered) * 0.8:
+        return None
+    return best_cut
+
+
+def _catmull(p0, p1, p2, p3, t: float) -> tuple[float, float]:
+    t2 = t * t
+    t3 = t2 * t
+    def coord(index: int) -> float:
+        return 0.5 * (
+            2.0 * p1[index]
+            + (-p0[index] + p2[index]) * t
+            + (2.0 * p0[index] - 5.0 * p1[index] + 4.0 * p2[index] - p3[index]) * t2
+            + (-p0[index] + 3.0 * p1[index] - 3.0 * p2[index] + p3[index]) * t3
+        )
+    return (coord(0), coord(1))
+
+
+def smooth_path(points: list[tuple[float, float]], spacing: float = 0.25) -> list[tuple[float, float]]:
+    """Две точки остаются отрезком. Дальше линия проходит через все клики плавной кривой."""
+    if len(points) < 3:
+        return list(points)
+    dense = [points[0]]
+    step = max(spacing, 0.05)
+    for index in range(len(points) - 1):
+        p0 = points[index - 1] if index > 0 else points[0]
+        p1 = points[index]
+        p2 = points[index + 1]
+        p3 = points[index + 2] if index + 2 < len(points) else points[-1]
+        chord = hypot(p2[0] - p1[0], p2[1] - p1[1])
+        pieces = max(2, int(chord / step))
+        for piece in range(1, pieces + 1):
+            dense.append(_catmull(p0, p1, p2, p3, piece / pieces))
+    return dense
+
+
+def _sample_path(points: list[tuple[float, float]], distance: float) -> tuple[float, float, float, float]:
+    travelled = 0.0
+    last = points[0]
+    for start, end in zip(points, points[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = hypot(dx, dy)
+        if length < 1e-9:
+            continue
+        if travelled + length >= distance - 1e-8:
+            ratio = min(max((distance - travelled) / length, 0.0), 1.0)
+            return (start[0] + dx * ratio, start[1] + dy * ratio, dx, dy)
+        travelled += length
+        last = end
+    dx = last[0] - points[0][0]
+    dy = last[1] - points[0][1]
+    return (last[0], last[1], dx, dy)
+
+
+def bench_path(
+    points: list[tuple[float, float]],
+    step: float,
+    depth: float,
+    heading: str = "tangent",
+    turn: float = 0.0,
+) -> list[tuple[float, float, float]]:
+    """Точки и поворот лавок вдоль линии. Длинная сторона идёт по пути, взгляд — поперёк."""
+    path = smooth_path(points)
+    if len(path) < 2 or step <= 0:
+        return []
+    total = 0.0
+    for start, end in zip(path, path[1:]):
+        total += hypot(end[0] - start[0], end[1] - start[1])
+    if total < 1e-6:
+        return []
+    if total < step:
+        distances = [total * 0.5]
+    else:
+        inset = max(depth, 0.0) * 0.5
+        if total <= inset * 2:
+            distances = [total * 0.5]
+        else:
+            span = total - inset * 2
+            count = int(span // step) + 1
+            used = (count - 1) * step
+            lead = inset + (span - used) * 0.5
+            distances = [lead + index * step for index in range(count)]
+    end_dx = path[-1][0] - path[0][0]
+    end_dy = path[-1][1] - path[0][1]
+    shared = bench_facing(end_dx, end_dy) if heading == "uniform" else None
+    placed: list[tuple[float, float, float]] = []
+    for distance in distances:
+        x, y, dx, dy = _sample_path(path, distance)
+        angle = shared if shared is not None else bench_facing(dx, dy)
+        placed.append((x, y, angle + turn))
+    return placed
+
+
+def cluster_boxes(
+    boxes: list[tuple[float, float, float, float]],
+    gap: float,
+) -> list[list[int]]:
+    """Группы прямоугольников с зазором не больше gap.
+
+    Связь транзитивная: цепочка соседних пятен одного чертежа остаётся
+    одной группой. Группы идут слева направо по левому нижнему углу.
+    """
+    count = len(boxes)
+    parent = list(range(count))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def unite(left: int, right: int) -> None:
+        root_a, root_b = find(left), find(right)
+        if root_a != root_b:
+            parent[root_a] = root_b
+
+    limit = max(gap, 0.0) ** 2
+    for left in range(count):
+        ax0, ay0, ax1, ay1 = boxes[left]
+        for right in range(left + 1, count):
+            bx0, by0, bx1, by1 = boxes[right]
+            dx = max(0.0, ax0 - bx1, bx0 - ax1)
+            dy = max(0.0, ay0 - by1, by0 - ay1)
+            if dx * dx + dy * dy <= limit:
+                unite(left, right)
+
+    groups: dict[int, list[int]] = {}
+    for index in range(count):
+        groups.setdefault(find(index), []).append(index)
+
+    def origin(members: list[int]) -> tuple[float, float]:
+        return (
+            min(boxes[index][0] for index in members),
+            min(boxes[index][1] for index in members),
+        )
+
+    return [members for _root, members in sorted(groups.items(), key=lambda item: origin(item[1]))]

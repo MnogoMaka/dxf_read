@@ -86,15 +86,95 @@ def layer_leaf(name: str) -> str:
     return SHEET_PREFIX_RE.sub("", text).strip() or normalize_name(name)
 
 
+# $INSUNITS. 0 и 6 не трогаем: чертёж уже в метрах. Остальные — только если
+# рёбра слишком длинные для метров. Иначе заголовок врёт, как у файлов в метрах с кодом «мм».
+_INSUNITS_TO_M = {
+    1: 0.0254,
+    2: 0.3048,
+    4: 0.001,
+    5: 0.01,
+    7: 1000.0,
+    14: 0.1,
+}
+def unit_scale(insunits: int, median_segment: float) -> float:
+    """Множитель к метрам. Короткие рёбра оставляем как есть: заголовок часто ошибочен."""
+    factor = _INSUNITS_TO_M.get(int(insunits), 1.0)
+    if factor == 1.0 or median_segment < 50.0:
+        return 1.0
+    return factor
+
+
+def _median_segment_length(document: Drawing) -> float:
+    lengths: list[float] = []
+    for entity in document.modelspace():
+        kind = entity.dxftype()
+        if kind == "LINE":
+            start, end = entity.dxf.start, entity.dxf.end
+            lengths.append(((start.x - end.x) ** 2 + (start.y - end.y) ** 2) ** 0.5)
+        elif kind == "LWPOLYLINE":
+            points = [(float(point[0]), float(point[1])) for point in entity.get_points("xy")]
+            for left, right in zip(points, points[1:]):
+                lengths.append(((left[0] - right[0]) ** 2 + (left[1] - right[1]) ** 2) ** 0.5)
+        if len(lengths) >= 2000:
+            break
+    if not lengths:
+        return 0.0
+    lengths.sort()
+    return lengths[len(lengths) // 2]
+
+
+def drawing_to_meters(document: Drawing) -> float:
+    """Единицы чертежа → метры. Повторный вызов для того же документа ничего не считает заново."""
+    cached = getattr(document, "_dwgreader_unit_scale", None)
+    if isinstance(cached, float):
+        return cached
+    try:
+        code = int(document.header.get("$INSUNITS", 0) or 0)
+    except (TypeError, ValueError):
+        code = 0
+    scale = unit_scale(code, _median_segment_length(document))
+    try:
+        setattr(document, "_dwgreader_unit_scale", scale)
+    except (AttributeError, TypeError):
+        pass
+    if scale != 1.0:
+        _status(f"Координаты чертежа переведены в метры (x{scale:g})")
+    return scale
+
+
+def hidden_sheet_copies(
+    names: Sequence[str],
+    totals: Mapping[str, int] | None = None,
+) -> set[str]:
+    """Лишние копии «_Ном._пера__N».
+
+    Если есть слой без номера листа, копии скрыты. Если номера — единственная
+    геометрия, остаётся одна, самая наполненная.
+    """
+    counts = totals or {}
+    plain: set[str] = set()
+    copies: dict[str, list[str]] = {}
+    for name in names:
+        if PENA_SUFFIX_RE.search(normalize_name(name)):
+            copies.setdefault(layer_leaf(name), []).append(str(name))
+        else:
+            plain.add(layer_leaf(name))
+    hidden: set[str] = set()
+    for leaf, group in copies.items():
+        if leaf in plain:
+            hidden.update(group)
+            continue
+        ranked = sorted(group, key=lambda item: (-int(counts.get(item, 0)), item))
+        hidden.update(ranked[1:])
+    return hidden
+
+
 def is_junk_layer(name: str) -> bool:
-    """Служебные копии, подписи, Civil 3D, интерьер — не площадка.
+    """Подписи, Civil 3D, интерьер — не площадка.
 
     Токены смотрим только в хвосте: префикс xref («…трасса|Газон») сам по себе
-    не должен выкидывать нормальный слой.
+    не должен выкидывать нормальный слой. Копии листа отбирает hidden_sheet_copies.
     """
-    text = normalize_name(name)
-    if PENA_SUFFIX_RE.search(text):
-        return True
     probe = layer_leaf(name)
     return any(token in probe for token in config.settings().junk_layer_tokens)
 
@@ -356,6 +436,197 @@ def _fuzzy_layer(key: str, allowed: Mapping[str, str]) -> str | None:
     return None
 
 
+_CHATGPT_URL = "https://api.openai.com/v1/responses"
+_CHATGPT_LIMITS = {
+    "subscription_sharing_usage_limit_exceeded",
+    "subscription_sharing_usage_unavailable",
+}
+_CHATGPT_AUTH_CODES = {
+    "invalid_api_key",
+    "invalid_token",
+    "invalid_grant",
+    "insufficient_scope",
+}
+_CHATGPT_REASONS = {
+    "invalid_api_key": "Ключ API не принят",
+    "invalid_token": "Сессия ChatGPT недействительна. Войдите ещё раз",
+    "invalid_grant": "Сессия ChatGPT отклонена. Войдите ещё раз",
+    "subscription_sharing_user_not_eligible": "План ChatGPT недоступен для этого аккаунта",
+    "insufficient_scope": "План ChatGPT не разрешает классификацию через аккаунт",
+}
+
+
+class ChatGPTRouteError(Exception):
+    """Ошибка маршрута ChatGPT. fallback оставлен для разбора кода ответа."""
+
+    def __init__(self, message: str, *, code: str, fallback: bool) -> None:
+        super().__init__(message)
+        self.code = code
+        self.fallback = fallback
+
+
+class ChatGPTNeedChoice(Exception):
+    """Аккаунт ChatGPT не ответил. Классификацию не продолжаем через API."""
+
+
+def _resolved_api_key(explicit: str | None) -> str:
+    if explicit is not None:
+        return explicit
+    env_key = os.environ.get("LLM_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    return config.settings().llm_api_key
+
+
+def _chatgpt_credentials() -> tuple[str, str]:
+    token = os.environ.get("DWGREADER_CHATGPT_ACCESS_TOKEN", "").strip()
+    model = os.environ.get("DWGREADER_CHATGPT_MODEL", "").strip()
+    if token and model and model != "none":
+        return token, model
+    return "", ""
+
+
+def _chatgpt_failure(code: str, status: int = 0) -> ChatGPTRouteError:
+    if code in _CHATGPT_LIMITS:
+        return ChatGPTRouteError(
+            "Лимит плана ChatGPT исчерпан. Проверьте лимит на chatgpt.com/codex/settings/usage",
+            code=code,
+            fallback=False,
+        )
+    if code == "subscription_sharing_user_not_eligible":
+        return ChatGPTRouteError(
+            "План ChatGPT недоступен для этого аккаунта",
+            code=code,
+            fallback=True,
+        )
+    if code == "subscription_sharing_route_not_supported":
+        return ChatGPTRouteError(
+            "План ChatGPT принимает только POST /v1/responses",
+            code=code,
+            fallback=False,
+        )
+    fallback = status in {401, 403} or code in _CHATGPT_AUTH_CODES
+    reason = _CHATGPT_REASONS.get(code) or (f"Ответ ChatGPT: HTTP {status}" if status else "Сессия ChatGPT недоступна")
+    return ChatGPTRouteError(reason, code=code or f"http_{status}", fallback=fallback)
+
+
+def _response_text_from_sse(lines: Iterable[str]) -> str:
+    """Собирает текст Responses API. Успех только после response.completed."""
+    event = "message"
+    data_lines: list[str] = []
+    parts: list[str] = []
+    completed = False
+    failed = ""
+
+    def flush() -> None:
+        nonlocal event, completed, failed
+        if not data_lines:
+            event = "message"
+            return
+        raw = "\n".join(data_lines)
+        data_lines.clear()
+        current = event
+        event = "message"
+        if raw == "[DONE]":
+            return
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        kind = str(payload.get("type") or current)
+        if kind == "response.output_text.delta":
+            parts.append(str(payload.get("delta") or ""))
+        elif kind == "response.output_text.done" and not parts:
+            parts.append(str(payload.get("text") or ""))
+        elif kind == "response.completed":
+            completed = True
+            response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+            if not parts and isinstance(response.get("output_text"), str):
+                parts.append(response["output_text"])
+        elif kind in {"response.failed", "error"}:
+            err = payload.get("error")
+            if not isinstance(err, dict):
+                response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+                err = response.get("error") if isinstance(response.get("error"), dict) else {}
+            failed = str(err.get("code") or err.get("type") or kind)
+
+    for line in lines:
+        text = line.rstrip("\r\n")
+        if text == "":
+            flush()
+            continue
+        if text.startswith(":"):
+            continue
+        if text.startswith("event:"):
+            event = text[6:].strip()
+        elif text.startswith("data:"):
+            data_lines.append(text[5:].lstrip())
+    flush()
+    if failed:
+        raise _chatgpt_failure(failed)
+    if not completed:
+        raise ChatGPTRouteError("Ответ ChatGPT оборвался", code="stream_incomplete", fallback=False)
+    return "".join(parts)
+
+
+def _request_responses(system: str, user: str, model: str, token: str, timeout: float) -> str:
+    last: ChatGPTRouteError | None = None
+    for _attempt in range(2):
+        try:
+            return _request_responses_once(system, user, model, token, timeout)
+        except ChatGPTRouteError as error:
+            last = error
+            if error.code != "stream_incomplete":
+                raise
+    assert last is not None
+    raise last
+
+
+def _request_responses_once(system: str, user: str, model: str, token: str, timeout: float) -> str:
+    payload = {
+        "model": model,
+        "instructions": system,
+        "input": [{"role": "user", "content": user}],
+        "store": False,
+        "stream": True,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        _CHATGPT_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "DWGREADER/1.0",
+        },
+        method="POST",
+    )
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8", "replace")
+        raise _chatgpt_failure(_chatgpt_error_code(raw), error.code) from None
+    except _CONNECTION_ERRORS as error:
+        raise ConnectionError(f"Нет соединения с api.openai.com: {error}") from error
+    with response:
+        lines = (raw.decode("utf-8", "replace") for raw in response)
+        return _response_text_from_sse(lines)
+
+
+def _chatgpt_error_code(raw: str) -> str:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return "http_error"
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("code") or err.get("type") or "http_error")
+    return "http_error"
+
+
 def select_target_layers(
     layer_names: Sequence[str],
     hints: Mapping[str, str] | None = None,
@@ -371,29 +642,49 @@ def select_target_layers(
     cfg = config.settings()
     model = model or cfg.llm_model
     base_url = base_url or cfg.llm_base_url
-    api_key = cfg.llm_api_key if api_key is None else api_key
+    api_key = _resolved_api_key(api_key)
     batch_size = cfg.batch_size if batch_size is None else batch_size
     timeout = cfg.llm_timeout if timeout is None else timeout
-    selection = LayerSelection(model=model)
     allowed = {normalize_name(name): name for name in layer_names}
     used: set[str] = set()
-    _ensure_model_awake(model, base_url, api_key)
+    force_api = os.environ.get("DWGREADER_FORCE_API") == "1"
+    token, chatgpt_model = ("", "") if force_api else _chatgpt_credentials()
+    use_chatgpt = bool(token)
+    if use_chatgpt:
+        selection = LayerSelection(model=chatgpt_model)
+        _status("Классификация через план ChatGPT")
+    else:
+        selection = LayerSelection(model=model)
+        _ensure_model_awake(model, base_url, api_key)
+        _status("Классификация через API")
+
+    def ask(system: str, user: str) -> str:
+        if use_chatgpt:
+            try:
+                return _request_responses(system, user, chatgpt_model, token, timeout)
+            except ChatGPTRouteError as error:
+                raise ChatGPTNeedChoice(str(error)) from error
+            except ConnectionError as error:
+                raise ChatGPTNeedChoice(f"Нет соединения с ChatGPT: {error}") from error
+        return _request_chat_completion(
+            system=system,
+            user=user,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
 
     for batch in _chunks(list(layer_names), batch_size):
-        reply = _request_chat_completion(
-            system=SYSTEM_PROMPT,
-            user=_build_prompt(batch, hints),
-            model=model, base_url=base_url, api_key=api_key, timeout=timeout,
-        )
+        reply = ask(SYSTEM_PROMPT, _build_prompt(batch, hints))
         try:
             parsed = _parse_selection(reply)
         except ValueError:
             try:
-                reply = _request_chat_completion(
-                    system=SYSTEM_PROMPT,
-                    user=_build_prompt(batch, hints)
+                reply = ask(
+                    SYSTEM_PROMPT,
+                    _build_prompt(batch, hints)
                     + "\n\nОтвет — только JSON, без thinking, без пояснений и без висячих запятых.",
-                    model=model, base_url=base_url, api_key=api_key, timeout=timeout,
                 )
                 parsed = _parse_selection(reply)
             except ValueError as error:
@@ -695,7 +986,7 @@ def _request_chat_completion(
     """Один запрос к OpenAI-совместимому API. Возвращает текст ответа."""
     cfg = config.settings()
     base_url = cfg.llm_base_url if base_url is None else base_url
-    api_key = cfg.llm_api_key if api_key is None else api_key
+    api_key = _resolved_api_key(api_key)
     timeout = cfg.llm_timeout if timeout is None else timeout
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -772,8 +1063,7 @@ def read_layer_geometry(
     modelspace = document.modelspace()
 
     wanted = {normalize_name(name) for name in layer_names}
-    # Чертёж уже в метрах, $INSUNITS не используем.
-    scale = 1.0
+    scale = drawing_to_meters(document)
 
     shapes: list[Shape] = []
 
@@ -1031,21 +1321,26 @@ def infer_layer_category(name: str) -> str | None:
 def refine_layer_groups(
     by_category: Mapping[str, Sequence[str]],
     all_layers: Sequence[str] | None = None,
+    totals: Mapping[str, int] | None = None,
 ) -> dict[str, list[str]]:
     """Сохраняет тип, который прислала модель. По имени дополняются только слои без типа."""
+    catalog = list(all_layers or ())
+    for names in by_category.values():
+        catalog.extend(str(name) for name in names)
+    hidden = hidden_sheet_copies(catalog, totals)
     refined: dict[str, list[str]] = {}
     seen: set[str] = set()
     for category, names in by_category.items():
         mapped = category if category in TARGET_OBJECT_TYPES else ""
         for name in names:
-            if name in seen or is_junk_layer(name):
+            if name in seen or name in hidden or is_junk_layer(name):
                 continue
             seen.add(name)
             guessed = mapped or infer_layer_category(name)
             if guessed in TARGET_OBJECT_TYPES:
                 refined.setdefault(guessed, []).append(name)
     for name in all_layers or ():
-        if name in seen or is_junk_layer(name):
+        if name in seen or name in hidden or is_junk_layer(name):
             continue
         guessed = infer_layer_category(name)
         if guessed in TARGET_OBJECT_TYPES:
@@ -1118,8 +1413,7 @@ def extract_classified_hatches(
 
         def category_of(layer: str) -> str | None:
             return _category_for_layer(layer, layer_to_category)
-    # Чертёж уже в метрах, $INSUNITS не используем.
-    scale = 1.0
+    scale = drawing_to_meters(document)
     pieces: list[HatchPiece] = []
     orphans: list[tuple[DXFEntity, str, tuple[str, ...]]] = []
 
@@ -1151,8 +1445,7 @@ def extract_classified_hatches(
             if chosen:
                 emit(entity, layer, chosen, block_path)
             elif (
-                not lock_groups
-                and is_generic_block_layer(layer)
+                is_generic_block_layer(layer)
                 and not is_junk_layer(layer)
                 and bool(entity.dxf.get("solid_fill", 0))
             ):
@@ -1346,7 +1639,7 @@ def extract_curve_pieces(
     category_of, layer_to_category = _category_lookup(
         by_category, lock_groups, document, match_leaf=not lock_groups,
     )
-    scale = 1.0
+    scale = drawing_to_meters(document)
     max_span = config.settings().max_contour_span_m
     site_segments: list[tuple[tuple[float, float], tuple[float, float], str]] = []
     plant_segments: list[tuple[tuple[float, float], tuple[float, float], str]] = []
@@ -1810,17 +2103,15 @@ def _polygon_patch(polygon: ShapelyPolygon, color: tuple[float, float, float], m
     )
 
 
-def _is_overlay(category: str | None, layer: str) -> bool:
-    """Тип «МАФ» и слои «Площадки» не вырезают землю, пока галочка вырезания выключена."""
+def _is_overlay(category: str | None, _layer: str) -> bool:
+    """Типы «МАФ» и «Посадки» лежат поверх земли, пока галочка вырезания выключена."""
     if config.settings().cut_vegetation:
         return False
-    if category == "furniture":
-        return True
-    return "ПЛОЩАДК" in layer_leaf(layer)
+    return category in {"furniture", "vegetation"}
 
 
 def _without_symbol_holes(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
-    """Дырка газона или покрытия, совпавшая с МАФ или площадкой, перестаёт быть дыркой."""
+    """Дырка газона или покрытия, совпавшая с МАФ или посадкой, перестаёт быть дыркой."""
     symbols = [
         polygon
         for piece in pieces
@@ -1879,7 +2170,7 @@ def arrange_hatch_faces_by_layer(
 ) -> list[tuple[BaseGeometry, str, str]]:
     """Arrangement, но грань помнит слой AutoCAD.
 
-    По умолчанию слой типа «МАФ» и слой с «Площадки» в имени не режут газоны и покрытия:
+    По умолчанию слои типов «МАФ» и «Посадки» не режут газоны и покрытия:
     они добавляются своим слоем поверх целой площадки.
     """
     pieces = _without_symbol_holes(pieces)
@@ -2067,12 +2358,19 @@ def count_layer_objects(
     Текст, размеры и открытые линии не считаются.
     """
     found: list[tuple[str, str, tuple[float, float] | None]] = []
+    scale = drawing_to_meters(document)
+
+    def located(entity: DXFEntity) -> tuple[float, float] | None:
+        center = _entity_center(entity)
+        if center is None or scale == 1.0:
+            return center
+        return (center[0] * scale, center[1] * scale)
 
     def take(entity: DXFEntity, layer: str) -> None:
         if _is_fill_entity(entity, layer):
-            found.append((layer, "fills", _entity_center(entity)))
+            found.append((layer, "fills", located(entity)))
         if _is_closed_contour(entity):
-            found.append((layer, "curves", _entity_center(entity)))
+            found.append((layer, "curves", located(entity)))
 
     for entity in document.modelspace():
         layer = str(entity.dxf.layer)
@@ -2365,7 +2663,7 @@ def _write_layers_json(
     return path
 
 
-GEOMETRY_CACHE_VERSION = 1
+GEOMETRY_CACHE_VERSION = 2
 
 
 def _file_stamp(path: Path) -> dict[str, Any]:
@@ -2428,7 +2726,7 @@ def _ring_xyz(ring: Sequence[Sequence[float]]) -> list[tuple[float, float, float
 
 def collect_geometry_cache(document: Drawing, source: Path) -> dict[str, Any]:
     """Сырые контуры и заливки. Сборка потом фильтрует их по выбранным слоям."""
-    scale = 1.0
+    scale = drawing_to_meters(document)
     max_span = config.settings().max_contour_span_m
     fills: list[list[Any]] = []
     curves: list[list[Any]] = []
@@ -2566,6 +2864,7 @@ def pieces_from_cache(
         category_of, _map = _category_lookup(
             fill_groups, True, None, match_leaf=False, known_layers=known,
         )
+        orphan_rings: list[tuple[Any, ...]] = []
         for kind, layer, insert_layer, _solid, handle, outer, holes in payload.get("fills") or []:
             stored_layer, chosen = _resolved_block_layer(str(layer), str(insert_layer or ""), category_of)
             outer_xyz = _ring_xyz(outer)
@@ -2577,6 +2876,15 @@ def pieces_from_cache(
                 pieces.append(HatchPiece(chosen, stored_layer, outer_xyz, hole_xyz, handle, block_path))
             elif kind == "p" and chosen and is_area_polyline_layer(stored_layer):
                 pieces.append(HatchPiece(chosen, stored_layer, outer_xyz, hole_xyz, handle, block_path))
+            elif (
+                kind == "h"
+                and not chosen
+                and int(_solid or 0)
+                and is_generic_block_layer(str(layer))
+                and not is_junk_layer(str(layer))
+            ):
+                orphan_rings.append((outer_xyz, hole_xyz, str(handle or ""), block_path))
+        _assign_orphan_rings(pieces, orphan_rings)
     if any(curve_groups.values()):
         category_of, layer_to_category = _category_lookup(
             curve_groups, True, None, match_leaf=False, known_layers=known,
@@ -2676,17 +2984,22 @@ def run_pipeline(
         groups = _confirmed_groups(by_category)
         _status("Генерация по подтверждённым слоям")
     elif by_category is not None:
-        groups = refine_layer_groups(by_category, layers)
+        groups = refine_layer_groups(by_category, layers, entity_totals)
     elif classify:
         llm_down = False
         try:
             selection = select_target_layers(layers)
+        except ChatGPTRouteError as error:
+            llm_down = True
+            _status(str(error))
+            print(str(error))
+            selection = LayerSelection(model=cfg.llm_model)
         except ConnectionError as error:
             llm_down = True
             _status("Модель не поднялась. Отбор слоёв по именам")
             print(f"Модель недоступна, слои отбираются по именам: {error}")
             selection = LayerSelection(model=cfg.llm_model)
-        groups = refine_layer_groups(selection.by_category, layers)
+        groups = refine_layer_groups(selection.by_category, layers, entity_totals)
         if llm_down:
             print("Слои отобраны по именам, без ответа модели.")
         print("Отобрано по категориям:")

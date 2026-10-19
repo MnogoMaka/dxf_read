@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from .config import DEFAULT_SOURCE, PipelineSettings, resolve_path, use_settings
-from .dxf import run_pipeline
+from .dxf import ChatGPTNeedChoice, run_pipeline
 
 
 def _settings_from_file(path: Path) -> PipelineSettings:
@@ -62,11 +62,15 @@ def main(argv: list[str] | None = None) -> None:
         "geometry_source": parsed.geometry,
         "geometry_by_layer": per_layer,
     }
-    if parsed.settings:
-        with use_settings(_settings_from_file(Path(parsed.settings))):
+    try:
+        if parsed.settings:
+            with use_settings(_settings_from_file(Path(parsed.settings))):
+                result = run_pipeline(source, **pipeline_kwargs)
+        else:
             result = run_pipeline(source, **pipeline_kwargs)
-    else:
-        result = run_pipeline(source, **pipeline_kwargs)
+    except ChatGPTNeedChoice as error:
+        print(f"CHATGPT_NEED={error}", flush=True)
+        return
     if parsed.classify_only:
         print(f"LAYERS_JSON={result.get('layers_json') or ''}")
         return
