@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import http.server
 import json
+import socket
 import os
 import secrets
 import subprocess
@@ -318,6 +320,7 @@ class LoginJob:
         self.another = False
         self.url = ""
         self._server: http.server.HTTPServer | None = None
+        self._socket: socket.socket | None = None
 
     def run(self) -> None:
         try:
@@ -338,6 +341,9 @@ class LoginJob:
 
     def cancel(self) -> None:
         self.cancelled = True
+        sock = self._socket
+        self._socket = None
+        _close_socket(sock)
 
 
 _ACTIVE_LOGIN: LoginJob | None = None
@@ -474,15 +480,14 @@ def _authorize(job: LoginJob, saved: dict) -> dict:
     auth_code = str(captured.get("code") or "")
     if not auth_code or " " in auth_code:
         raise AuthError("Сервер не вернул код входа")
-    token = _form(TOKEN_URL, {
+    return _finish_authorization(job, {
         "grant_type": "authorization_code",
         "client_id": callback_client,
         "code": auth_code,
         "code_verifier": verifier,
         "redirect_uri": redirect,
         "resource": RESOURCE,
-    })
-    return _store_token_response(token, callback_client, nonce, previous=saved)
+    }, callback_client, nonce, saved)
 
 
 def _retain_client(client_id: str) -> None:
@@ -495,7 +500,27 @@ def _retain_client(client_id: str) -> None:
     save_session({"client_id": client_id})
 
 
-def _store_token_response(token: dict, client_id: str, nonce: str, previous: dict | None = None) -> dict:
+def _finish_authorization(
+    job: LoginJob,
+    fields: dict[str, str],
+    client_id: str,
+    nonce: str,
+    previous: dict | None,
+) -> dict:
+    _raise_if_cancelled(job)
+    token = _form(TOKEN_URL, fields, job=job)
+    _raise_if_cancelled(job)
+    return _store_token_response(token, client_id, nonce, previous=previous, job=job)
+
+
+def _store_token_response(
+    token: dict,
+    client_id: str,
+    nonce: str,
+    previous: dict | None = None,
+    job: LoginJob | None = None,
+) -> dict:
+    _raise_if_cancelled(job)
     access = str(token.get("access_token") or "")
     refresh = str(token.get("refresh_token") or (previous or {}).get("refresh_token") or "")
     id_token = str(token.get("id_token") or "")
@@ -518,6 +543,7 @@ def _store_token_response(token: dict, client_id: str, nonce: str, previous: dic
         "email": email,
         "subject": str(claims.get("sub") or (previous or {}).get("subject") or ""),
     }
+    _raise_if_cancelled(job)
     save_session(session)
     return session
 
@@ -633,7 +659,72 @@ def _discovery() -> dict:
     return _DISCOVERY
 
 
-def _form(url: str, fields: dict[str, str]) -> dict:
+def _close_socket(sock: socket.socket | None) -> None:
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _raise_if_cancelled(job: LoginJob | None) -> None:
+    if job is not None and job.cancelled:
+        raise AuthError("Вход отменён")
+
+
+class _LoginHTTPSConnection(http.client.HTTPSConnection):
+    """Сокет обмена кода лежит на задании, чтобы «Отмена» оборвала POST."""
+
+    _job: LoginJob | None = None
+
+    def connect(self) -> None:
+        job = self._job
+        if job is not None and job.cancelled:
+            raise OSError("cancelled")
+        super().connect()
+        if job is None:
+            return
+        job._socket = self.sock
+        if job.cancelled:
+            _close_socket(self.sock)
+            raise OSError("cancelled")
+
+
+class _LoginHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, job: LoginJob) -> None:
+        super().__init__()
+        self._job = job
+
+    def https_open(self, req):
+        job = self._job
+
+        def connection(host, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, **kwargs):
+            link = _LoginHTTPSConnection(host, timeout=timeout, **kwargs)
+            link._job = job
+            return link
+
+        return self.do_open(
+            connection,
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
+def _open_form(request: urllib.request.Request, timeout: float, job: LoginJob | None):
+    if job is None:
+        return urllib.request.urlopen(request, timeout=timeout)
+    opener = urllib.request.build_opener(_LoginHTTPSHandler(job))
+    return opener.open(request, timeout=timeout)
+
+
+def _form(url: str, fields: dict[str, str], *, job: LoginJob | None = None) -> dict:
+    _raise_if_cancelled(job)
     body = urllib.parse.urlencode(fields).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -642,16 +733,24 @@ def _form(url: str, fields: dict[str, str]) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with _open_form(request, 20, job) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as error:
+        if job is not None and job.cancelled:
+            raise AuthError("Вход отменён") from None
         detail = _error_payload(error.read().decode("utf-8", "replace"))
         code = str(detail.get("code") or "")
         failure = AuthError(auth_error_text(code, str(detail.get("message") or "")))
         failure.code = code
         raise failure from None
     except OSError as error:
+        if job is not None and job.cancelled:
+            raise AuthError("Вход отменён") from None
         raise AuthError("Нет соединения с OpenAI") from error
+    finally:
+        if job is not None:
+            job._socket = None
+    _raise_if_cancelled(job)
     if not raw.strip():
         return {}
     try:

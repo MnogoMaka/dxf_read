@@ -224,6 +224,186 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(calls, ["", "oaiapp_issued"])
         self.assertEqual(session["access_token"], "new")
 
+    def test_cancel_before_exchange_skips_the_token_request(self) -> None:
+        self._session()
+        job = chatgpt_auth.LoginJob()
+        job.cancel()
+        with patch.object(chatgpt_auth, "_form", side_effect=AssertionError("form")):
+            with self.assertRaises(chatgpt_auth.AuthError) as caught:
+                chatgpt_auth._finish_authorization(job, {}, "oaiapp_test", "nonce", None)
+        self.assertEqual(str(caught.exception), "Вход отменён")
+        saved = chatgpt_auth.load_session()
+        assert saved is not None
+        self.assertEqual(saved["access_token"], "old-access")
+
+    def test_cancel_during_exchange_keeps_the_saved_token(self) -> None:
+        self._session()
+        job = chatgpt_auth.LoginJob()
+
+        def fake_form(url, fields, *, job=None):
+            job.cancel()
+            return {
+                "access_token": "leaked",
+                "refresh_token": "leaked",
+                "id_token": "id-token",
+                "expires_in": 60,
+            }
+
+        previous = chatgpt_auth.load_session()
+        with patch.object(chatgpt_auth, "_form", side_effect=fake_form):
+            with self.assertRaises(chatgpt_auth.AuthError) as caught:
+                chatgpt_auth._finish_authorization(
+                    job,
+                    {"grant_type": "authorization_code"},
+                    "oaiapp_test",
+                    "nonce",
+                    previous,
+                )
+        self.assertEqual(str(caught.exception), "Вход отменён")
+        saved = chatgpt_auth.load_session()
+        assert saved is not None
+        self.assertEqual(saved["access_token"], "old-access")
+        self.assertEqual(saved["refresh_token"], "old-refresh")
+
+    def test_cancel_during_token_check_does_not_save(self) -> None:
+        self._session()
+        job = chatgpt_auth.LoginJob()
+
+        def fake_form(url, fields, *, job=None):
+            return {
+                "access_token": "leaked",
+                "refresh_token": "leaked",
+                "id_token": "id-token",
+                "expires_in": 60,
+                "scope": "openid",
+            }
+
+        def verify(token, audience, nonce):
+            job.cancel()
+            return {"email": "person@example.com", "sub": "subject-1"}
+
+        with patch.object(chatgpt_auth, "_form", side_effect=fake_form), patch.object(
+            chatgpt_auth, "verify_id_token", side_effect=verify,
+        ):
+            with self.assertRaises(chatgpt_auth.AuthError) as caught:
+                chatgpt_auth._finish_authorization(
+                    job,
+                    {"grant_type": "authorization_code"},
+                    "oaiapp_test",
+                    "nonce",
+                    chatgpt_auth.load_session(),
+                )
+        self.assertEqual(str(caught.exception), "Вход отменён")
+        saved = chatgpt_auth.load_session()
+        assert saved is not None
+        self.assertEqual(saved["access_token"], "old-access")
+
+    def test_finish_authorization_stores_the_session(self) -> None:
+        job = chatgpt_auth.LoginJob()
+        seen: dict = {}
+
+        def fake_form(url, fields, *, job=None):
+            seen["job"] = job
+            seen["fields"] = fields
+            return {
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "id_token": "id-token",
+                "expires_in": 3600,
+                "scope": "openid email",
+            }
+
+        with patch.object(chatgpt_auth, "_form", side_effect=fake_form), patch.object(
+            chatgpt_auth, "verify_id_token", return_value={"email": "person@example.com", "sub": "subject-1"},
+        ):
+            session = chatgpt_auth._finish_authorization(
+                job,
+                {"grant_type": "authorization_code", "code": "abc"},
+                "oaiapp_test",
+                "nonce",
+                None,
+            )
+        self.assertIs(seen["job"], job)
+        self.assertEqual(seen["fields"]["code"], "abc")
+        self.assertEqual(session["access_token"], "new-access")
+        self.assertEqual(session["email"], "person@example.com")
+        saved = chatgpt_auth.load_session()
+        assert saved is not None
+        self.assertEqual(saved["access_token"], "new-access")
+        self.assertEqual(saved["refresh_token"], "new-refresh")
+        self.assertEqual(saved["client_id"], "oaiapp_test")
+
+    def test_form_oserror_while_cancelled_is_cancel(self) -> None:
+        job = chatgpt_auth.LoginJob()
+
+        def fake_open(request, timeout, bound):
+            bound.cancel()
+            raise OSError("reset")
+
+        with patch.object(chatgpt_auth, "_open_form", side_effect=fake_open):
+            with self.assertRaises(chatgpt_auth.AuthError) as caught:
+                chatgpt_auth._form(
+                    chatgpt_auth.TOKEN_URL,
+                    {"grant_type": "authorization_code"},
+                    job=job,
+                )
+        self.assertEqual(str(caught.exception), "Вход отменён")
+
+    def test_form_without_job_still_reports_a_network_error(self) -> None:
+        def fake_open(request, timeout, job):
+            self.assertIsNone(job)
+            raise OSError("down")
+
+        with patch.object(chatgpt_auth, "_open_form", side_effect=fake_open):
+            with self.assertRaises(chatgpt_auth.AuthError) as caught:
+                chatgpt_auth._form(chatgpt_auth.TOKEN_URL, {"grant_type": "refresh_token"})
+        self.assertEqual(str(caught.exception), "Нет соединения с OpenAI")
+
+    def test_cancel_closes_the_exchange_socket(self) -> None:
+        class _Sock:
+            def __init__(self) -> None:
+                self.shut = False
+                self.closed = False
+
+            def shutdown(self, how) -> None:
+                self.shut = True
+
+            def close(self) -> None:
+                self.closed = True
+
+        job = chatgpt_auth.LoginJob()
+        link = chatgpt_auth._LoginHTTPSConnection("auth.openai.com")
+        link._job = job
+        sock = _Sock()
+
+        def fake_connect(self) -> None:
+            self.sock = sock
+
+        with patch.object(chatgpt_auth.http.client.HTTPSConnection, "connect", fake_connect):
+            link.connect()
+        self.assertIs(job._socket, sock)
+        job.cancel()
+        self.assertTrue(job.cancelled)
+        self.assertTrue(sock.shut)
+        self.assertTrue(sock.closed)
+        self.assertIsNone(job._socket)
+
+    def test_cancelled_invalid_grant_does_not_retry(self) -> None:
+        calls: list[int] = []
+        job = chatgpt_auth.LoginJob()
+
+        def authorize(bound, saved):
+            calls.append(1)
+            bound.cancel()
+            error = chatgpt_auth.AuthError("отклонён")
+            error.code = "invalid_grant"
+            raise error
+
+        with patch.object(chatgpt_auth, "_authorize", side_effect=authorize):
+            with self.assertRaises(chatgpt_auth.AuthError):
+                chatgpt_auth._login(job)
+        self.assertEqual(calls, [1])
+
     def test_model_list_survives_a_restart(self) -> None:
         self._session()
         session = chatgpt_auth.load_session()
