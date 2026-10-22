@@ -60,8 +60,11 @@ from .config import (
     QUAD_TYPES,
     ROOT_COLLECTION,
     SHEET_PREFIX_RE,
+    SURFACE_TEXTURE_KEYS,
     SYSTEM_PROMPT,
     TARGET_OBJECT_TYPES,
+    TEXTURE_INSTRUCTIONS,
+    TEXTURE_SYSTEM_PROMPT,
     TEXT_TYPES,
     THINK_BLOCK_RE,
     UNDERLAY_SCRIPT,
@@ -459,10 +462,11 @@ _CHATGPT_REASONS = {
 class ChatGPTRouteError(Exception):
     """Ошибка маршрута ChatGPT. fallback оставлен для разбора кода ответа."""
 
-    def __init__(self, message: str, *, code: str, fallback: bool) -> None:
+    def __init__(self, message: str, *, code: str, fallback: bool, status: int = 0) -> None:
         super().__init__(message)
         self.code = code
         self.fallback = fallback
+        self.status = status
 
 
 class ChatGPTNeedChoice(Exception):
@@ -507,7 +511,7 @@ def _chatgpt_failure(code: str, status: int = 0) -> ChatGPTRouteError:
         )
     fallback = status in {401, 403} or code in _CHATGPT_AUTH_CODES
     reason = _CHATGPT_REASONS.get(code) or (f"Ответ ChatGPT: HTTP {status}" if status else "Сессия ChatGPT недоступна")
-    return ChatGPTRouteError(reason, code=code or f"http_{status}", fallback=fallback)
+    return ChatGPTRouteError(reason, code=code or f"http_{status}", fallback=fallback, status=status)
 
 
 def _response_text_from_sse(lines: Iterable[str]) -> str:
@@ -571,15 +575,41 @@ def _response_text_from_sse(lines: Iterable[str]) -> str:
     return "".join(parts)
 
 
+_CHATGPT_RETRY_CODES = {
+    "stream_incomplete",
+    "subscription_sharing_usage_unavailable",
+    "subscription_sharing_user_unavailable",
+    "server_error",
+}
+_CHATGPT_RETRY_STATUS = {429, 500, 502, 503, 504}
+_CHATGPT_NO_RETRY = {
+    "subscription_sharing_usage_limit_exceeded",
+    "subscription_sharing_user_not_eligible",
+    "subscription_sharing_unsupported_capability",
+    "subscription_sharing_route_not_supported",
+    "subscription_sharing_invalid_user",
+}
+
+
 def _request_responses(system: str, user: str, model: str, token: str, timeout: float) -> str:
-    last: ChatGPTRouteError | None = None
-    for _attempt in range(2):
+    """Повтор при обрыве, временной ошибке плана и HTTP 429/5xx. Лимит плана не повторяем."""
+    delays = (0.5, 1.5)
+    last: Exception | None = None
+    for attempt in range(3):
         try:
             return _request_responses_once(system, user, model, token, timeout)
         except ChatGPTRouteError as error:
             last = error
-            if error.code != "stream_incomplete":
+            status_retry = error.status in _CHATGPT_RETRY_STATUS and error.code not in _CHATGPT_NO_RETRY
+            if error.code not in _CHATGPT_RETRY_CODES and not status_retry:
                 raise
+            if attempt == 2:
+                raise
+        except ConnectionError as error:
+            last = error
+            if attempt == 2:
+                raise
+        time.sleep(delays[attempt])
     assert last is not None
     raise last
 
@@ -659,16 +689,11 @@ def select_target_layers(
         _status("Классификация через API")
 
     def ask(system: str, user: str) -> str:
-        if use_chatgpt:
-            try:
-                return _request_responses(system, user, chatgpt_model, token, timeout)
-            except ChatGPTRouteError as error:
-                raise ChatGPTNeedChoice(str(error)) from error
-            except ConnectionError as error:
-                raise ChatGPTNeedChoice(f"Нет соединения с ChatGPT: {error}") from error
-        return _request_chat_completion(
-            system=system,
-            user=user,
+        return _ask_model(
+            system, user,
+            use_chatgpt=use_chatgpt,
+            chatgpt_model=chatgpt_model,
+            token=token,
             model=model,
             base_url=base_url,
             api_key=api_key,
@@ -711,6 +736,123 @@ def select_target_layers(
 
     selection.rejected = sorted(set(layer_names) - used)
     return selection
+
+
+def _ask_model(
+    system: str,
+    user: str,
+    *,
+    use_chatgpt: bool,
+    chatgpt_model: str,
+    token: str,
+    model: str,
+    base_url: str,
+    api_key: str,
+    timeout: float,
+) -> str:
+    """Тот же запрос, что у классификации слоёв: план ChatGPT или запасной API."""
+    if use_chatgpt:
+        try:
+            return _request_responses(system, user, chatgpt_model, token, timeout)
+        except ChatGPTRouteError as error:
+            raise ChatGPTNeedChoice(str(error)) from error
+        except ConnectionError as error:
+            raise ChatGPTNeedChoice(f"Нет соединения с ChatGPT: {error}") from error
+    return _request_chat_completion(
+        system=system,
+        user=user,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+    )
+
+
+def build_texture_prompt(layer_names: Sequence[str]) -> str:
+    quoted = ",\n".join(f"  {json.dumps(name, ensure_ascii=False)}" for name in layer_names)
+    return TEXTURE_INSTRUCTIONS.replace("__LAYERS__", quoted)
+
+
+def _score_textures(data: dict[str, Any]) -> int:
+    score = 0
+    for key in data.values():
+        if str(key).strip().lower() in (*SURFACE_TEXTURE_KEYS, "none"):
+            score += 10
+    return score
+
+
+def _parse_texture_assignment(reply: str, allowed: Mapping[str, str]) -> dict[str, str]:
+    """Имя слоя → ключ текстуры. none и неизвестные ключи отбрасываются."""
+    cleaned = _repair_json_text(_strip_reasoning(reply))
+    candidates = list(_iter_json_objects(cleaned))
+    if not candidates:
+        candidates = list(_iter_json_objects(_repair_json_text(reply)))
+    if not candidates:
+        raise ValueError(f"Модель вернула ответ без JSON:\n{reply[:500]}")
+    data = max(candidates, key=_score_textures)
+    if _score_textures(data) <= 0:
+        raise ValueError(f"Модель не назвала текстуры:\n{reply[:500]}")
+    assigned: dict[str, str] = {}
+    for raw_name, raw_key in data.items():
+        key = str(raw_key).strip().lower()
+        if key not in SURFACE_TEXTURE_KEYS:
+            continue
+        original = _resolve_layer_name(str(raw_name), allowed)
+        if original is None:
+            continue
+        assigned[original] = key
+    return assigned
+
+
+def assign_surface_textures(
+    layer_names: Sequence[str],
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    batch_size: int | None = None,
+    timeout: float | None = None,
+) -> dict[str, str]:
+    """Сопоставляет имя слоя с текстурой тем же каналом, что и классификацию."""
+    cfg = config.settings()
+    model = model or cfg.llm_model
+    base_url = base_url or cfg.llm_base_url
+    api_key = _resolved_api_key(api_key)
+    batch_size = cfg.batch_size if batch_size is None else batch_size
+    timeout = cfg.llm_timeout if timeout is None else timeout
+    force_api = os.environ.get("DWGREADER_FORCE_API") == "1"
+    token, chatgpt_model = ("", "") if force_api else _chatgpt_credentials()
+    use_chatgpt = bool(token)
+    if use_chatgpt:
+        _status("Текстуры через план ChatGPT")
+    else:
+        _ensure_model_awake(model, base_url, api_key)
+        _status("Текстуры через API")
+    allowed = {normalize_name(name): name for name in layer_names}
+    assigned: dict[str, str] = {}
+    for batch in _chunks(list(layer_names), batch_size):
+        prompt = build_texture_prompt(batch)
+        reply = _ask_model(
+            TEXTURE_SYSTEM_PROMPT, prompt,
+            use_chatgpt=use_chatgpt, chatgpt_model=chatgpt_model, token=token,
+            model=model, base_url=base_url, api_key=api_key, timeout=timeout,
+        )
+        try:
+            parsed = _parse_texture_assignment(reply, allowed)
+        except ValueError:
+            try:
+                reply = _ask_model(
+                    TEXTURE_SYSTEM_PROMPT,
+                    prompt + "\n\nОтвет — только JSON, без пояснений и без висячих запятых.",
+                    use_chatgpt=use_chatgpt, chatgpt_model=chatgpt_model, token=token,
+                    model=model, base_url=base_url, api_key=api_key, timeout=timeout,
+                )
+                parsed = _parse_texture_assignment(reply, allowed)
+            except ValueError as error:
+                print(f"Пропуск пакета текстур ({len(batch)} слоёв): {error}")
+                continue
+        assigned.update(parsed)
+    return assigned
 
 
 def _message_text(message: Mapping[str, Any] | None) -> str:
@@ -1847,9 +1989,8 @@ def _assign_generic_fills_to_buildings(
 def arrange_hatch_faces(
     pieces: Sequence[HatchPiece],
 ) -> list[tuple[BaseGeometry, str]]:
-    clustered = _cluster_hatch_pieces(pieces)
     labeled: list[tuple[ShapelyPolygon, str]] = []
-    for piece in clustered:
+    for piece in pieces:
         for polygon in _piece_polygons(piece):
             if polygon.area >= config.settings().min_arrangement_area_m2:
                 labeled.append((polygon, piece.category))
@@ -2000,51 +2141,6 @@ def _iter_shapely_polygons(geometry: BaseGeometry) -> Iterator[ShapelyPolygon]:
             yield from _iter_shapely_polygons(item)
 
 
-def _cluster_hatch_pieces(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
-    """Оставляет одно пятно площадки.
-    В DWG часто два мира: участок и ситуационный план / легенда в сотнях
-    метров в стороне. Берём связную группу в радиусе SITE_CLUSTER_RADIUS_M
-    с наибольшей площадью дорог, газонов и зданий — не самое большое
-    одиночное пятно (им может оказаться рамка ситплана).
-    """
-    ranked: list[HatchPiece] = []
-    for piece in pieces:
-        if _ring_area(piece.vertices) >= config.settings().min_arrangement_area_m2:
-            ranked.append(piece)
-    if not ranked:
-        return list(pieces)
-
-    clusters: list[list[HatchPiece]] = []
-    remaining = list(ranked)
-    while remaining:
-        group = [remaining.pop(0)]
-        changed = True
-        while changed:
-            changed = False
-            next_remaining: list[HatchPiece] = []
-            group_rings = [item.vertices for item in group]
-            for piece in remaining:
-                if _near_hatch_cluster(piece.vertices, group_rings):
-                    group.append(piece)
-                    changed = True
-                else:
-                    next_remaining.append(piece)
-            remaining = next_remaining
-        clusters.append(group)
-
-    def score(group: Sequence[HatchPiece]) -> tuple[float, float]:
-        project = 0.0
-        total = 0.0
-        for piece in group:
-            area = _ring_area(piece.vertices)
-            total += area
-            if piece.category in PROJECT_CLUSTER_CATEGORIES:
-                project += area
-        return project, total
-
-    return list(max(clusters, key=score))
-
-
 def _ring_area(ring: Sequence[tuple[float, float, float]]) -> float:
     area = 0.0
     for (x1, y1, _), (x2, y2, _) in zip(ring, list(ring[1:]) + [ring[0]]):
@@ -2057,19 +2153,6 @@ def _centroid_xy(ring: Sequence[tuple[float, float, float]]) -> tuple[float, flo
         sum(point[0] for point in ring) / len(ring),
         sum(point[1] for point in ring) / len(ring),
     )
-
-
-def _near_hatch_cluster(
-    ring: Sequence[tuple[float, float, float]],
-    cluster: Sequence[Sequence[tuple[float, float, float]]],
-) -> bool:
-    cx, cy = _centroid_xy(ring)
-    radius_sq = config.settings().site_cluster_radius_m ** 2
-    for other in cluster:
-        ox, oy = _centroid_xy(other)
-        if (cx - ox) ** 2 + (cy - oy) ** 2 <= radius_sq:
-            return True
-    return False
 
 
 def _polygon_patch(polygon: ShapelyPolygon, color: tuple[float, float, float], mpl_path: Any, path_patch: Any) -> Any:
@@ -2174,11 +2257,10 @@ def arrange_hatch_faces_by_layer(
     они добавляются своим слоем поверх целой площадки.
     """
     pieces = _without_symbol_holes(pieces)
-    clustered = _cluster_hatch_pieces(pieces)
-    symbols = [piece for piece in clustered if _is_overlay(piece.category, piece.layer)]
+    symbols = [piece for piece in pieces if _is_overlay(piece.category, piece.layer)]
     if not symbols:
-        return _arrange_piece_polygons(clustered)
-    base = [piece for piece in clustered if not _is_overlay(piece.category, piece.layer)]
+        return _arrange_piece_polygons(pieces)
+    base = [piece for piece in pieces if not _is_overlay(piece.category, piece.layer)]
     arranged = _arrange_piece_polygons(base)
     extra: list[tuple[BaseGeometry, str, str]] = []
     for piece in symbols:
@@ -2349,28 +2431,21 @@ def _is_closed_contour(entity: DXFEntity) -> bool:
 
 def count_layer_objects(
     document: Drawing,
-    groups: Mapping[str, Sequence[str]],
+    _groups: Mapping[str, Sequence[str]],
     include_blocks: bool = True,
 ) -> dict[str, dict[str, int]]:
-    """Сколько заливок и замкнутых контуров у каждого слоя в радиусе отрисовки.
+    """Сколько заливок и замкнутых контуров у каждого слоя.
 
-    Центр участка — медиана центров объектов на слоях благоустройства.
     Текст, размеры и открытые линии не считаются.
     """
-    found: list[tuple[str, str, tuple[float, float] | None]] = []
-    scale = drawing_to_meters(document)
-
-    def located(entity: DXFEntity) -> tuple[float, float] | None:
-        center = _entity_center(entity)
-        if center is None or scale == 1.0:
-            return center
-        return (center[0] * scale, center[1] * scale)
+    counts: dict[str, dict[str, int]] = {}
 
     def take(entity: DXFEntity, layer: str) -> None:
+        row = counts.setdefault(layer, {"fills": 0, "curves": 0})
         if _is_fill_entity(entity, layer):
-            found.append((layer, "fills", located(entity)))
+            row["fills"] += 1
         if _is_closed_contour(entity):
-            found.append((layer, "curves", located(entity)))
+            row["curves"] += 1
 
     for entity in document.modelspace():
         layer = str(entity.dxf.layer)
@@ -2379,27 +2454,7 @@ def count_layer_objects(
             for child, child_layer, _path in _iter_block_content(entity):
                 take(child, child_layer)
 
-    site_layers = {normalize_name(name) for names in groups.values() for name in names}
-    anchors = [
-        center for layer, _kind, center in found
-        if center is not None and normalize_name(layer) in site_layers
-    ]
-    if not anchors:
-        anchors = [center for _layer, _kind, center in found if center is not None]
-    center_x = center_y = 0.0
-    if anchors:
-        xs = sorted(point[0] for point in anchors)
-        ys = sorted(point[1] for point in anchors)
-        center_x, center_y = xs[len(xs) // 2], ys[len(ys) // 2]
-    radius_sq = config.settings().site_cluster_radius_m ** 2
-
-    counts: dict[str, dict[str, int]] = {}
-    for layer, kind, center in found:
-        if center is not None and (center[0] - center_x) ** 2 + (center[1] - center_y) ** 2 > radius_sq:
-            continue
-        row = counts.setdefault(layer, {"fills": 0, "curves": 0})
-        row[kind] += 1
-    return counts
+    return {layer: row for layer, row in counts.items() if row["fills"] or row["curves"]}
 
 
 def _geometry_origin(
@@ -2459,9 +2514,14 @@ def _find_blender() -> Path | None:
 def _oda_search_roots() -> list[Path]:
     roots = list(ODA_SEARCH_ROOTS)
     if sys.platform == "darwin":
-        roots.extend((Path("/Applications"), Path.home() / "Applications"))
+        roots.extend((Path("/Applications"), Path.home() / "Applications", Path.home()))
     elif sys.platform.startswith("linux"):
         roots.extend((Path("/usr/bin"), Path("/usr/local/bin"), Path.home()))
+    else:
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            roots.append(Path(local) / "Programs")
+        roots.append(Path.home())
     return roots
 
 
@@ -2485,7 +2545,8 @@ def find_oda_converter(explicit: str | Path | None = None) -> Path:
         return path
     if ODA_CONVERTER and Path(ODA_CONVERTER).is_file():
         return Path(ODA_CONVERTER)
-    candidates: list[Path] = []
+    which = shutil.which("ODAFileConverter")
+    candidates: list[Path] = [Path(which)] if which else []
     for root in _oda_search_roots():
         candidates.extend(_iter_oda_binaries(root))
     if not candidates:
@@ -3047,6 +3108,17 @@ def run_pipeline(
     if cached is not None:
         prepared = pieces_from_cache(cached, groups, source_mode, geometry_by_layer)
         print(f"Фигур из сохранённого разбора: {len(prepared)}")
+    texture_names = sorted({name for names in groups.values() for name in names})
+    surface_textures: dict[str, str] = {}
+    if texture_names:
+        try:
+            surface_textures = assign_surface_textures(texture_names)
+        except ConnectionError as error:
+            _status("Текстуры не назначены, модель недоступна")
+            print(f"Текстуры не назначены: {error}")
+        else:
+            chosen = ", ".join(f"{name}={key}" for name, key in sorted(surface_textures.items()))
+            print(f"Текстуры: {chosen or 'нет'}")
     underlay = export_blender_underlay(
         document, groups,
         json_path=str(out / f"{source.stem}_underlay.json"),
@@ -3057,6 +3129,7 @@ def run_pipeline(
         geometry_by_layer=geometry_by_layer,
         prepared_pieces=prepared,
         source_label=source,
+        surface_textures=surface_textures,
     )
     return {
         "dxf": str(source),
@@ -3081,6 +3154,7 @@ def export_blender_underlay(
     geometry_by_layer: Mapping[str, str] | None = None,
     prepared_pieces: list[HatchPiece] | None = None,
     source_label: str | Path | None = None,
+    surface_textures: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Каждый слой AutoCAD становится отдельной коллекцией. Без выдавливания:
@@ -3155,13 +3229,18 @@ def export_blender_underlay(
     scale = float(config.settings().scene_scale or 1.0)
     if scale <= 0:
         scale = 1.0
+    texture_by_name = {
+        normalize_name(name): key
+        for name, key in (surface_textures or {}).items()
+        if key in SURFACE_TEXTURE_KEYS
+    }
     layers_payload: list[dict[str, Any]] = []
     for geometry, category, layer in sorted(faces, key=lambda item: item[2]):
         vertices, triangles, polygon_faces = _layer_mesh(geometry, origin, scale)
         if not triangles:
             continue
         color = HATCH_DRAW_COLORS.get(category, (0.55, 0.55, 0.55))
-        layers_payload.append({
+        record = {
             "dxf_layer": layer,
             "category": category,
             "color": list(color),
@@ -3169,7 +3248,11 @@ def export_blender_underlay(
             "vertices": vertices,
             "faces": triangles,
             "polygon_faces": polygon_faces,
-        })
+        }
+        texture = texture_by_name.get(normalize_name(layer))
+        if texture:
+            record["texture"] = texture
+        layers_payload.append(record)
         print(f"  слой {layer!r}: {len(vertices)} вершин, {len(triangles)} треугольников")
 
     payload = {

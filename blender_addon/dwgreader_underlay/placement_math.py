@@ -424,6 +424,13 @@ def smooth_path(points: list[tuple[float, float]], spacing: float = 0.25) -> lis
     return dense
 
 
+def _path_length(points: list[tuple[float, float]]) -> float:
+    total = 0.0
+    for start, end in zip(points, points[1:]):
+        total += hypot(end[0] - start[0], end[1] - start[1])
+    return total
+
+
 def _sample_path(points: list[tuple[float, float]], distance: float) -> tuple[float, float, float, float]:
     travelled = 0.0
     last = points[0]
@@ -443,15 +450,45 @@ def _sample_path(points: list[tuple[float, float]], distance: float) -> tuple[fl
     return (last[0], last[1], dx, dy)
 
 
+def _blend_paths(
+    straight: list[tuple[float, float]],
+    curved: list[tuple[float, float]],
+    amount: float,
+) -> list[tuple[float, float]]:
+    """Одна и та же доля длины: отрезок и дуга смешиваются."""
+    straight_len = _path_length(straight)
+    curved_len = _path_length(curved)
+    if straight_len < 1e-6 or curved_len < 1e-6:
+        return list(straight)
+    pieces = max(len(curved), 8)
+    blended: list[tuple[float, float]] = []
+    for index in range(pieces + 1):
+        ratio = index / pieces
+        sx, sy, _dx, _dy = _sample_path(straight, ratio * straight_len)
+        cx, cy, _dx, _dy = _sample_path(curved, ratio * curved_len)
+        blended.append((sx + (cx - sx) * amount, sy + (cy - sy) * amount))
+    return blended
+
+
 def bench_path(
     points: list[tuple[float, float]],
     step: float,
     depth: float,
     heading: str = "tangent",
     turn: float = 0.0,
+    roundness: float = 1.0,
 ) -> list[tuple[float, float, float]]:
-    """Точки и поворот лавок вдоль линии. Длинная сторона идёт по пути, взгляд — поперёк."""
-    path = smooth_path(points)
+    """Точки и поворот лавок вдоль линии. Длинная сторона идёт по пути, взгляд — поперёк.
+
+    roundness 0 — строго по отрезкам между кликами, 1 — плавная дуга.
+    """
+    amount = min(max(float(roundness), 0.0), 1.0)
+    if amount <= 0.0 or len(points) < 3:
+        path = list(points)
+    elif amount >= 1.0:
+        path = smooth_path(points)
+    else:
+        path = _blend_paths(points, smooth_path(points), amount)
     if len(path) < 2 or step <= 0:
         return []
     total = 0.0

@@ -480,6 +480,7 @@ def _listed_layer_meshes(context) -> list[bpy.types.Object]:
 
 
 _LAST_ZONE = ""
+_LAST_BENCH_NAME = ""
 _PLANT_OWNER = object()
 
 
@@ -501,6 +502,7 @@ def _track_clicked_zone() -> None:
     if context is None:
         return
     _remember_zone(_context_active_object(context))
+    _sync_bench_roundness(context)
 
 
 def _active_zone_mesh(context) -> bpy.types.Object | None:
@@ -1176,9 +1178,23 @@ def _place_benches(context, points: list[tuple[float, float]]) -> int:
         raise PlacementError("Для линии нужна модель из семейства лавок")
     heading = str(getattr(context.scene, "dwgreader_bench_heading", "tangent") or "tangent")
     turn = pi if bool(getattr(context.scene, "dwgreader_bench_flip", False)) else 0.0
-    placed = bench_path(points, step, float(asset["footprint"][1]), heading, turn)
+    depth = float(asset["footprint"][1])
+    roundness = float(getattr(context.scene, "dwgreader_bench_roundness", 1.0) or 0.0)
+    placed = bench_path(points, step, depth, heading, turn, roundness)
     if not placed:
         raise PlacementError("Линия слишком короткая")
+    global _BENCH_LOCK
+    _BENCH_LOCK = True
+    try:
+        count = _place_bench_row(
+            context, points, asset, step, heading, turn, depth, roundness, placed,
+        )
+    finally:
+        _BENCH_LOCK = False
+    return count
+
+
+def _place_bench_row(context, points, asset, step, heading, turn, depth, roundness, placed) -> int:
     source = _import_mesh(context, asset)
     collection = _placement_collection("benches")
     key = ":".join(f"{round(point[0], 2)},{round(point[1], 2)}" for point in points)
@@ -1192,6 +1208,10 @@ def _place_benches(context, points: list[tuple[float, float]]) -> int:
     parent["zone_key"] = key
     parent["step"] = step
     parent["heading"] = heading
+    parent["turn"] = turn
+    parent["depth"] = depth
+    parent["path_xy"] = _encode_path(points)
+    parent["roundness"] = roundness
     collection.objects.link(parent)
     parent.hide_set(True)
     parent.hide_render = True
@@ -1211,6 +1231,8 @@ def _place_benches(context, points: list[tuple[float, float]]) -> int:
         inst.scale = (scale, scale, scale)
         inst["asset_id"] = asset["id"]
         collection.objects.link(inst)
+    _mark_last_bench(parent)
+    _select_only(context, [child for child in parent.children if child.type == "MESH"])
     return len(placed)
 
 
@@ -1280,6 +1302,268 @@ def _play_items(self, context):
     if not assets:
         return [("none", "Нет площадок в каталоге", "")]
     return [(asset["id"], asset["name"], asset["file"]) for asset in assets]
+
+
+def _encode_path(points: list[tuple[float, float]]) -> str:
+    return ";".join(f"{point[0]:.6f},{point[1]:.6f}" for point in points)
+
+
+def _decode_path(raw: str) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for part in str(raw or "").replace(":", ";").split(";"):
+        bits = part.split(",")
+        if len(bits) != 2:
+            continue
+        try:
+            points.append((float(bits[0]), float(bits[1])))
+        except ValueError:
+            continue
+    return points
+
+
+def _stored_bench_points(parent) -> list[tuple[float, float]]:
+    points = _decode_path(str(parent.get("path_xy") or ""))
+    if len(points) >= 2:
+        return points
+    return _decode_path(str(parent.get("zone_key") or ""))
+
+
+def _row_depth(context, parent) -> float:
+    if "depth" in parent.keys():
+        return float(parent["depth"])
+    depth = 0.0
+    asset_id = str(parent.get("asset_id") or "")
+    if asset_id:
+        try:
+            depth = float(_asset(context, asset_id)["footprint"][1])
+        except Exception:
+            depth = 0.0
+    parent["depth"] = depth
+    return depth
+
+
+def _row_turn(parent, points, step: float, depth: float, heading: str, roundness: float) -> float:
+    if "turn" in parent.keys():
+        return float(parent["turn"])
+    children = [child for child in parent.children if child.type == "MESH"]
+    turn = 0.0
+    if children:
+        sample = bench_path(points, step, depth, heading, 0.0, roundness)
+        if sample:
+            delta = float(children[0].rotation_euler.z) - sample[0][2]
+            delta = (delta + pi) % (2.0 * pi) - pi
+            if abs(abs(delta) - pi) < 0.35:
+                turn = pi
+    parent["turn"] = turn
+    return turn
+
+
+def _retarget_benches(parent, placed: list[tuple[float, float, float]], scale: float) -> None:
+    if not placed:
+        return
+    children = [child for child in parent.children if child.type == "MESH"]
+    children.sort(key=lambda child: child.name)
+    if not children:
+        return
+    collection = next(iter(parent.users_collection), None)
+    if collection is None:
+        return
+    template = children[0]
+    asset_id = str(parent.get("asset_id") or "bench")
+    while len(children) < len(placed):
+        inst = template.copy()
+        inst.data = template.data
+        inst.parent = parent
+        inst.matrix_parent_inverse.identity()
+        inst.hide_viewport = False
+        inst.hide_render = False
+        inst.hide_select = False
+        inst.name = f"BENCH_{asset_id}_{len(children)}"
+        inst["asset_id"] = asset_id
+        collection.objects.link(inst)
+        children.append(inst)
+    for child, (x, y, angle) in zip(children, placed):
+        child.location = (x, y, 0.0)
+        child.rotation_mode = "XYZ"
+        child.rotation_euler = (0.0, 0.0, angle)
+        child.scale = (scale, scale, scale)
+    for child in children[len(placed):]:
+        bpy.data.objects.remove(child, do_unlink=True)
+
+
+_BENCH_LOCK = False
+
+
+def _bench_row_of(obj) -> bpy.types.Object | None:
+    current = obj
+    seen: set[str] = set()
+    while current is not None and current.name not in seen:
+        seen.add(current.name)
+        if current.get("placement") == "linear" and current.get("family") == "bench":
+            return current
+        current = current.parent
+    return None
+
+
+def _selected_bench_rows(context) -> list:
+    """Ряды, чьи лавки сейчас выделены. Активный ряд идёт первым."""
+    selected = list(getattr(context, "selected_objects", None) or [])
+    active = _context_active_object(context)
+    ordered = [active] + [obj for obj in selected if obj is not active] if active in selected else selected
+    rows = []
+    seen: set[str] = set()
+    for obj in ordered:
+        parent = _bench_row_of(obj)
+        if parent is None or parent.name in seen:
+            continue
+        seen.add(parent.name)
+        rows.append(parent)
+    return rows
+
+
+def _last_bench_row():
+    named = bpy.data.objects.get(_LAST_BENCH_NAME) if _LAST_BENCH_NAME else None
+    if _bench_row_of(named) is named and named is not None:
+        return named
+    root = bpy.data.collections.get(ROOT_NAME)
+    if root is None:
+        return None
+    for obj in root.all_objects:
+        if obj.get("placement") == "linear" and obj.get("family") == "bench" and obj.get("bench_last"):
+            return obj
+    return None
+
+
+def _roundness_targets(context) -> list:
+    picked = _selected_bench_rows(context)
+    if picked:
+        return picked
+    last = _last_bench_row()
+    return [last] if last is not None else []
+
+
+def _mark_last_bench(parent) -> None:
+    global _LAST_BENCH_NAME
+    _LAST_BENCH_NAME = parent.name
+    root = bpy.data.collections.get(ROOT_NAME)
+    if root is None:
+        parent["bench_last"] = 1
+        return
+    for obj in root.all_objects:
+        if obj.get("family") == "bench" and obj.get("bench_last") and obj.name != parent.name:
+            del obj["bench_last"]
+    parent["bench_last"] = 1
+
+
+def _select_only(context, objects) -> None:
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is None:
+        return
+    for obj in list(view_layer.objects):
+        if obj.select_get():
+            obj.select_set(False)
+    active = None
+    for obj in objects:
+        if obj.name not in view_layer.objects:
+            continue
+        obj.hide_set(False)
+        obj.select_set(True)
+        active = active or obj
+    if active is not None:
+        view_layer.objects.active = active
+
+
+def _stored_roundness(parent) -> float | None:
+    if "roundness" not in parent.keys():
+        return None
+    return min(max(float(parent["roundness"]), 0.0), 1.0)
+
+
+def _stored_step(parent) -> float | None:
+    if "step" not in parent.keys():
+        return None
+    return max(float(parent["step"]), MIN_BENCH_STEP_M)
+
+
+def _sync_bench_roundness(context) -> None:
+    """Ползунки показывают шаг и скругление выделенного ряда, иначе последнего поставленного."""
+    global _BENCH_LOCK
+    if context is None or _BENCH_LOCK:
+        return
+    rows = _roundness_targets(context)
+    if not rows:
+        return
+    parent = rows[0]
+    stored_roundness = _stored_roundness(parent)
+    stored_step = _stored_step(parent)
+    current_roundness = float(getattr(context.scene, "dwgreader_bench_roundness", 1.0) or 0.0)
+    current_step = float(getattr(context.scene, "dwgreader_bench_step", 3.0) or 0.0)
+    write_roundness = stored_roundness is not None and abs(current_roundness - stored_roundness) >= 1e-4
+    write_step = stored_step is not None and abs(current_step - stored_step) >= 1e-4
+    if not write_roundness and not write_step:
+        return
+    _BENCH_LOCK = True
+    try:
+        if write_roundness:
+            context.scene.dwgreader_bench_roundness = stored_roundness
+        if write_step:
+            context.scene.dwgreader_bench_step = stored_step
+    finally:
+        _BENCH_LOCK = False
+
+
+def _apply_bench_layout(context, parent, step: float, roundness: float, scale: float) -> None:
+    points = _stored_bench_points(parent)
+    if len(points) < 2:
+        return
+    heading = str(parent.get("heading") or "tangent")
+    depth = _row_depth(context, parent)
+    turn = _row_turn(parent, points, step, depth, heading, roundness)
+    placed = bench_path(points, step, depth, heading, turn, roundness)
+    _retarget_benches(parent, placed, scale)
+    parent["step"] = step
+    parent["roundness"] = roundness
+
+
+def _reshape_benches(context, *, step: float | None = None, roundness: float | None = None) -> None:
+    """Шаг и скругление двигают выделенные ряды, а без выделения — последний поставленный."""
+    global _BENCH_LOCK
+    if context is None or _BENCH_LOCK:
+        return
+    targets = _roundness_targets(context)
+    if not targets:
+        return
+    scale = _model_scale(context, "dwgreader_bench_scale")
+    selected = {obj.name for obj in _selected_bench_rows(context)}
+    _BENCH_LOCK = True
+    try:
+        for parent in targets:
+            row_step = step if step is not None else float(parent.get("step") or context.scene.dwgreader_bench_step)
+            row_roundness = roundness if roundness is not None else _stored_roundness(parent)
+            if row_roundness is None:
+                row_roundness = float(getattr(context.scene, "dwgreader_bench_roundness", 1.0) or 0.0)
+            _apply_bench_layout(context, parent, row_step, row_roundness, scale)
+            if parent.name in selected:
+                for child in parent.children:
+                    if child.type == "MESH":
+                        try:
+                            child.select_set(True)
+                        except RuntimeError:
+                            pass
+    finally:
+        _BENCH_LOCK = False
+
+
+def _on_bench_step(self, context):
+    if context is None:
+        return
+    _reshape_benches(context, step=max(float(self.dwgreader_bench_step), MIN_BENCH_STEP_M))
+
+
+def _on_bench_roundness(self, context):
+    if context is None:
+        return
+    _reshape_benches(context, roundness=float(self.dwgreader_bench_roundness))
 
 
 def _on_bench_scale(self, context):
@@ -1352,6 +1636,7 @@ def draw_panel(layout, context) -> None:
         elif mode == "benches":
             box.prop(scene, "dwgreader_bench_asset", text="Модель")
             box.prop(scene, "dwgreader_bench_step")
+            box.prop(scene, "dwgreader_bench_roundness", text="Скругление", slider=True)
             box.prop(scene, "dwgreader_bench_heading", text="Ориентация")
             box.prop(scene, "dwgreader_bench_flip")
             box.prop(scene, "dwgreader_bench_scale", text="Размер лавок и лежаков")
@@ -1432,9 +1717,20 @@ def register() -> None:
     )
     bpy.types.Scene.dwgreader_bench_step = FloatProperty(
         name="Шаг, м",
+        description="Расстояние между лавками. Двигается выделенный ряд, а без выделения — последний поставленный",
         default=3.0,
         min=0.5,
         soft_max=30.0,
+        update=_on_bench_step,
+    )
+    bpy.types.Scene.dwgreader_bench_roundness = FloatProperty(
+        name="Скругление",
+        description="0 — лавки по отрезкам между кликами, 1 — плавная дуга. Двигается выделенный ряд, а без выделения — последний поставленный",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+        update=_on_bench_roundness,
     )
     bpy.types.Scene.dwgreader_bench_asset = EnumProperty(
         name="Лавка",
@@ -1485,6 +1781,7 @@ def unregister() -> None:
         "dwgreader_bench_flip",
         "dwgreader_bench_heading",
         "dwgreader_bench_asset",
+        "dwgreader_bench_roundness",
         "dwgreader_bench_step",
         "dwgreader_plant_scale",
         "dwgreader_bush_model",

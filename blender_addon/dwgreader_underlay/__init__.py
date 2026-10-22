@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -26,7 +28,18 @@ def _reload_stale_modules() -> None:
     """Установка zip выгружает сам пакет, а подмодули старой версии остаются в sys.modules."""
     import importlib
 
-    for name in ("placement_math", "build_scene", "placement", "chatgpt_auth", "building_export"):
+    for name in (
+        "placement_math",
+        "install_support",
+        "build_scene",
+        "placement",
+        "chatgpt_auth",
+        "building_export",
+        "mcp_bridge",
+        "scene_changes",
+        "chat_view",
+        "scene_chat",
+    ):
         module = sys.modules.get(f"{__name__}.{name}")
         if module is not None:
             importlib.reload(module)
@@ -34,14 +47,35 @@ def _reload_stale_modules() -> None:
 
 _reload_stale_modules()
 
-from . import building_export, chatgpt_auth, placement
-from .build_scene import SHEET_GAP_M, build, drop_objects, frame_objects, remove_root, sheet_groups, sheet_size
+from . import building_export, chatgpt_auth, install_support, placement, scene_chat
+from .build_scene import (
+    SHEET_GAP_M,
+    commit_underlay,
+    drop_objects,
+    frame_objects,
+    remove_root,
+    sheet_groups,
+    sheet_size,
+)
+from .install_support import (
+    ODA_DOWNLOAD_URL,
+    ODA_INSTALL_NEED_UI,
+    ODA_INSTALL_OK,
+    PIP_PACKAGES,
+    classify_block_reason,
+    deps_ready,
+    is_python_binary,
+    is_windows_arm,
+    oda_present,
+    oda_search_roots,
+    python_search_folders,
+)
 
 
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 4, 31),
+    "version": (1, 4, 62),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF, жилой дом и расстановка благоустройства в сцене",
@@ -94,9 +128,8 @@ SCREENS = (
     ("import", "Импорт DXF", ""),
     ("place", "Озеленение и МАФ", ""),
     ("building", "Здание", ""),
+    ("chat", "Чат", ""),
 )
-PIP_PACKAGES = ("ezdxf", "shapely", "numpy", "mapbox-earcut", "PyJWT[crypto]")
-WINGET_ODA_ID = "ODA.ODAFileConverter"
 JUNK_TOKENS = (
     "НОМ._ПЕРА, LABEL_, POINTS_GRID, POINTS_GRADE, NULL_WORKS, "
     "ИНТЕРЬЕР, ГОРИЗОНТАЛ, ВЕРТИКАЛК, DEFPOINTS, ЭКСПЛИКАЦ, "
@@ -131,23 +164,8 @@ def _engine_dir() -> Path:
 
 
 def _python_folders() -> list[Path]:
-    folders = [Path(sys.prefix) / "bin", Path(sys.prefix)]
     binary = Path(getattr(bpy.app, "binary_path", "") or "")
-    if not binary:
-        return folders
-    # macOS: Blender.app/Contents/MacOS/Blender → Contents/Resources/4.x/python/bin
-    resources = binary.parent.parent / "Resources"
-    if resources.is_dir():
-        folders.extend(resources.glob("*/python/bin"))
-    folders.extend(binary.parent.glob("*/python/bin"))
-    return folders
-
-
-def _is_python_binary(path: Path) -> bool:
-    name = path.name.lower()
-    if not path.is_file() or "config" in name:
-        return False
-    return name.startswith("python") and not name.endswith((".dll", ".dylib", ".so"))
+    return python_search_folders(Path(sys.prefix), binary if binary else None)
 
 
 def _blender_python() -> Path:
@@ -158,7 +176,7 @@ def _blender_python() -> Path:
             continue
         for candidate in folder.iterdir():
             resolved = candidate.resolve()
-            if resolved in seen or not _is_python_binary(candidate):
+            if resolved in seen or not is_python_binary(candidate):
                 continue
             seen.add(resolved)
             found.append(candidate)
@@ -170,40 +188,52 @@ def _blender_python() -> Path:
     )
 
 
-def _oda_roots() -> tuple[Path, ...]:
-    if sys.platform == "darwin":
-        return (Path("/Applications"), Path.home() / "Applications")
-    if sys.platform.startswith("linux"):
-        return (Path("/usr/bin"), Path("/usr/local/bin"), Path.home())
-    return (
-        Path(r"C:\Program Files\ODA"),
-        Path(r"C:\Program Files (x86)\ODA"),
-        Path(r"C:\Program Files"),
-    )
+def _oda_roots() -> list[Path]:
+    return oda_search_roots(sys.platform, Path.home(), os.environ.get("LOCALAPPDATA", ""))
 
 
 def _oda_installed(prefs=None) -> bool:
     """Есть ли ODA File Converter: путь из настроек или стандартные папки системы."""
     if prefs is not None and prefs.oda_converter.strip():
         return Path(bpy.path.abspath(prefs.oda_converter.strip())).is_file()
-    for root in _oda_roots():
-        if not root.is_dir():
-            continue
-        patterns = (
-            "ODAFileConverter*/ODAFileConverter.exe",
-            "ODAFileConverter.exe",
-            "ODAFileConverter*.app/Contents/MacOS/ODAFileConverter",
-            "ODAFileConverter",
-        )
-        if any(path.is_file() for pattern in patterns for path in root.glob(pattern)):
-            return True
-    return False
+    return oda_present(_oda_roots(), shutil.which("ODAFileConverter") or "")
 
 
 def _deps_ready() -> bool:
-    vendor = _vendor_dir()
-    names = ("ezdxf", "shapely", "mapbox_earcut", "numpy", "jwt", "cryptography")
-    return all((vendor / name).exists() for name in names)
+    return deps_ready(_vendor_dir())
+
+
+def _run_blender_python(python: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    return subprocess.run(
+        [str(python), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+
+
+def _ensure_pip(python: Path) -> str:
+    """Пустая строка — pip готов. Иначе текст ошибки для панели."""
+    probe = _run_blender_python(python, ["-m", "pip", "--version"])
+    if probe.returncode == 0:
+        return ""
+    setup = _run_blender_python(python, ["-m", "ensurepip", "--upgrade"])
+    if setup.returncode != 0:
+        detail = (setup.stderr or setup.stdout or "ensurepip не сработал").strip()
+        return f"В Python Blender нет pip. {detail[:160]}"
+    probe = _run_blender_python(python, ["-m", "pip", "--version"])
+    if probe.returncode == 0:
+        return ""
+    return "В Python Blender нет pip. Не удалось вызвать ensurepip."
+
+
+def _open_oda_download() -> None:
+    import webbrowser
+
+    webbrowser.open(ODA_DOWNLOAD_URL)
 
 
 def _addon_prefs(context):
@@ -274,7 +304,6 @@ def _settings_payload(prefs, source: Path) -> dict:
     if prefs.oda_converter.strip():
         oda = bpy.path.abspath(prefs.oda_converter.strip())
     return {
-        "site_cluster_radius_m": float(prefs.site_cluster_radius_m),
         "generic_fill_associate_m": float(prefs.generic_fill_associate_m),
         "min_arrangement_area_m2": float(prefs.min_arrangement_area_m2),
         "flattening_distance_m": float(prefs.flattening_distance_m),
@@ -320,17 +349,21 @@ def _python_env(prefs=None, force_api: bool = False) -> dict[str, str]:
     return env
 
 
-def _chatgpt_block_reason(prefs) -> str:
-    """Пустая строка — можно звать план ChatGPT. Иначе разбор запускать нельзя."""
+def _chatgpt_block_reason(prefs, force_api: bool = False) -> str:
+    """Пустая строка — разбор можно запускать. Иначе причина для панели."""
     profile = chatgpt_auth.public_profile()
-    if profile is None or not profile.get("sharing"):
-        return ""
+    sharing = bool(profile and profile.get("sharing"))
     slug = (getattr(prefs, "chatgpt_model", "") or chatgpt_auth.saved_model() or "").strip()
-    if not slug or slug == "none":
-        return "Модель ChatGPT не выбрана. Список моделей ещё не загрузился — повторите через несколько секунд."
-    if not chatgpt_auth.ensure_access():
-        return chatgpt_auth.last_notice() or "Сессия ChatGPT не дала токен доступа"
-    return ""
+    has_access = bool(sharing and not force_api and chatgpt_auth.ensure_access())
+    return classify_block_reason(
+        sharing=sharing,
+        slug=slug,
+        has_access=has_access,
+        access_notice=chatgpt_auth.last_notice(),
+        api_url=str(getattr(prefs, "llm_base_url", "") or ""),
+        api_model=str(getattr(prefs, "llm_model", "") or ""),
+        force_api=force_api,
+    )
 
 
 def _redraw(context) -> None:
@@ -362,6 +395,14 @@ def _on_chatgpt_model(self, context):
 
 
 def _draw_chatgpt(layout, prefs) -> None:
+    waiting = chatgpt_auth.active_login()
+    if waiting is not None:
+        box = layout.box()
+        box.label(text="Завершите вход в браузере", icon="URL")
+        actions = box.row(align=True)
+        actions.operator("dwgreader.chatgpt_copy_link", text="Скопировать ссылку")
+        actions.operator("dwgreader.chatgpt_cancel", text="Отмена")
+        return
     profile = chatgpt_auth.public_profile()
     if profile is None:
         layout.operator("dwgreader.chatgpt_login", text="Продолжить с ChatGPT")
@@ -371,11 +412,16 @@ def _draw_chatgpt(layout, prefs) -> None:
     if profile["sharing"]:
         box.label(text="Используется план ChatGPT")
         if prefs is not None:
-            box.prop(prefs, "chatgpt_model", text="Модель")
+            row = box.row(align=True)
+            row.prop(prefs, "chatgpt_model", text="Модель")
+            row.operator("dwgreader.chatgpt_models", text="", icon="FILE_REFRESH")
+        box.operator("dwgreader.chatgpt_usage", text="Расход плана")
     else:
         box.label(text="План ChatGPT не разрешён, классификация пойдёт через API", icon="INFO")
     actions = box.row(align=True)
     actions.operator("dwgreader.chatgpt_login", text="Переподключить")
+    other = actions.operator("dwgreader.chatgpt_login", text="Другой аккаунт")
+    other.another = True
     actions.operator("dwgreader.chatgpt_logout", text="Выйти")
 
 
@@ -397,11 +443,11 @@ class DWGREADER_AddonPreferences(AddonPreferences):
     llm_model: StringProperty(
         name="Модель",
         description="Имя модели на OpenAI-совместимом сервере",
-        default="qwen/qwen3-vl-30b-a3b-instruct",
+        default="",
     )
     llm_base_url: StringProperty(
         name="Адрес модели",
-        default="https://llm-router.cxm.dev/v1/",
+        default="",
     )
     llm_api_key: StringProperty(
         name="Ключ API",
@@ -421,18 +467,6 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         default=600,
         min=1,
         max=2000,
-    )
-    site_cluster_radius_m: FloatProperty(
-        name="Радиус кластера, м",
-        description=(
-            "До сборки оставляет одну группу заливок. Пятна, чьи центры ближе этого "
-            "расстояния по цепочке, считаются одним чертежом. В подложку попадает группа "
-            "с наибольшей площадью покрытий, газона и зданий. Остальные чертежи листа "
-            "отбрасываются. 400000 м почти ничего не отбрасывает"
-        ),
-        default=400000.0,
-        min=1.0,
-        soft_max=400000.0,
     )
     layer_part_gap_m: FloatProperty(
         name="Зазор частей слоя, м",
@@ -566,7 +600,6 @@ class DWGREADER_AddonPreferences(AddonPreferences):
 
 
 def _draw_geometry(layout, prefs) -> None:
-    layout.prop(prefs, "site_cluster_radius_m")
     layout.prop(prefs, "generic_fill_associate_m")
     layout.prop(prefs, "min_arrangement_area_m2")
     layout.prop(prefs, "flattening_distance_m")
@@ -584,7 +617,7 @@ def _draw_split(layout, prefs) -> None:
 class DWGREADER_OT_install_deps(Operator):
     bl_idname = "dwgreader.install_deps"
     bl_label = "Установить библиотеки"
-    bl_description = "Ставит ezdxf, shapely и earcut в папку аддона через Python Blender"
+    bl_description = "Ставит ezdxf, shapely, earcut, matplotlib и requests в папку аддона через Python Blender"
 
     _timer = None
     _proc = None
@@ -600,6 +633,10 @@ class DWGREADER_OT_install_deps(Operator):
             python = _blender_python()
         except FileNotFoundError as exc:
             self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        missing = _ensure_pip(python)
+        if missing:
+            self.report({"ERROR"}, missing)
             return {"CANCELLED"}
         vendor = _vendor_dir()
         vendor.mkdir(parents=True, exist_ok=True)
@@ -628,6 +665,7 @@ class DWGREADER_OT_chatgpt_login(Operator):
     _timer = None
     _thread = None
     _job: chatgpt_auth.LoginJob | None = None
+    another: BoolProperty(name="Другой аккаунт", default=False, options={"HIDDEN", "SKIP_SAVE"})
 
     @classmethod
     def poll(cls, context):
@@ -643,7 +681,9 @@ class DWGREADER_OT_chatgpt_login(Operator):
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
         job = chatgpt_auth.LoginJob()
+        job.another = bool(self.another)
         self._job = job
+        chatgpt_auth.set_active_login(job)
         self._thread = threading.Thread(target=job.run, daemon=True)
         self._thread.start()
         context.window_manager.dwgreader_busy = True
@@ -660,6 +700,7 @@ class DWGREADER_OT_chatgpt_login(Operator):
             return {"PASS_THROUGH"}
         job = self._job
         if job is None or not job.done:
+            _redraw(context)
             return {"RUNNING_MODAL"}
         self._finish(context, cancel=False)
         if job.email and not job.error:
@@ -686,6 +727,7 @@ class DWGREADER_OT_chatgpt_login(Operator):
             prefs.chatgpt_model = saved
         elif prefs.chatgpt_model not in slugs:
             prefs.chatgpt_model = slugs[0]
+        chatgpt_auth.remember_model(prefs.chatgpt_model)
 
     def _finish(self, context, cancel: bool) -> None:
         if self._timer is not None:
@@ -693,8 +735,64 @@ class DWGREADER_OT_chatgpt_login(Operator):
             self._timer = None
         if cancel and self._job is not None:
             self._job.cancel()
+        if chatgpt_auth.active_login() is self._job or self._job is not None:
+            chatgpt_auth.set_active_login(None)
         context.window_manager.dwgreader_busy = False
         _redraw(context)
+
+
+class DWGREADER_OT_chatgpt_copy_link(Operator):
+    bl_idname = "dwgreader.chatgpt_copy_link"
+    bl_label = "Скопировать ссылку"
+    bl_description = "Копирует ссылку входа, если браузер не открылся"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        url = chatgpt_auth.login_url()
+        if not url:
+            self.report({"WARNING"}, "Ссылка входа ещё не готова")
+            return {"CANCELLED"}
+        context.window_manager.clipboard = url
+        self.report({"INFO"}, "Ссылка входа скопирована")
+        return {"FINISHED"}
+
+
+class DWGREADER_OT_chatgpt_cancel(Operator):
+    bl_idname = "dwgreader.chatgpt_cancel"
+    bl_label = "Отмена"
+    bl_description = "Прерывает ожидание входа в ChatGPT"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        job = chatgpt_auth.active_login()
+        if job is not None:
+            job.cancel()
+        context.scene.dwgreader_status = "Вход отменён"
+        return {"FINISHED"}
+
+
+class DWGREADER_OT_chatgpt_usage(Operator):
+    bl_idname = "dwgreader.chatgpt_usage"
+    bl_label = "Расход плана"
+    bl_description = "Открывает страницу расхода ChatGPT"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        import webbrowser
+        webbrowser.open(chatgpt_auth.USAGE_URL)
+        return {"FINISHED"}
+
+
+class DWGREADER_OT_chatgpt_models(Operator):
+    bl_idname = "dwgreader.chatgpt_models"
+    bl_label = "Обновить модели"
+    bl_description = "Заново запрашивает список моделей плана ChatGPT"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        threading.Thread(target=chatgpt_auth.refresh_models, daemon=True).start()
+        self.report({"INFO"}, "Список моделей обновляется")
+        return {"FINISHED"}
 
 
 class DWGREADER_OT_chatgpt_logout(Operator):
@@ -721,7 +819,7 @@ class DWGREADER_OT_chatgpt_logout(Operator):
 class DWGREADER_OT_install_oda(Operator):
     bl_idname = "dwgreader.install_oda"
     bl_label = "Установить ODA File Converter"
-    bl_description = "Ставит ODA File Converter, если его ещё нет: winget в Windows, страница загрузки на Mac"
+    bl_description = "Скачивает установщик ODA File Converter. Если сайт блокирует автозагрузку — открывает страницу"
 
     _timer = None
     _proc = None
@@ -736,29 +834,39 @@ class DWGREADER_OT_install_oda(Operator):
         if _oda_installed(_addon_prefs(context)):
             self.report({"INFO"}, "ODA File Converter уже установлен")
             return {"CANCELLED"}
-        if sys.platform == "darwin":
-            import webbrowser
-            webbrowser.open("https://www.opendesign.com/guestfiles/oda_file_converter")
+        if sys.platform != "win32" or is_windows_arm(platform.machine()):
+            _open_oda_download()
+            if sys.platform == "darwin":
+                self.report(
+                    {"INFO"},
+                    "Открыта загрузка ODA. Поставьте приложение в /Applications и запустите импорт снова",
+                )
+            elif sys.platform == "win32":
+                self.report(
+                    {"INFO"},
+                    "Открыта загрузка ODA. На ARM Windows укажите путь к конвертеру в настройках",
+                )
+            else:
+                self.report(
+                    {"INFO"},
+                    "Открыта загрузка ODA. Укажите путь к конвертеру в настройках",
+                )
+            return {"FINISHED"}
+        try:
+            python = _blender_python()
+        except FileNotFoundError:
+            _open_oda_download()
             self.report(
                 {"INFO"},
-                "Открыта загрузка ODA. Поставьте приложение в /Applications и запустите импорт снова",
+                "Открыта загрузка ODA. Поставьте и укажите путь в настройках",
             )
             return {"FINISHED"}
-        if os.name != "nt":
-            self.report({"ERROR"}, "Скачайте ODA File Converter с сайта Open Design Alliance и укажите путь в настройках")
-            return {"CANCELLED"}
-        winget = shutil.which("winget")
-        if not winget:
-            self.report({"ERROR"}, "winget не найден. Нужны Windows 10 или 11 с App Installer")
-            return {"CANCELLED"}
-        command = [
-            winget, "install", "--id", WINGET_ODA_ID, "-e",
-            "--silent",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-        ]
         log_dir = Path(DEFAULT_OUTPUT)
         log_dir.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(python), str(_addon_dir() / "install_support.py"),
+            "oda-install", str(log_dir),
+        ]
         return _start_process(
             self, context, command, cwd=log_dir, env=os.environ.copy(),
             title="Установка ODA File Converter…",
@@ -766,11 +874,40 @@ class DWGREADER_OT_install_oda(Operator):
         )
 
     def modal(self, context, event):
-        return _poll_process(
-            self, context, event,
-            on_ok="ODA File Converter установлен",
-            on_err="Не удалось установить ODA File Converter",
-        )
+        if event.type == "ESC":
+            self._stop(context, kill=True)
+            context.scene.dwgreader_status = "Отменено"
+            return {"CANCELLED"}
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        proc = self._proc
+        if proc is None or proc.poll() is None:
+            context.scene.dwgreader_status = str((self._state or {}).get("status") or "")
+            _redraw(context)
+            return {"RUNNING_MODAL"}
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2)
+        code = proc.returncode
+        self._stop(context, kill=False)
+        if code == ODA_INSTALL_OK or _oda_installed(_addon_prefs(context)):
+            context.scene.dwgreader_status = "ODA File Converter установлен"
+            self.report({"INFO"}, "ODA File Converter установлен")
+            return {"FINISHED"}
+        _open_oda_download()
+        if code == ODA_INSTALL_NEED_UI:
+            context.scene.dwgreader_status = "Подтвердите установщик ODA"
+            self.report(
+                {"INFO"},
+                "Запущен установщик ODA. Подтвердите права администратора. Если окна нет — поставьте с открытой страницы",
+            )
+        else:
+            context.scene.dwgreader_status = "Открыта загрузка ODA"
+            self.report(
+                {"INFO"},
+                "Сайт ODA блокирует автоскачивание. Поставьте с открытой страницы и укажите путь в настройках",
+            )
+        return {"FINISHED"}
 
     def _stop(self, context, kill: bool) -> None:
         _stop_process(self, context, kill)
@@ -1045,8 +1182,8 @@ def _launch_pipeline(operator, context, extra: list[str], title: str, mode: str,
         *extra,
     ]
     operator._mode = mode
-    if mode == "classify" and not force_api:
-        reason = _chatgpt_block_reason(prefs)
+    if mode == "classify":
+        reason = _chatgpt_block_reason(prefs, force_api=force_api)
         if reason:
             context.scene.dwgreader_chatgpt_block = reason[:400]
             context.scene.dwgreader_status = reason[:180]
@@ -1289,12 +1426,16 @@ class DWGREADER_OT_sheet(Operator):
 class DWGREADER_OT_open_chat(Operator):
     bl_idname = "dwgreader.open_chat"
     bl_label = "Открыть чат"
-    bl_description = "Генерация объектов по описанию. Скоро"
+    bl_description = "Чат ChatGPT: сцена, выделение и вьюпорт через MCP"
     bl_options = {"INTERNAL"}
 
     def execute(self, context):
-        self.report({"INFO"}, "Генерация по описанию скоро появится")
-        context.scene.dwgreader_status = "Генерация по описанию скоро появится"
+        from . import chat_view
+
+        context.scene.dwgreader_screen = "chat"
+        if not chat_view.request_chat_window(context):
+            self.report({"WARNING"}, "Не удалось открыть окно чата")
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -1472,6 +1613,25 @@ class DWGREADER_OT_generate(Operator):
         _stop_process(self, context, kill)
 
 
+def _draw_mcp_setup(layout) -> None:
+    """Установка MCP на том же экране, что библиотеки и ODA."""
+    try:
+        ready = scene_chat.mcp_operator_ready()
+        opened = scene_chat.port_is_open()
+    except Exception:
+        ready = False
+        opened = False
+    if opened:
+        return
+    box = layout.box()
+    if ready:
+        box.label(text="Сервер MCP не запущен", icon="INFO")
+        box.operator("dwgreader.chat_server", text="Запустить сервер", icon="PLAY")
+    else:
+        box.label(text="MCP for Blender ещё не стоит", icon="INFO")
+        box.operator("dwgreader.chat_install", text="Установить MCP", icon="IMPORT")
+
+
 def _draw_setup(layout, prefs) -> None:
     if not _deps_ready():
         box = layout.box()
@@ -1481,6 +1641,7 @@ def _draw_setup(layout, prefs) -> None:
         box = layout.box()
         box.label(text="Для DWG не найден ODA File Converter", icon="INFO")
         box.operator("dwgreader.install_oda", icon="IMPORT")
+    _draw_mcp_setup(layout)
 
 
 def _tile(layout, key: str, title: str, lines: tuple[str, ...]):
@@ -1847,6 +2008,8 @@ class DWGREADER_PT_panel(Panel):
             _draw_place(layout, context)
         elif screen == "building":
             _draw_building(layout, context)
+        elif screen == "chat":
+            scene_chat.draw(layout, context)
         else:
             _draw_home(layout, context)
         if scene.dwgreader_status:
@@ -2083,9 +2246,9 @@ def build_underlay(json_path: Path, scene: bpy.types.Scene | None = None) -> int
     target = scene or bpy.context.scene
     prefs = _addon_prefs(bpy.context)
     if prefs is None:
-        return build(json_path, scene=target)
+        return commit_underlay(json_path, scene=target)
     gap = float(getattr(prefs, "layer_part_gap_m", 10.0))
-    return build(
+    return commit_underlay(
         json_path,
         gap,
         split_mode=str(getattr(prefs, "split_mode", "gap") or "gap"),
@@ -2101,6 +2264,10 @@ CLASSES = (
     DWGREADER_UL_place_layers,
     DWGREADER_OT_install_deps,
     DWGREADER_OT_chatgpt_login,
+    DWGREADER_OT_chatgpt_copy_link,
+    DWGREADER_OT_chatgpt_cancel,
+    DWGREADER_OT_chatgpt_usage,
+    DWGREADER_OT_chatgpt_models,
     DWGREADER_OT_chatgpt_logout,
     DWGREADER_OT_install_oda,
     DWGREADER_OT_pick_file,
@@ -2149,11 +2316,31 @@ def _activate_listed_layer(self, context):
     bpy.app.timers.register(_later, first_interval=0.05)
 
 
+_RETIRED_LLM = frozenset({
+    "b6cb148688ac0b3ca2bcdc0c67748ddbce5cf233ee588802e27b6e15618959ea",
+    "d23f99f8ee65669a557f1ad671080fa0a68e36edad8afc31ca2f2c3b9d2f8e29",
+    "bae096a7fc9204865ea5fc4511fecec4b9f904996c411108474f882e67eb09ef",
+})
+
+
+def _clear_retired_llm(prefs) -> None:
+    """Стирает сохранённые адрес и имя модели, которые больше не входят в сборку."""
+    for name in ("llm_base_url", "llm_model"):
+        value = str(getattr(prefs, name, "") or "").strip().rstrip("/")
+        if not value:
+            continue
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        if digest in _RETIRED_LLM:
+            setattr(prefs, name, "")
+
+
 def register() -> None:
+    chatgpt_auth.ensure_vendor_path()
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     placement.register()
     building_export.register()
+    scene_chat.register()
     bpy.types.Scene.dwgreader_source = StringProperty(
         name="Чертёж",
         description="Файл DWG или DXF",
@@ -2212,11 +2399,7 @@ def register() -> None:
     except Exception:
         addon = None
     if addon is not None:
-        prefs = addon.preferences
-        if prefs.llm_model in {"", "google/gemma-4-e4b"}:
-            prefs.llm_model = "qwen/qwen3-vl-30b-a3b-instruct"
-        if prefs.llm_base_url in {"", "http://127.0.0.1:1234/v1"}:
-            prefs.llm_base_url = "https://llm-router.cxm.dev/v1/"
+        _clear_retired_llm(addon.preferences)
 
 
 def unregister() -> None:
@@ -2228,6 +2411,7 @@ def unregister() -> None:
     if _PREVIEWS is not None:
         previews.remove(_PREVIEWS)
         _PREVIEWS = None
+    scene_chat.unregister()
     placement.unregister()
     building_export.unregister()
     for name in (

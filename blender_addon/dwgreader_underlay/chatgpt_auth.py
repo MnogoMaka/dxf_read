@@ -37,6 +37,7 @@ DYNAMIC_CLIENT = "dynamic_agent_client"
 AGENT_NAME = "Подложка DWG"
 REFRESH_SKEW_S = 120.0
 LOGIN_TIMEOUT_S = 180.0
+USAGE_URL = "https://chatgpt.com/codex/settings/usage"
 _DEAD_REFRESH = {
     "invalid_grant",
     "invalid_refresh_token",
@@ -276,6 +277,25 @@ def ensure_access() -> str:
         return str(refreshed.get("access_token") or "")
 
 
+def force_refresh() -> str:
+    """Новый access token после HTTP 401. Пустая строка, если сессии уже нет."""
+    with _LOCK:
+        session = load_session()
+        if not session or not session.get("refresh_token"):
+            _set_notice("Сессия ChatGPT недействительна. Войдите ещё раз")
+            return ""
+        try:
+            refreshed = _refresh_locked(session)
+        except AuthError as error:
+            _set_notice(str(error))
+            return ""
+        if not has_direct_scope(refreshed.get("scopes")):
+            _set_notice("План ChatGPT не разрешён")
+            return ""
+        _set_notice("")
+        return str(refreshed.get("access_token") or "")
+
+
 def child_credentials(model_slug: str) -> dict[str, str]:
     token = ensure_access()
     slug = (model_slug or "").strip()
@@ -295,6 +315,8 @@ class LoginJob:
         self.sharing = False
         self.models: list[dict[str, str]] = []
         self.cancelled = False
+        self.another = False
+        self.url = ""
         self._server: http.server.HTTPServer | None = None
 
     def run(self) -> None:
@@ -316,6 +338,28 @@ class LoginJob:
 
     def cancel(self) -> None:
         self.cancelled = True
+
+
+_ACTIVE_LOGIN: LoginJob | None = None
+
+
+def set_active_login(job: LoginJob | None) -> None:
+    global _ACTIVE_LOGIN
+    _ACTIVE_LOGIN = job
+
+
+def active_login() -> LoginJob | None:
+    job = _ACTIVE_LOGIN
+    if job is None or job.done:
+        return None
+    return job
+
+
+def login_url() -> str:
+    job = _ACTIVE_LOGIN
+    if job is None or job.done:
+        return ""
+    return str(job.url or "")
 
 
 def list_models(access_token: str) -> list[dict[str, str]]:
@@ -401,9 +445,12 @@ def _authorize(job: LoginJob, saved: dict) -> dict:
     }
     if client_id == DYNAMIC_CLIENT:
         params["agent_name_hint"] = AGENT_NAME
-    elif saved.get("email"):
+    elif saved.get("email") and not job.another:
         params["login_hint"] = str(saved["email"])
+    if job.another:
+        params["prompt"] = "login"
     url = AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+    job.url = url
     if not _open_browser(url):
         server.server_close()
         raise AuthError("Не удалось открыть браузер")

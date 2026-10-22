@@ -208,7 +208,7 @@ def _ring(x: float, y: float, size: float) -> list[tuple[float, float, float]]:
 
 
 def _areas(pieces: list[HatchPiece], cut: bool) -> dict[str, float]:
-    settings = PipelineSettings(cut_vegetation=cut, site_cluster_radius_m=400000.0)
+    settings = PipelineSettings(cut_vegetation=cut)
     with use_settings(settings):
         arranged = arrange_hatch_faces_by_layer(pieces)
     return {layer: float(geometry.area) for geometry, _category, layer in arranged}

@@ -9,8 +9,6 @@ import ezdxf
 
 from dxf_read.config import PipelineSettings, use_settings
 from dxf_read.dxf import (
-    HatchPiece,
-    _cluster_hatch_pieces,
     _flattened_paths,
     count_layer_objects,
     drawing_to_meters,
@@ -114,15 +112,6 @@ class SheetCopyTests(unittest.TestCase):
         self.assertEqual(groups, {})
 
 
-def _ring(x: float, y: float, size: float) -> list[tuple[float, float, float]]:
-    return [
-        (x, y, 0.0),
-        (x + size, y, 0.0),
-        (x + size, y + size, 0.0),
-        (x, y + size, 0.0),
-    ]
-
-
 def _solid_hatch(document, layer: str, origin: tuple[float, float], size: float):
     x, y = origin
     hatch = document.modelspace().add_hatch(dxfattribs={"layer": layer})
@@ -198,19 +187,6 @@ class BuildSettingTests(unittest.TestCase):
         with use_settings(PipelineSettings(flattening_distance_m=0.01)):
             fine = _flattened_paths(arc, 1.0)
         self.assertGreater(len(fine[0][0]), len(coarse[0][0]))
-
-    def test_cluster_radius_drops_a_distant_patch(self) -> None:
-        pieces = [
-            HatchPiece("pavement", "A", _ring(0, 0, 10)),
-            HatchPiece("pavement", "B", _ring(1000, 0, 10)),
-        ]
-        with use_settings(PipelineSettings(site_cluster_radius_m=10.0)):
-            near = _cluster_hatch_pieces(pieces)
-        with use_settings(PipelineSettings(site_cluster_radius_m=2000.0)):
-            wide = _cluster_hatch_pieces(pieces)
-        self.assertEqual(len(near), 1)
-        self.assertEqual(len(wide), 2)
-
 
 class CacheContourTests(unittest.TestCase):
     def test_fill_mode_skips_closed_polyline_without_hatch(self) -> None:

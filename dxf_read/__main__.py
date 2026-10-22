@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import fields
 from pathlib import Path
 
 from .config import DEFAULT_SOURCE, PipelineSettings, resolve_path, use_settings
@@ -14,7 +15,8 @@ def _settings_from_file(path: Path) -> PipelineSettings:
     for key in ("fill_polyline_tokens", "junk_layer_tokens"):
         if key in data and not isinstance(data[key], tuple):
             data[key] = tuple(data[key])
-    return PipelineSettings(**data)
+    known = {item.name for item in fields(PipelineSettings)}
+    return PipelineSettings(**{key: value for key, value in data.items() if key in known})
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -28,7 +30,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--settings",
         default=None,
-        help="JSON с PipelineSettings: радиус, пороги, модель, ODA",
+        help="JSON с PipelineSettings: пороги, модель, ODA",
     )
     parser.add_argument(
         "--classify-only",

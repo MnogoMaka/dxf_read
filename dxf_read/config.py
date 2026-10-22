@@ -42,8 +42,8 @@ def resolve_path(value: str | Path) -> Path:
 
 
 #сервисы (.env)
-LLM_MODEL = env("LLM_MODEL", "qwen/qwen3-vl-30b-a3b-instruct")
-LLM_BASE_URL = env("LLM_BASE_URL", "https://llm-router.cxm.dev/v1/")
+LLM_MODEL = env("LLM_MODEL", "")
+LLM_BASE_URL = env("LLM_BASE_URL", "")
 LLM_API_KEY = env("LLM_API_KEY", "")
 DEFAULT_SOURCE = env("DEFAULT_SOURCE", "input_dwg/ПЗУ Касимовская 33 (1).dwg")
 BLENDER = env("BLENDER")
@@ -66,7 +66,6 @@ CONTOUR_SNAP_TOLERANCE_M = 0.02
 MIN_ARRANGEMENT_AREA_M2 = 0.05
 # Рамка листа и копии «Ном.пера» бывают десятки километров. Площадка меньше.
 MAX_CONTOUR_SPAN_M = 8000.0
-SITE_CLUSTER_RADIUS_M = 400000.0
 # Слой 0 / HATCH: SOLID-заливка внутри контура стен здания.
 GENERIC_FILL_ASSOCIATE_M = 15.0
 FILL_POLYLINE_TOKENS = ("ЗАЛИВ", "ЗАПОЛН", "ПЯТН")
@@ -204,11 +203,52 @@ SYSTEM_PROMPT = (
     "JSON должен быть строгим: без висячих запятых."
 )
 
+# Ключи бесшовных картинок. none в ответ модели входит, файла у него нет.
+SURFACE_TEXTURE_KEYS = ("grass", "tile", "sidewalk", "asphalt", "rubber")
+
+TEXTURE_SYSTEM_PROMPT = (
+    "Ты назначаешь бесшовную текстуру покрытия слоям чертежа планировки участка. "
+    "Тебе дают точные имена слоёв AutoCAD, а ты выбираешь одну текстуру на слой. "
+    "Не рассуждай вслух. Верни только один JSON-объект, без markdown, "
+    "без тегов channel/think и без текста до или после JSON. "
+    "JSON должен быть строгим: без висячих запятых."
+)
+
+# __LAYERS__ подменяется массивом имён. Фигурные скобки в примере ответа здесь намеренно.
+TEXTURE_INSTRUCTIONS = """\
+Текстуры. В ответе у каждого слоя ровно один ключ:
+- grass — газон, цветник, клумба, полоса озеленения, зелёная поверхность. Не дерево, не куст и не живая изгородь.
+- tile — плитка, брусчатка, мощение плиткой.
+- sidewalk — тротуар, пешеходный проход.
+- asphalt — асфальт, проезд, проезжая часть, дорога, гостевая стоянка, парковка, паркинг.
+- rubber — резиновое покрытие, резиновая крошка, безопасное покрытие площадки.
+- none — текстуры нет. Сюда относятся борт, поребрик, лоток, площадка ТБО, разметка, здание, забор, дерево, куст, МАФ, граница участка и любое имя, в котором нет материала покрытия.
+
+Как выбирать, читая имя слева направо:
+1. Номер листа, «ГП», «УДС», имя xref, «$0$» и «|» материалом не являются. Пропусти их и смотри имя дальше.
+2. Первое слово, которое называет одну из текстур выше, и есть ответ. Слово правее не перебивает его, даже если оно тоже называет покрытие.
+3. «асфальт_тротуар» — asphalt: асфальт стоит раньше тротуара.
+4. «тротуар_асфальт» — sidewalk: тротуар стоит раньше асфальта.
+5. «тротуарная_плитка» и «тротуарная плитка» — sidewalk: тротуар стоит раньше плитки.
+6. «плитка_тротуар» — tile: плитка стоит раньше тротуара.
+7. «резиновая_крошка_плитка» — rubber: резина стоит раньше плитки.
+8. «газон_тротуар» — grass: газон стоит раньше тротуара.
+9. Если такого слова нет — none. Не назначай текстуру по догадке и не ставь grass только из-за того, что слой кажется зелёным.
+
+Имена слоёв из чертежа — JSON-массив точных строк:
+[
+__LAYERS__
+]
+
+Верни JSON-объект: ключ — точное имя слоя из массива, значение — grass, tile, sidewalk, asphalt, rubber или none.
+Каждый слой укажи ровно один раз. Копируй имя целиком, ничего не отрезай и не придумывай. Не ставь запятую перед }.
+Пример: {"1 ГП_асфальт_тротуар": "asphalt", "Газон": "grass", "Борт": "none"}
+"""
+
 @dataclass
 class PipelineSettings:
     """Параметры прогона. Пустое переопределение не используется: его даёт settings()."""
 
-    site_cluster_radius_m: float = 400000.0
     generic_fill_associate_m: float = 15.0
     min_arrangement_area_m2: float = 0.05
     flattening_distance_m: float = 0.02
@@ -242,7 +282,6 @@ def settings() -> PipelineSettings:
     if custom is not None:
         return custom
     return PipelineSettings(
-        site_cluster_radius_m=SITE_CLUSTER_RADIUS_M,
         generic_fill_associate_m=GENERIC_FILL_ASSOCIATE_M,
         min_arrangement_area_m2=MIN_ARRANGEMENT_AREA_M2,
         flattening_distance_m=FLATTENING_DISTANCE_M,

@@ -58,6 +58,34 @@ class BenchPathTests(unittest.TestCase):
         angles = {round(item[2], 5) for item in placed}
         self.assertEqual(len(angles), 1)
 
+    def test_roundness_zero_stays_on_the_segments(self) -> None:
+        placed = bench_path([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], 2.0, 0.0, roundness=0.0)
+        self.assertTrue(placed)
+        for x, y, _angle in placed:
+            on_bottom = abs(y) < 1e-6 and -1e-6 <= x <= 10.0
+            on_side = abs(x - 10.0) < 1e-6 and -1e-6 <= y <= 10.0
+            self.assertTrue(on_bottom or on_side)
+
+    def test_full_roundness_matches_the_default_curve(self) -> None:
+        points = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+        self.assertEqual(
+            bench_path(points, 2.0, 0.0, roundness=1.0),
+            bench_path(points, 2.0, 0.0),
+        )
+
+    def test_half_roundness_sits_between_the_line_and_the_arc(self) -> None:
+        points = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+        straight = bench_path(points, 2.0, 0.0, roundness=0.0)
+        curved = bench_path(points, 2.0, 0.0, roundness=1.0)
+        middle = bench_path(points, 2.0, 0.0, roundness=0.5)
+
+        def off_corner(row) -> float:
+            return max(min(abs(y), abs(x - 10.0)) for x, y, _angle in row)
+
+        self.assertGreater(off_corner(curved), off_corner(straight) + 0.05)
+        self.assertGreater(off_corner(middle), off_corner(straight) + 0.02)
+        self.assertLess(off_corner(middle), off_corner(curved) - 0.02)
+
 
 class SheetClusterTests(unittest.TestCase):
     def test_distant_boxes_stay_apart(self) -> None:

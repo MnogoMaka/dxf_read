@@ -14,6 +14,22 @@ from .placement_math import cluster_boxes, split_far_parts, split_polygons
 ROOT_NAME = "SITE_UNDERLAY"
 # Пятна ближе этого зазора остаются одним объектом. Рамка и соседний чертёж уходят в свой.
 LAYER_PART_GAP_M = 10.0
+# Имя файла в комплекте и размер одной клетки текстуры в метрах плана.
+SURFACE_TEXTURES = {
+    "grass": ("grass.jpg", 4.0),
+    "tile": ("pavers.jpg", 2.0),
+    "sidewalk": ("sidewalk.jpg", 2.0),
+    "asphalt": ("asphalt.png", 2.0),
+    "rubber": ("rubber.jpg", 2.0),
+}
+
+
+def surface_texture_key(assigned: str | None) -> str | None:
+    """Ключ, который уже выбрала модель. Имя слоя здесь не разбирается."""
+    key = str(assigned or "").strip().lower()
+    if key in SURFACE_TEXTURES:
+        return key
+    return None
 
 
 def safe_name(text: str, fallback: str = "NO_LAYER") -> str:
@@ -85,6 +101,7 @@ def _is_underlay_collection(collection: bpy.types.Collection, name: str) -> bool
 
 def remove_root(name: str) -> None:
     """Удаляет прежнюю подложку, в том числе копии SITE_UNDERLAY.001 и объекты вне коллекции."""
+    clear_sheet_cache()
     for obj in list(bpy.data.objects):
         if "dxf_layer" in obj.keys():
             _delete_object(obj)
@@ -119,11 +136,33 @@ def _shader_node(tree: bpy.types.NodeTree | None, bl_type: str):
     return next((node for node in tree.nodes if node.type == bl_type), None)
 
 
-def ensure_material(category: str, color: list[float]) -> bpy.types.Material:
-    name = f"MAT_{safe_name(category, 'fill')}"
-    material = bpy.data.materials.get(name)
+def _rgba(color: list[float]) -> tuple[float, float, float, float]:
     rgb = [float(channel) for channel in (list(color) + [0.55, 0.55, 0.55])[:3]]
-    rgba = (rgb[0], rgb[1], rgb[2], 1.0)
+    return rgb[0], rgb[1], rgb[2], 1.0
+
+
+def _surface_image(filename: str):
+    path = Path(__file__).resolve().parent / "textures" / filename
+    if not path.is_file():
+        return None
+    try:
+        image = bpy.data.images.load(str(path), check_existing=True)
+    except Exception:
+        return None
+    try:
+        image.colorspace_settings.name = "sRGB"
+    except Exception:
+        pass
+    try:
+        if image.packed_file is None:
+            image.pack()
+    except Exception:
+        pass
+    return image
+
+
+def _flat_material(name: str, rgba: tuple[float, float, float, float]) -> bpy.types.Material:
+    material = bpy.data.materials.get(name)
     if material is None:
         material = bpy.data.materials.new(name)
     material.use_nodes = True
@@ -139,6 +178,53 @@ def ensure_material(category: str, color: list[float]) -> bpy.types.Material:
         if "Emission Strength" in principled.inputs:
             principled.inputs["Emission Strength"].default_value = 0.25
     return material
+
+
+def _textured_material(name: str, rgba: tuple[float, float, float, float], image) -> bpy.types.Material:
+    material = bpy.data.materials.get(name)
+    if material is None:
+        material = bpy.data.materials.new(name)
+    material.use_nodes = True
+    material.diffuse_color = rgba
+    tree = material.node_tree
+    principled = _shader_node(tree, "BSDF_PRINCIPLED")
+    image_node = _shader_node(tree, "TEX_IMAGE")
+    if image_node is None and tree is not None:
+        image_node = tree.nodes.new("ShaderNodeTexImage")
+    if image_node is not None:
+        image_node.image = image
+        image_node.interpolation = "Linear"
+        image_node.extension = "REPEAT"
+    if principled is not None and image_node is not None and tree is not None:
+        socket = principled.inputs["Base Color"]
+        for link in list(socket.links):
+            tree.links.remove(link)
+        tree.links.new(image_node.outputs["Color"], socket)
+        principled.inputs["Roughness"].default_value = 1.0
+        if "Specular IOR Level" in principled.inputs:
+            principled.inputs["Specular IOR Level"].default_value = 0.0
+        if "Emission Strength" in principled.inputs:
+            principled.inputs["Emission Strength"].default_value = 0.0
+    return material
+
+
+def ensure_material(category: str, color: list[float], texture_key: str | None = None) -> bpy.types.Material:
+    rgba = _rgba(color)
+    spec = SURFACE_TEXTURES.get(texture_key or "")
+    image = _surface_image(spec[0]) if spec else None
+    if image is None:
+        return _flat_material(f"MAT_{safe_name(category, 'fill')}", rgba)
+    return _textured_material(f"MAT_{safe_name(texture_key, 'fill')}", rgba, image)
+
+
+def assign_plan_uv(mesh, tile_m: float) -> None:
+    """Клетка текстуры ложится на tile_m метров плана и повторяется."""
+    layer = mesh.uv_layers.new(name="Plan") if not mesh.uv_layers else mesh.uv_layers[0]
+    mesh.uv_layers.active = layer
+    for polygon in mesh.polygons:
+        for loop_index in polygon.loop_indices:
+            vertex = mesh.vertices[mesh.loops[loop_index].vertex_index]
+            layer.data[loop_index].uv = (vertex.co.x / tile_m, vertex.co.y / tile_m)
 
 
 def relax_view_clip(context: bpy.types.Context, span: float = 0.0) -> None:
@@ -158,7 +244,7 @@ def relax_view_clip(context: bpy.types.Context, span: float = 0.0) -> None:
 
 
 def apply_plan_viewport() -> None:
-    """Solid + плоский свет + цвет материала. Сетка и фон темы остаются как в Blender."""
+    """Solid + плоский свет. Текстура видна на газоне и покрытиях, остальные группы остаются цветом материала."""
     for screen in bpy.data.screens:
         for area in screen.areas:
             if area.type != "VIEW_3D":
@@ -168,7 +254,7 @@ def apply_plan_viewport() -> None:
                     continue
                 space.shading.type = "SOLID"
                 space.shading.light = "FLAT"
-                space.shading.color_type = "MATERIAL"
+                space.shading.color_type = "TEXTURE"
                 space.shading.show_object_outline = False
                 space.shading.background_type = "THEME"
                 if space.region_3d is not None:
@@ -231,6 +317,14 @@ def frame_collection(context: bpy.types.Context, root: bpy.types.Collection) -> 
 
 SHEET_GAP_M = 200.0
 _SHEET_CACHE: dict[str, object] = {"key": None, "groups": []}
+_PARK_KEY = "dwgreader_parked_name"
+_BUILD_ROOT_KEY = "dwgreader_build_root"
+_MATERIAL_INPUTS = ("Base Color", "Roughness", "Specular IOR Level", "Emission Color", "Emission Strength")
+
+
+def clear_sheet_cache() -> None:
+    _SHEET_CACHE["key"] = None
+    _SHEET_CACHE["groups"] = []
 
 
 def world_box(obj: bpy.types.Object) -> tuple[float, float, float, float]:
@@ -246,13 +340,31 @@ def world_box(obj: bpy.types.Object) -> tuple[float, float, float, float]:
     return (point.x, point.y, point.x, point.y)
 
 
+def _sheet_identity(objects: list[bpy.types.Object]) -> tuple[tuple[str, int], ...] | None:
+    try:
+        return tuple(sorted((obj.name, int(obj.as_pointer())) for obj in objects))
+    except ReferenceError:
+        return None
+
+
+def _same_sheet_objects(cached: object, objects: list[bpy.types.Object]) -> bool:
+    if not isinstance(cached, list):
+        return False
+    try:
+        cached_ids = sorted(int(obj.as_pointer()) for group in cached for obj in group)
+        live_ids = sorted(int(obj.as_pointer()) for obj in objects)
+    except ReferenceError:
+        return False
+    return cached_ids == live_ids
+
+
 def sheet_groups(root: bpy.types.Collection, gap: float) -> list[list[bpy.types.Object]]:
     """Отдельные чертежи на одном листе: объекты дальше gap друг от друга."""
     objects = [obj for obj in root.all_objects if obj.type != "EMPTY"]
-    key = (tuple(sorted(obj.name for obj in objects)), round(float(gap), 3))
-    if _SHEET_CACHE["key"] == key:
-        cached = _SHEET_CACHE["groups"]
-        return cached if isinstance(cached, list) else []
+    key = (_sheet_identity(objects), round(float(gap), 3))
+    cached = _SHEET_CACHE["groups"]
+    if key[0] is not None and _SHEET_CACHE["key"] == key and _same_sheet_objects(cached, objects):
+        return cached
     boxes = [world_box(obj) for obj in objects]
     groups = [[objects[index] for index in members] for members in cluster_boxes(boxes, gap)]
     _SHEET_CACHE["key"] = key
@@ -340,7 +452,7 @@ def drop_objects(objects: list[bpy.types.Object], root: bpy.types.Collection | N
             continue
     if root is not None:
         _prune_empty(root)
-    _SHEET_CACHE["key"] = None
+    clear_sheet_cache()
     return removed
 
 
@@ -371,11 +483,13 @@ def build(
     split_mode: str = "gap",
     by_type: bool = True,
     scene: bpy.types.Scene | None = None,
+    root_name: str | None = None,
+    clear_existing: bool = True,
 ) -> int:
     payload = json.loads(json_path.read_text(encoding="utf-8"))
-    root_name = str(payload.get("root_collection") or ROOT_NAME)
+    root_name = str(root_name or payload.get("root_collection") or ROOT_NAME)
     origin = payload.get("origin") or [0.0, 0.0]
-    root = reset_root(root_name, scene)
+    root = reset_root(root_name, scene) if clear_existing else _link_new_root(root_name, scene)
     root["dxf_source"] = str(payload.get("source") or "")
     root["origin_x"] = float(origin[0])
     root["origin_y"] = float(origin[1])
@@ -404,7 +518,10 @@ def build(
             continue
 
         parts = layer_parts(layer, vertices, faces, split_mode, part_gap_m)
-        material = ensure_material(category, color)
+        texture_key = surface_texture_key(layer.get("texture"))
+        material = ensure_material(category, color, texture_key)
+        textured = texture_key is not None and material.name == f"MAT_{safe_name(texture_key, 'fill')}"
+        tile_m = SURFACE_TEXTURES[texture_key][1] if textured else None
         rgb = (list(color) + [0.55, 0.55, 0.55])[:3]
         color_rgba = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
         for part_index, (part_vertices, part_faces) in enumerate(parts, start=1):
@@ -412,6 +529,8 @@ def build(
             mesh = bpy.data.meshes.new(f"HATCH_{object_name}")
             mesh.from_pydata(part_vertices, [], part_faces)
             mesh.update()
+            if tile_m:
+                assign_plan_uv(mesh, tile_m)
             obj = bpy.data.objects.new(object_name, mesh)
             collection.objects.link(obj)
             obj.data.materials.append(material)
@@ -432,3 +551,308 @@ def build(
     except Exception:
         pass
     return built
+
+
+def _update_view() -> None:
+    layer = getattr(bpy.context, "view_layer", None)
+    if layer is None:
+        return
+    try:
+        layer.update()
+    except Exception:
+        return
+
+
+def _link_new_root(name: str, scene: bpy.types.Scene | None) -> bpy.types.Collection:
+    root = bpy.data.collections.new(name)
+    root[_BUILD_ROOT_KEY] = name
+    target = scene or bpy.context.scene
+    target.collection.children.link(root)
+    return root
+
+
+def _collection_tree(root: bpy.types.Collection):
+    stack = [root]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        try:
+            pointer = int(current.as_pointer())
+        except ReferenceError:
+            continue
+        if pointer in seen:
+            continue
+        seen.add(pointer)
+        yield current
+        try:
+            stack.extend(current.children)
+        except ReferenceError:
+            continue
+
+
+def _underlay_roots(name: str) -> list[bpy.types.Collection]:
+    roots = []
+    for collection in list(bpy.data.collections):
+        try:
+            matched = _is_underlay_collection(collection, name)
+        except ReferenceError:
+            continue
+        if matched:
+            roots.append(collection)
+    return roots
+
+
+def _rename_parked(block, library, taken: set[str]) -> str:
+    original = block.name
+    block[_PARK_KEY] = original
+    for index in range(10000):
+        suffix = "" if index == 0 else f"~{index}"
+        requested = f"~p~{original}"
+        requested = f"{requested[: 63 - len(suffix)]}{suffix}"
+        if requested in taken:
+            continue
+        try:
+            owner = library.get(requested)
+        except ReferenceError:
+            owner = None
+        if owner not in (None, block):
+            taken.add(requested)
+            continue
+        block.name = requested
+        taken.add(block.name)
+        return block.name
+    raise RuntimeError(f"Не удалось освободить имя {original}")
+
+
+def _park_underlay(name: str, parked: list[tuple[str, str]]) -> None:
+    """Прячет текущую подложку под другими именами, чтобы новая собралась, не стирая её."""
+    taken: set[str] = set()
+    seen: set[int] = set()
+    objects = []
+    for root in _underlay_roots(name):
+        try:
+            found = list(root.all_objects)
+        except ReferenceError:
+            continue
+        for obj in found:
+            try:
+                pointer = int(obj.as_pointer())
+            except ReferenceError:
+                continue
+            if pointer in seen:
+                continue
+            seen.add(pointer)
+            objects.append(obj)
+    for obj in list(bpy.data.objects):
+        try:
+            marked = "dxf_layer" in obj.keys()
+            pointer = int(obj.as_pointer())
+        except ReferenceError:
+            continue
+        if not marked or pointer in seen:
+            continue
+        seen.add(pointer)
+        objects.append(obj)
+    for obj in objects:
+        parked.append(("object", _rename_parked(obj, bpy.data.objects, taken)))
+        mesh = obj.data if isinstance(getattr(obj, "data", None), bpy.types.Mesh) else None
+        if mesh is not None and _PARK_KEY not in mesh.keys():
+            parked.append(("mesh", _rename_parked(mesh, bpy.data.meshes, taken)))
+    seen_collections: set[int] = set()
+    for root in _underlay_roots(name):
+        for collection in _collection_tree(root):
+            try:
+                pointer = int(collection.as_pointer())
+            except ReferenceError:
+                continue
+            if pointer in seen_collections:
+                continue
+            seen_collections.add(pointer)
+            parked.append(("collection", _rename_parked(collection, bpy.data.collections, taken)))
+
+
+def _library(kind: str):
+    if kind == "object":
+        return bpy.data.objects
+    if kind == "mesh":
+        return bpy.data.meshes
+    return bpy.data.collections
+
+
+def _unpark(parked: list[tuple[str, str]]) -> None:
+    for kind, name in reversed(parked):
+        try:
+            block = _library(kind).get(name)
+        except ReferenceError:
+            continue
+        if block is None:
+            continue
+        original = block.get(_PARK_KEY)
+        if not original:
+            continue
+        block.name = str(original)
+        try:
+            del block[_PARK_KEY]
+        except KeyError:
+            pass
+
+
+def _discard_parked(parked: list[tuple[str, str]]) -> None:
+    for kind, name in parked:
+        if kind != "object":
+            continue
+        try:
+            obj = bpy.data.objects.get(name)
+        except ReferenceError:
+            continue
+        if obj is None:
+            continue
+        try:
+            _delete_object(obj)
+        except (ReferenceError, RuntimeError):
+            continue
+    for kind, name in parked:
+        if kind != "mesh":
+            continue
+        try:
+            mesh = bpy.data.meshes.get(name)
+            if mesh is not None and getattr(mesh, "users", 1) == 0:
+                bpy.data.meshes.remove(mesh)
+        except (ReferenceError, RuntimeError):
+            continue
+    for kind, name in parked:
+        if kind != "collection":
+            continue
+        try:
+            collection = bpy.data.collections.get(name)
+            if collection is None:
+                continue
+            unlink_tree(collection)
+            _remove_collection(collection)
+        except (ReferenceError, RuntimeError):
+            continue
+
+
+def _discard_fresh_underlay(root_name: str) -> None:
+    for collection in list(bpy.data.collections):
+        try:
+            fresh = collection.get(_BUILD_ROOT_KEY) == root_name and _PARK_KEY not in collection.keys()
+        except ReferenceError:
+            continue
+        if not fresh:
+            continue
+        try:
+            unlink_tree(collection)
+            _remove_collection(collection)
+        except ReferenceError:
+            continue
+
+
+def _socket_value(value):
+    if isinstance(value, (int, float, bool)):
+        return value
+    try:
+        return tuple(value)
+    except TypeError:
+        return value
+
+
+def _snapshot_materials() -> dict[str, tuple]:
+    saved: dict[str, tuple] = {}
+    for material in list(bpy.data.materials):
+        try:
+            principled = _shader_node(material.node_tree, "BSDF_PRINCIPLED")
+            inputs = {}
+            if principled is not None:
+                for key in _MATERIAL_INPUTS:
+                    if key not in principled.inputs:
+                        continue
+                    inputs[key] = _socket_value(principled.inputs[key].default_value)
+            saved[material.name] = (_socket_value(material.diffuse_color), inputs)
+        except ReferenceError:
+            continue
+    return saved
+
+
+def _restore_materials(saved: dict[str, tuple]) -> None:
+    for name, (diffuse, inputs) in saved.items():
+        material = bpy.data.materials.get(name)
+        if material is None:
+            continue
+        material.diffuse_color = diffuse
+        principled = _shader_node(getattr(material, "node_tree", None), "BSDF_PRINCIPLED")
+        if principled is None:
+            continue
+        for key, value in inputs.items():
+            if key in principled.inputs:
+                principled.inputs[key].default_value = value
+
+
+def _remove_unused_materials_except(kept: set[str]) -> None:
+    for material in list(bpy.data.materials):
+        if material.name in kept or getattr(material, "users", 1) != 0:
+            continue
+        bpy.data.materials.remove(material)
+
+
+def _claim_root_name(root_name: str) -> None:
+    for collection in list(bpy.data.collections):
+        try:
+            if collection.get(_BUILD_ROOT_KEY) != root_name or _PARK_KEY in collection.keys():
+                continue
+        except ReferenceError:
+            continue
+        if collection.name != root_name:
+            collection.name = root_name
+        try:
+            del collection[_BUILD_ROOT_KEY]
+        except KeyError:
+            pass
+        return
+
+
+def _rollback_underlay(root_name: str, parked: list[tuple[str, str]], materials: dict[str, tuple]) -> None:
+    _discard_fresh_underlay(root_name)
+    _update_view()
+    _remove_unused_materials_except(set(materials))
+    _restore_materials(materials)
+    _unpark(parked)
+    clear_sheet_cache()
+    _update_view()
+
+
+def commit_underlay(
+    json_path: Path,
+    part_gap_m: float = LAYER_PART_GAP_M,
+    split_mode: str = "gap",
+    by_type: bool = True,
+    scene: bpy.types.Scene | None = None,
+) -> int:
+    """Собирает новую подложку рядом со старой и подменяет её только после успеха.
+
+    Если сборка падает, прежние объекты остаются на своих именах.
+    """
+    payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    root_name = str(payload.get("root_collection") or ROOT_NAME)
+    materials = _snapshot_materials()
+    parked: list[tuple[str, str]] = []
+    try:
+        clear_sheet_cache()
+        _park_underlay(root_name, parked)
+        count = build(
+            Path(json_path),
+            part_gap_m,
+            split_mode=split_mode,
+            by_type=by_type,
+            scene=scene,
+            root_name=root_name,
+            clear_existing=False,
+        )
+    except Exception:
+        _rollback_underlay(root_name, parked, materials)
+        raise
+    _discard_parked(parked)
+    _claim_root_name(root_name)
+    clear_sheet_cache()
+    _update_view()
+    return count
