@@ -16,11 +16,11 @@ ROOT_NAME = "SITE_UNDERLAY"
 LAYER_PART_GAP_M = 10.0
 # Имя файла в комплекте и размер одной клетки текстуры в метрах плана.
 SURFACE_TEXTURES = {
-    "grass": ("grass.jpg", 4.0),
-    "tile": ("pavers.jpg", 2.0),
-    "sidewalk": ("sidewalk.jpg", 2.0),
-    "asphalt": ("asphalt.png", 2.0),
-    "rubber": ("rubber.jpg", 2.0),
+    "grass": ("grass.jpg", 16.0),
+    "tile": ("pavers.jpg", 8.0),
+    "sidewalk": ("sidewalk.jpg", 8.0),
+    "asphalt": ("asphalt.png", 8.0),
+    "rubber": ("rubber.jpg", 8.0),
 }
 
 
@@ -537,6 +537,8 @@ def build(
             obj.color = color_rgba
             obj["dxf_layer"] = dxf_layer
             obj["category"] = category
+            if texture_key:
+                obj["texture"] = texture_key
             obj["part"] = part_index
             obj["geometry"] = str(layer.get("geometry") or "")
             obj.lock_location = (True, True, True)

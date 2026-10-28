@@ -134,10 +134,12 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(seen_http[0]["tools"][0]["type"], "namespace")
         self.assertFalse(seen_http[0]["tools"][0]["tools"][0]["strict"])
         self.assertEqual(seen_http[0]["reasoning"]["summary"], "auto")
+        self.assertEqual(seen_http[0]["reasoning"]["effort"], "high")
         self.assertIn("reasoning.encrypted_content", seen_http[0]["include"])
         names = [item[0] for item in seen_socket]
         self.assertEqual(names, ["get_object_info", "get_viewport_screenshot"])
         self.assertEqual(seen_socket[0][1]["name"], "Газон")
+        self.assertEqual(seen_socket[1][1]["max_size"], 1400)
         blob = json.dumps(seen_http[1], ensure_ascii=False)
         self.assertIn("function_call_output", blob)
         self.assertIn("data:image/png;base64,", blob)
@@ -322,6 +324,12 @@ class LoopTests(unittest.TestCase):
             self.assertNotIn("qwen/qwen3-vl-30b-a3b-instruct", blob)
             self.assertNotIn("google/gemma-4-e4b", blob)
 
+    def test_rebuild_clears_placed_models_before_the_new_underlay(self) -> None:
+        source = (ADDON / "__init__.py").read_text(encoding="utf-8")
+        body = source.split("def _schedule_underlay_replace", 1)[1].split("def build_underlay", 1)[0]
+        self.assertLess(body.find("placement.clear_placement()"), body.find("build_underlay("))
+        self.assertLess(body.find("placement.clear_placement()"), body.find("furnish_underlay("))
+
     def test_tool_row_is_sent_as_a_tool_result(self) -> None:
         scene_chat._REPLAY.put("сделал", ["call_1"], [
             {"type": "reasoning", "id": "rs_9", "encrypted_content": "keep-me", "summary": []},
@@ -439,6 +447,56 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(text, "ок")
         self.assertIn("include", seen[0])
         self.assertNotIn("include", seen[1])
+
+    def test_refused_reasoning_effort_falls_back_without_losing_summary(self) -> None:
+        scene_chat._DISABLED.clear()
+        seen: list[dict] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body_json = json.loads(raw.decode("utf-8"))
+                seen.append(body_json)
+                if body_json.get("reasoning", {}).get("effort"):
+                    payload = json.dumps({
+                        "error": {
+                            "message": "Unsupported reasoning effort for this model",
+                            "param": "reasoning.effort",
+                            "code": "unsupported_parameter",
+                        },
+                    }).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                body = _sse([{"type": "message", "content": [{"type": "output_text", "text": "ок"}]}])
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _fmt, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        scene_chat.RESPONSES_URL = f"http://127.0.0.1:{server.server_address[1]}/v1/responses"
+        try:
+            text, _image = scene_chat.complete_turn("token", "gpt-test", [], "привет")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            scene_chat._DISABLED.clear()
+
+        self.assertEqual(text, "ок")
+        self.assertEqual(seen[0]["reasoning"]["effort"], "high")
+        self.assertNotIn("effort", seen[1]["reasoning"])
+        self.assertEqual(seen[1]["reasoning"]["summary"], "auto")
 
     def test_library_command_reaches_the_plugin(self) -> None:
         seen: list[tuple] = []
@@ -674,6 +732,12 @@ class McpReadyTests(unittest.TestCase):
             self.assertTrue(scene_chat.mcp_operator_ready())
         finally:
             del scene_chat.bpy.types.BLENDERMCP_OT_StartServer
+
+    def test_undo_point_is_set_before_the_busy_flag(self) -> None:
+        source = Path(scene_chat.__file__).read_text(encoding="utf-8")
+        send = source.split("class DWGREADER_OT_chat_send", 1)[1].split("class DWGREADER_OT_chat_stop", 1)[0]
+        self.assertLess(send.find("scene_changes.arm(scene)"), send.find("dwgreader_chat_busy = True"))
+        self.assertIn("def release_turn", source)
 
 
 if __name__ == "__main__":

@@ -3,25 +3,59 @@
 from __future__ import annotations
 
 import random
+import struct
+import sys
+import zlib
+from bisect import bisect_right
 from math import atan2, cos, hypot, pi, sin
+from pathlib import Path
 
 
 FIT_SLACK_M = 0.05
 
 
-def polygon_area_xy(vertices: list[tuple[float, float, float]], faces: list[tuple[int, ...]]) -> float:
-    area = 0.0
+def _face_triangles(vertices, face: tuple[int, ...]) -> list[tuple[int, int, int]]:
+    """Корректно триангулирует также вогнутый n-gon; веер из первой вершины не используется."""
+    clean: list[int] = []
+    for raw_index in face:
+        index = int(raw_index)
+        if index < 0 or index >= len(vertices):
+            return []
+        if not clean or index != clean[-1]:
+            clean.append(index)
+    if len(clean) > 1 and clean[0] == clean[-1]:
+        clean.pop()
+    if len(clean) < 3:
+        return []
+    if len(clean) == 3:
+        return [(clean[0], clean[1], clean[2])]
+    try:
+        import mapbox_earcut as earcut
+        import numpy as np
+
+        ring = np.asarray([(vertices[index][0], vertices[index][1]) for index in clean], dtype=np.float64)
+        indices = earcut.triangulate_float64(ring, np.asarray([len(clean)], dtype=np.uint32))
+    except Exception:
+        return []
+    return [
+        (clean[int(indices[pos])], clean[int(indices[pos + 1])], clean[int(indices[pos + 2])])
+        for pos in range(0, len(indices) - 2, 3)
+    ]
+
+
+def _mesh_triangles(vertices, faces):
+    triangles = []
     for face in faces:
-        if len(face) < 3:
-            continue
-        origin = vertices[face[0]]
-        for index in range(1, len(face) - 1):
-            ax = vertices[face[index]][0] - origin[0]
-            ay = vertices[face[index]][1] - origin[1]
-            bx = vertices[face[index + 1]][0] - origin[0]
-            by = vertices[face[index + 1]][1] - origin[1]
-            area += abs(ax * by - ay * bx) * 0.5
-    return area
+        for a_index, b_index, c_index in _face_triangles(vertices, face):
+            a, b, c = vertices[a_index], vertices[b_index], vertices[c_index]
+            weight = abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) * 0.5
+            if weight >= 1e-12:
+                triangles.append((a, b, c, weight))
+    return triangles
+
+
+def polygon_area_xy(vertices: list[tuple[float, float, float]], faces: list[tuple[int, ...]]) -> float:
+    return sum(triangle[3] for triangle in _mesh_triangles(vertices, faces))
 
 
 def face_groups(faces: list[tuple[int, ...]]) -> list[list[int]]:
@@ -65,21 +99,11 @@ def polygon_centroid_xy(
     """Центр площади полигона, а не центр рамки вокруг всех пятен слоя."""
     weight_sum = 0.0
     cx = cy = cz = 0.0
-    for face in faces:
-        if len(face) < 3:
-            continue
-        origin = vertices[face[0]]
-        for index in range(1, len(face) - 1):
-            a = vertices[face[index]]
-            b = vertices[face[index + 1]]
-            signed = (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
-            weight = abs(signed) * 0.5
-            if weight < 1e-12:
-                continue
-            weight_sum += weight
-            cx += (origin[0] + a[0] + b[0]) / 3.0 * weight
-            cy += (origin[1] + a[1] + b[1]) / 3.0 * weight
-            cz += (origin[2] + a[2] + b[2]) / 3.0 * weight
+    for origin, a, b, weight in _mesh_triangles(vertices, faces):
+        weight_sum += weight
+        cx += (origin[0] + a[0] + b[0]) / 3.0 * weight
+        cy += (origin[1] + a[1] + b[1]) / 3.0 * weight
+        cz += (origin[2] + a[2] + b[2]) / 3.0 * weight
     if weight_sum < 1e-12:
         return None
     return cx / weight_sum, cy / weight_sum, cz / weight_sum
@@ -92,38 +116,21 @@ def scatter_points(
     seed: int,
 ) -> list[tuple[float, float, float]]:
     """Случайные точки внутри граней. Плотность задаёт число, сид — рисунок."""
-    triangles: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]] = []
-    weights: list[float] = []
-    for face in faces:
-        if len(face) < 3:
-            continue
-        origin = vertices[face[0]]
-        for index in range(1, len(face) - 1):
-            a = vertices[face[index]]
-            b = vertices[face[index + 1]]
-            weight = abs((a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])) * 0.5
-            if weight < 1e-12:
-                continue
-            triangles.append((origin, a, b))
-            weights.append(weight)
+    triangles = _mesh_triangles(vertices, faces)
     if not triangles or count <= 0:
         return []
-    total = sum(weights)
     cumulative: list[float] = []
     running = 0.0
-    for weight in weights:
+    for _origin, _a, _b, weight in triangles:
         running += weight
         cumulative.append(running)
+    total = running
     rng = random.Random(seed)
     points: list[tuple[float, float, float]] = []
     for _ in range(count):
         mark = rng.random() * total
-        chosen = triangles[-1]
-        for triangle, edge in zip(triangles, cumulative):
-            if mark <= edge:
-                chosen = triangle
-                break
-        origin, a, b = chosen
+        chosen = triangles[min(bisect_right(cumulative, mark), len(triangles) - 1)]
+        origin, a, b, _weight = chosen
         r1 = rng.random()
         r2 = rng.random()
         if r1 + r2 > 1.0:
@@ -181,10 +188,15 @@ def split_far_parts(
         if left_root != right_root:
             parent[right_root] = left_root
 
-    for left in range(len(groups)):
-        for right in range(left + 1, len(groups)):
-            if _box_gap(boxes[left], boxes[right]) <= gap_m:
+    distance = max(float(gap_m), 0.0)
+    active: list[int] = []
+    for left in sorted(range(len(groups)), key=lambda index: (boxes[index][0], index)):
+        ax0 = boxes[left][0]
+        active = [index for index in active if boxes[index][2] >= ax0 - distance]
+        for right in active:
+            if _box_gap(boxes[left], boxes[right]) <= distance:
                 union(left, right)
+        active.append(left)
     clustered: dict[int, list[int]] = {}
     for index, group in enumerate(groups):
         clustered.setdefault(find(index), []).extend(group)
@@ -290,6 +302,52 @@ def minimum_rectangle(points: list[tuple[float, float]]) -> tuple[float, float, 
     if best is None:
         return None
     return best[1], best[2], best[3], best[4]
+
+
+def is_playground_layer(name: str) -> bool:
+    """Покрытие площадки: в имени есть площадка, игровая или спорт, и нет ТБО."""
+    text = str(name or "").casefold()
+    if "тбо" in text:
+        return False
+    return "площад" in text or "игров" in text or "спорт" in text
+
+
+def is_playground_surface(name: str, texture: str = "") -> bool:
+    """Площадка по имени или по резиновому покрытию. ТБО не берём."""
+    if "тбо" in str(name or "").casefold():
+        return False
+    if is_playground_layer(name):
+        return True
+    return str(texture or "") == "rubber"
+
+
+def blocks_playground(
+    category: str,
+    placement: str,
+    parent_placement: str,
+    family: str,
+    placed: bool,
+) -> bool:
+    """Забор, здание и уже стоящий МАФ мешают. Дерево и куст — нет."""
+    if placement == "scatter" or parent_placement == "scatter" or family in {"tree", "bush"}:
+        return False
+    if placed:
+        return (
+            placement in {"area", "linear"}
+            or parent_placement in {"area", "linear"}
+            or family in {"playground", "bench"}
+        )
+    return category in {"fence", "building"}
+
+
+def playground_capacity(area_m2: float) -> int:
+    """Сколько моделей ещё имеет смысл пробовать. Место проверяет упаковщик."""
+    count = int(float(area_m2) / 20.0)
+    if count < 8:
+        return 8
+    if count > 40:
+        return 40
+    return count
 
 
 def rank_playgrounds(
@@ -542,15 +600,19 @@ def cluster_boxes(
         if root_a != root_b:
             parent[root_a] = root_b
 
-    limit = max(gap, 0.0) ** 2
-    for left in range(count):
+    distance = max(float(gap), 0.0)
+    limit = distance * distance
+    active: list[int] = []
+    for left in sorted(range(count), key=lambda index: (boxes[index][0], index)):
         ax0, ay0, ax1, ay1 = boxes[left]
-        for right in range(left + 1, count):
+        active = [index for index in active if boxes[index][2] >= ax0 - distance]
+        for right in active:
             bx0, by0, bx1, by1 = boxes[right]
             dx = max(0.0, ax0 - bx1, bx0 - ax1)
             dy = max(0.0, ay0 - by1, by0 - ay1)
             if dx * dx + dy * dy <= limit:
                 unite(left, right)
+        active.append(left)
 
     groups: dict[int, list[int]] = {}
     for index in range(count):
@@ -563,3 +625,300 @@ def cluster_boxes(
         )
 
     return [members for _root, members in sorted(groups.items(), key=lambda item: origin(item[1]))]
+
+
+def impact_margin(height: float) -> float:
+    """Зазор зоны падения по ГОСТ 34614.1: до 1.5 м падения — 1.5 м, дальше не больше 2.5 м."""
+    fall = min(max(float(height), 0.0), 3.0)
+    if fall <= 1.5:
+        return 1.5
+    return min(1.5 + (2.0 / 3.0) * (fall - 1.5), 2.5)
+
+
+def _rotate(x: float, y: float, angle: float, origin: tuple[float, float]) -> tuple[float, float]:
+    ca, sa = cos(angle), sin(angle)
+    return (origin[0] + x * ca - y * sa, origin[1] + x * sa + y * ca)
+
+
+def equipment_quads(
+    width: float,
+    depth: float,
+    clearance: tuple[float, float, float, float],
+    angle: float,
+    origin: tuple[float, float],
+    inflate: float = 0.0,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Коробка модели и зона безопасности. clearance: вперёд, назад, влево, вправо."""
+    front, back, left, right = clearance
+    pad = max(float(inflate), 0.0)
+    body = [
+        _rotate(-width * 0.5 - pad, -depth * 0.5 - pad, angle, origin),
+        _rotate(width * 0.5 + pad, -depth * 0.5 - pad, angle, origin),
+        _rotate(width * 0.5 + pad, depth * 0.5 + pad, angle, origin),
+        _rotate(-width * 0.5 - pad, depth * 0.5 + pad, angle, origin),
+    ]
+    safety = [
+        _rotate(-(width * 0.5 + left), -(depth * 0.5 + back), angle, origin),
+        _rotate(width * 0.5 + right, -(depth * 0.5 + back), angle, origin),
+        _rotate(width * 0.5 + right, depth * 0.5 + front, angle, origin),
+        _rotate(-(width * 0.5 + left), depth * 0.5 + front, angle, origin),
+    ]
+    return body, safety
+
+
+_SHAPE = None
+
+
+def _shapely():
+    """Библиотека ставится кнопкой после включения аддона, поэтому импорт не на загрузке."""
+    global _SHAPE
+    if _SHAPE is not None:
+        return _SHAPE
+    vendor = Path(__file__).resolve().parent / "vendor"
+    folder = str(vendor)
+    if vendor.is_dir() and folder not in sys.path:
+        sys.path.insert(0, folder)
+    try:
+        from shapely.geometry import Point, Polygon
+        from shapely.ops import unary_union
+        from shapely.prepared import prep
+    except ImportError as error:
+        raise RuntimeError(
+            "Сначала нажмите «Установить библиотеки» на панели «Подложка»."
+        ) from error
+    _SHAPE = (Point, Polygon, unary_union, prep)
+    return _SHAPE
+
+
+class _Triangles:
+    """Единая GEOS-геометрия слоя: быстрые и точные предикаты вместо выборочных точек."""
+
+    def __init__(self, vertices: list[tuple[float, float, float]], faces: list[tuple[int, ...]]):
+        Point, Polygon, unary_union, prep = _shapely()
+        polygons = [
+            Polygon(((a[0], a[1]), (b[0], b[1]), (c[0], c[1])))
+            for a, b, c, _weight in _mesh_triangles(vertices, faces)
+        ]
+        self.geometry = unary_union(polygons) if polygons else Polygon()
+        self._prepared = prep(self.geometry)
+
+    def contains(self, x: float, y: float) -> bool:
+        Point, _Polygon, _union, _prep = _shapely()
+        return self._prepared.covers(Point(x, y))
+
+    def covers(self, quad: list[tuple[float, float]]) -> bool:
+        _Point, Polygon, _union, _prep = _shapely()
+        return self._prepared.covers(Polygon(quad))
+
+    def intersects(self, quad: list[tuple[float, float]]) -> bool:
+        _Point, Polygon, _union, _prep = _shapely()
+        return self._prepared.intersects(Polygon(quad))
+
+
+def _axes(poly: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    found = []
+    count = len(poly)
+    for index in range(count):
+        x1, y1 = poly[index]
+        x2, y2 = poly[(index + 1) % count]
+        found.append((y1 - y2, x2 - x1))
+    return found
+
+
+def _project(poly: list[tuple[float, float]], axis: tuple[float, float]) -> tuple[float, float]:
+    dots = [point[0] * axis[0] + point[1] * axis[1] for point in poly]
+    return min(dots), max(dots)
+
+
+def quads_overlap(left: list[tuple[float, float]], right: list[tuple[float, float]]) -> bool:
+    for axis in _axes(left) + _axes(right):
+        a0, a1 = _project(left, axis)
+        b0, b1 = _project(right, axis)
+        if a1 <= b0 + 1e-7 or b1 <= a0 + 1e-7:
+            return False
+    return True
+
+
+def _quad_inside(quad: list[tuple[float, float]], ground: _Triangles, blocked: _Triangles | None) -> bool:
+    if not ground.covers(quad):
+        return False
+    return blocked is None or not blocked.intersects(quad)
+
+
+def _safety_area(asset: dict) -> float:
+    front, back, left, right = asset["clearance"]
+    return (float(asset["width"]) + left + right) * (float(asset["depth"]) + front + back)
+
+
+def pack_playground(
+    vertices: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    assets: list[dict],
+    blocked: tuple[list[tuple[float, float, float]], list[tuple[int, ...]]] | None = None,
+    step: float = 0.5,
+    limit: int = 12,
+    seed: int = 0,
+) -> list[dict]:
+    """Несколько моделей внутрь полигона. Сид меняет выбор и позиции без ослабления зон безопасности."""
+    if not assets or not faces or step <= 0 or limit <= 0:
+        return []
+    rng = random.Random(int(seed))
+    flat = [(vertex[0], vertex[1]) for vertex in vertices]
+    rectangle = minimum_rectangle(flat)
+    if rectangle is None:
+        return []
+    width, depth, edge_angle, center = rectangle
+    if width < 0.5 or depth < 0.5:
+        return []
+    ground = _Triangles(vertices, faces)
+    obstacles = _Triangles(*blocked) if blocked and blocked[1] else None
+    cells = (width / step + 1.0) * (depth / step + 1.0)
+    if cells > 8000.0:
+        step *= (cells / 8000.0) ** 0.5
+    ux, uy = cos(edge_angle), sin(edge_angle)
+    vx, vy = -uy, ux
+    grid: list[tuple[float, float]] = []
+    u = -width * 0.5
+    while u <= width * 0.5 + 1e-6:
+        v = -depth * 0.5
+        while v <= depth * 0.5 + 1e-6:
+            point = (center[0] + u * ux + v * vx, center[1] + u * uy + v * vy)
+            if ground.contains(point[0], point[1]) and (obstacles is None or not obstacles.contains(point[0], point[1])):
+                grid.append(point)
+            v += step
+        u += step
+    if not grid:
+        return []
+    rng.shuffle(grid)
+    ordered = list(assets)
+    rng.shuffle(ordered)
+    placed: list[dict] = []
+
+    def try_place(asset: dict) -> bool:
+        if len(placed) >= limit:
+            return False
+        for orientation in ("A", "B"):
+            angle = orientation_angle(edge_angle, orientation)
+            for point in grid:
+                _gap, safety = equipment_quads(
+                    float(asset["width"]), float(asset["depth"]), asset["clearance"], angle, point,
+                )
+                gap, _safety = equipment_quads(
+                    float(asset["width"]), float(asset["depth"]), asset["clearance"], angle, point, inflate=0.25,
+                )
+                if not _quad_inside(safety, ground, obstacles):
+                    continue
+                motion = str(asset.get("motion") or "static")
+                conflict = False
+                for other in placed:
+                    if quads_overlap(gap, other["gap"]):
+                        conflict = True
+                        break
+                    moving = motion in {"swing", "slide"} or other["motion"] in {"swing", "slide"}
+                    if moving and quads_overlap(safety, other["safety"]):
+                        conflict = True
+                        break
+                if conflict:
+                    continue
+                placed.append({
+                    "id": asset["id"],
+                    "x": point[0],
+                    "y": point[1],
+                    "angle": angle,
+                    "orientation": orientation,
+                    "motion": motion,
+                    "gap": gap,
+                    "safety": safety,
+                })
+                return True
+        return False
+
+    for asset in ordered:
+        try_place(asset)
+    progressed = True
+    while progressed and len(placed) < limit:
+        progressed = False
+        for asset in ordered:
+            if try_place(asset):
+                progressed = True
+                break
+    return [
+        {"id": item["id"], "x": item["x"], "y": item["y"], "angle": item["angle"], "orientation": item["orientation"]}
+        for item in placed
+    ]
+
+
+def safety_inside(
+    vertices: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    width: float,
+    depth: float,
+    clearance: tuple[float, float, float, float],
+    angle: float,
+    origin: tuple[float, float],
+    blocked: tuple[list[tuple[float, float, float]], list[tuple[int, ...]]] | None = None,
+    scale: float = 1.0,
+) -> bool:
+    ground = _Triangles(vertices, faces)
+    obstacles = _Triangles(*blocked) if blocked and blocked[1] else None
+    factor = max(float(scale), 0.0)
+    scaled_clearance = tuple(float(value) * factor for value in clearance)
+    _body, safety = equipment_quads(width * factor, depth * factor, scaled_clearance, angle, origin)
+    return _quad_inside(safety, ground, obstacles)
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+
+def plan_image(segments: list[tuple[float, float, float, float]], size: int = 160) -> bytes:
+    """План слоя: тёмные контуры на светлом поле, PNG."""
+    if not segments:
+        return b""
+    xs = [value for segment in segments for value in (segment[0], segment[2])]
+    ys = [value for segment in segments for value in (segment[1], segment[3])]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span = max(max_x - min_x, max_y - min_y, 1e-6)
+    side = max(int(size), 16)
+    margin = 8
+    usable = side - margin * 2
+    pixels = bytearray([236, 232, 220] * side * side)
+
+    def plot(x: int, y: int) -> None:
+        if x < 0 or y < 0 or x >= side or y >= side:
+            return
+        offset = (y * side + x) * 3
+        pixels[offset:offset + 3] = b"\x1e\x46\x32"
+
+    def line(x0: int, y0: int, x1: int, y1: int) -> None:
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = dx - dy
+        while True:
+            plot(x0, y0)
+            if x0 == x1 and y0 == y1:
+                break
+            doubled = err * 2
+            if doubled > -dy:
+                err -= dy
+                x0 += sx
+            if doubled < dx:
+                err += dx
+                y0 += sy
+
+    drawn = segments[:8000]
+    for x1, y1, x2, y2 in drawn:
+        ax = margin + int(round((x1 - min_x) / span * usable))
+        ay = margin + int(round((max_y - y1) / span * usable))
+        bx = margin + int(round((x2 - min_x) / span * usable))
+        by = margin + int(round((max_y - y2) / span * usable))
+        line(ax, ay, bx, by)
+    raw = b"".join(b"\x00" + bytes(pixels[row * side * 3:(row + 1) * side * 3]) for row in range(side))
+    ihdr = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(raw, 6))
+        + _png_chunk(b"IEND", b"")
+    )

@@ -66,6 +66,8 @@ CONTOUR_SNAP_TOLERANCE_M = 0.02
 MIN_ARRANGEMENT_AREA_M2 = 0.05
 # Рамка листа и копии «Ном.пера» бывают десятки километров. Площадка меньше.
 MAX_CONTOUR_SPAN_M = 8000.0
+# Открытые линии ограждений становятся узкими полигонами-препятствиями.
+FENCE_WIDTH_M = 0.20
 # Слой 0 / HATCH: SOLID-заливка внутри контура стен здания.
 GENERIC_FILL_ASSOCIATE_M = 15.0
 FILL_POLYLINE_TOKENS = ("ЗАЛИВ", "ЗАПОЛН", "ПЯТН")
@@ -256,7 +258,9 @@ class PipelineSettings:
     contour_arrangement_mode: str = "layer"
     contour_from_fills: bool = False
     max_contour_span_m: float = 8000.0
+    fence_width_m: float = FENCE_WIDTH_M
     cut_vegetation: bool = False
+    omit_symbols: bool = False
     scene_scale: float = 1.0
     origin_mode: str = "mass"
     batch_size: int = 600
@@ -290,6 +294,7 @@ def settings() -> PipelineSettings:
         contour_from_fills=False,
         max_contour_span_m=MAX_CONTOUR_SPAN_M,
         cut_vegetation=False,
+        omit_symbols=False,
         scene_scale=1.0,
         origin_mode="mass",
         batch_size=DEFAULT_BATCH_SIZE,

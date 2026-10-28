@@ -24,6 +24,12 @@ from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatPrope
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 from bpy.utils import previews
 
+# Если библиотеки уже стоят, они видны до импорта модулей. Без них аддон всё равно включается.
+_VENDOR = Path(__file__).resolve().parent / "vendor"
+if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
+    sys.path.insert(0, str(_VENDOR))
+
+
 def _reload_stale_modules() -> None:
     """Установка zip выгружает сам пакет, а подмодули старой версии остаются в sys.modules."""
     import importlib
@@ -75,7 +81,7 @@ from .install_support import (
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 4, 62),
+    "version": (1, 5, 4),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF, жилой дом и расстановка благоустройства в сцене",
@@ -311,6 +317,7 @@ def _settings_payload(prefs, source: Path) -> dict:
         "contour_arrangement_mode": str(prefs.contour_arrangement_mode),
         "contour_from_fills": bool(prefs.contour_from_fills),
         "cut_vegetation": bool(prefs.cut_vegetation),
+        "omit_symbols": bool(prefs.omit_symbols),
         "scene_scale": float(prefs.scene_scale),
         "origin_mode": str(prefs.origin_mode),
         "batch_size": int(prefs.batch_size),
@@ -517,6 +524,11 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         name="Контуры из заливок",
         description="В режиме «Контуры» граница штриховки тоже собирается в полигон, даже если отдельной линии на слое нет",
         default=False,
+    )
+    omit_symbols: BoolProperty(
+        name="Убрать отметки МАФ и посадок",
+        description="Контуры кустов, деревьев и лавочек с чертежа не попадают в сцену. Газоны, покрытия и здания остаются, файл чертежа не меняется",
+        default=True,
     )
     cut_vegetation: BoolProperty(
         name="Вырезать полигоны под МАФ и посадками",
@@ -1209,12 +1221,9 @@ def _fill_review(context, layers_path: Path) -> tuple[int, int]:
     _remember_layers(scene)
     memory = _layer_memory(scene).get(str(scene.dwgreader_source), {})
     counts = data.get("counts") or {}
-    preset = scene.dwgreader_geometry
-    default_geometry = preset if preset in {"fills", "curves", "both"} else "fills"
     scene.dwgreader_selected.clear()
     scene.dwgreader_ignored.clear()
     seen: set[str] = set()
-    used_geometry: set[str] = set()
     pending: list[dict] = []
 
     def add(name: str, category: str, recognized: bool) -> None:
@@ -1256,7 +1265,7 @@ def _fill_review(context, layers_path: Path) -> tuple[int, int]:
             item.category = row["category"]
             item.recognized = row["recognized"]
             item.build = row["recognized"]
-            item.geometry = default_geometry
+            item.geometry = "fills"
             item.fills = row["fills"]
             item.curves = row["curves"]
             item.entities = row["entities"]
@@ -1265,15 +1274,9 @@ def _fill_review(context, layers_path: Path) -> tuple[int, int]:
                 item.build = bool(saved[0])
                 if saved[1] in CATEGORY_IDS:
                     item.category = saved[1]
-                if saved[2] in {"fills", "curves", "both"}:
-                    item.geometry = saved[2]
             if row["fills"] <= 0 and row["curves"] > 0:
                 item.geometry = "curves"
-            used_geometry.add(item.geometry)
-        if len(used_geometry) > 1:
-            scene.dwgreader_geometry = "per_layer"
-        elif used_geometry:
-            scene.dwgreader_geometry = next(iter(used_geometry))
+        scene.dwgreader_geometry = "fills"
     finally:
         _LAYER_SYNC = False
     scene.dwgreader_selected_index = 0
@@ -1345,6 +1348,21 @@ class DWGREADER_OT_mark_layers(Operator):
                 item.build = False
             else:
                 item.build = item.category not in {"", "none"}
+        return {"FINISHED"}
+
+
+class DWGREADER_OT_plan_zoom(Operator):
+    bl_idname = "dwgreader.plan_zoom"
+    bl_label = "Масштаб плана"
+    bl_description = "Приблизить или отдалить план активного слоя"
+    bl_options = {"INTERNAL"}
+
+    delta: IntProperty(name="Шаг", default=1)
+
+    def execute(self, context):
+        scene = context.scene
+        current = int(getattr(scene, "dwgreader_plan_zoom", 1) or 1)
+        scene.dwgreader_plan_zoom = min(4, max(1, current + int(self.delta)))
         return {"FINISHED"}
 
 
@@ -1451,6 +1469,7 @@ class DWGREADER_OT_cancel_import(Operator):
 
     def execute(self, context):
         remove_root(UNDERLAY_ROOT)
+        placement.clear_placement()
         context.scene.dwgreader_step = 2 if len(context.scene.dwgreader_selected) else 1
         context.scene.dwgreader_status = "Подложка удалена"
         return {"FINISHED"}
@@ -1578,21 +1597,23 @@ class DWGREADER_OT_generate(Operator):
             return {"CANCELLED"}
         groups: dict[str, list[str]] = {}
         per_layer: dict[str, str] = {}
+        mixed = scene.dwgreader_geometry == "per_layer"
         for item in scene.dwgreader_selected:
             name = item.layer_name.strip()
             if name and item.build:
                 groups.setdefault(item.category, []).append(name)
-                per_layer[name] = item.geometry
+                if mixed:
+                    per_layer[name] = item.geometry
         if not groups:
             self.report({"ERROR"}, "Не отмечено ни одного слоя")
             return {"CANCELLED"}
         _remember_layers(scene)
         out = _output_dir(prefs, source)
         groups_path = out / "_confirmed_layers.json"
-        groups_path.write_text(
-            json.dumps({"by_category": groups, "geometry_by_layer": per_layer}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        payload: dict = {"by_category": groups}
+        if mixed:
+            payload["geometry_by_layer"] = per_layer
+        groups_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         preset = scene.dwgreader_geometry if scene.dwgreader_geometry in {"fills", "curves", "both"} else "fills"
         _BUILD_STARTED = clock.time()
         return _launch_pipeline(
@@ -1778,6 +1799,130 @@ def _draw_step_file(layout, context, prefs) -> None:
     hint.label(text="Геометрия появится после шага 2.")
 
 
+_PLAN_FILE = {"path": "", "mtime": 0, "layers": {}}
+_LAYER_PLAN = {"key": None, "icon": 0, "message": "", "preview_key": ""}
+
+
+def _plan_segments(cache: Path) -> dict[str, list[tuple[float, float, float, float]]]:
+    mtime = cache.stat().st_mtime_ns
+    if _PLAN_FILE["path"] == str(cache) and _PLAN_FILE["mtime"] == mtime:
+        return _PLAN_FILE["layers"]
+    import gzip
+
+    with gzip.open(cache, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    layers: dict[str, list[tuple[float, float, float, float]]] = {}
+
+    def add(name: str, segment: tuple[float, float, float, float]) -> None:
+        if not name:
+            return
+        bucket = layers.setdefault(name, [])
+        if len(bucket) < 8000:
+            bucket.append(segment)
+
+    for fill in payload.get("fills") or []:
+        if not isinstance(fill, list) or len(fill) < 6:
+            continue
+        name = str(fill[1] or "")
+        rings = [fill[5]]
+        if isinstance(fill[6], list):
+            rings.extend(fill[6])
+        for ring in rings:
+            if not isinstance(ring, list) or len(ring) < 2:
+                continue
+            points = [
+                (float(point[0]), float(point[1]))
+                for point in ring
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            ]
+            if len(points) < 2:
+                continue
+            closed = points + points[:1]
+            for start, end in zip(closed, closed[1:]):
+                add(name, (start[0], start[1], end[0], end[1]))
+    for curve in payload.get("curves") or []:
+        if not isinstance(curve, list) or len(curve) < 6:
+            continue
+        add(str(curve[0] or ""), (float(curve[2]), float(curve[3]), float(curve[4]), float(curve[5])))
+    _PLAN_FILE["path"] = str(cache)
+    _PLAN_FILE["mtime"] = mtime
+    _PLAN_FILE["layers"] = layers
+    return layers
+
+
+def _layer_plan_icon(context, prefs, layer_name: str) -> tuple[int, str]:
+    from .placement_math import plan_image
+
+    scene = context.scene
+    source_raw = str(getattr(scene, "dwgreader_source", "") or "").strip()
+    if prefs is None or not source_raw or _PREVIEWS is None:
+        return 0, "Повторите анализ"
+    source = Path(bpy.path.abspath(source_raw))
+    cache = _output_dir(prefs, source) / f"{source.stem}_geometry_cache.json.gz"
+    if not cache.is_file():
+        return 0, "Повторите анализ"
+    zoom = min(4, max(1, int(getattr(scene, "dwgreader_plan_zoom", 1) or 1)))
+    key = (str(cache), cache.stat().st_mtime_ns, layer_name, zoom)
+    if _LAYER_PLAN["key"] == key:
+        return int(_LAYER_PLAN["icon"]), str(_LAYER_PLAN["message"])
+    try:
+        segments = _plan_segments(cache).get(layer_name) or []
+        image = plan_image(segments, 160 * zoom)
+    except (OSError, ValueError, EOFError):
+        return 0, "Повторите анализ"
+    previous = str(_LAYER_PLAN.get("preview_key") or "")
+    if previous and previous in _PREVIEWS:
+        try:
+            del _PREVIEWS[previous]
+        except Exception:
+            pass
+    if not image:
+        _LAYER_PLAN.update(key=key, icon=0, message="В слое нет контуров", preview_key="")
+        return 0, "В слое нет контуров"
+    folder = (Path(os.environ["APPDATA"]) if os.environ.get("APPDATA") else Path.home()) / "DWGREADER" / "plans"
+    folder.mkdir(parents=True, exist_ok=True)
+    preview_key = f"layer-{key[1]}-{zoom}-{hashlib.sha256(layer_name.encode('utf-8')).hexdigest()[:10]}"
+    dest = folder / f"{preview_key}.png"
+    dest.write_bytes(image)
+    _PREVIEWS.load(preview_key, str(dest), "IMAGE")
+    icon = _PREVIEWS[preview_key].icon_id
+    _LAYER_PLAN.update(key=key, icon=icon, message="", preview_key=preview_key)
+    return icon, ""
+
+
+def _draw_layer_plan(layout, context, prefs) -> None:
+    scene = context.scene
+    items = scene.dwgreader_selected
+    if not items:
+        return
+    index = min(max(int(scene.dwgreader_selected_index), 0), len(items) - 1)
+    name = items[index].layer_name
+    try:
+        icon, message = _layer_plan_icon(context, prefs, name)
+    except Exception:
+        icon, message = 0, "Повторите анализ"
+    if icon:
+        zoom = min(4, max(1, int(getattr(scene, "dwgreader_plan_zoom", 1) or 1)))
+        controls = layout.row(align=True)
+        controls.operator("dwgreader.plan_zoom", text="−").delta = -1
+        controls.label(text=f"План {zoom}×")
+        controls.operator("dwgreader.plan_zoom", text="+").delta = 1
+        row = layout.row()
+        row.alignment = "CENTER"
+        row.template_icon(icon_value=icon, scale=4.5 * zoom)
+        layout.label(text=name)
+        return
+    if message:
+        layout.label(text=message, icon="INFO")
+
+
+def _fold(layout, scene, prop: str, title: str) -> bool:
+    opened = bool(getattr(scene, prop, False))
+    row = layout.row(align=True)
+    row.prop(scene, prop, text=title, icon="TRIA_DOWN" if opened else "TRIA_RIGHT", emboss=False)
+    return opened
+
+
 def _draw_step_objects(layout, context, prefs) -> None:
     scene = context.scene
     summary = _layer_summary(scene)
@@ -1796,49 +1941,59 @@ def _draw_step_objects(layout, context, prefs) -> None:
         contour_option = box.row()
         contour_option.enabled = not fills_only
         contour_option.prop(prefs, "contour_from_fills")
-    box.prop(scene, "dwgreader_filter", text="", icon="VIEWZOOM")
-    marks = box.row(align=True)
-    marks.operator("dwgreader.mark_layers", text="Снять все").mode = "none"
-    marks.operator("dwgreader.mark_layers", text="Выбрать все").mode = "all"
-    working = box.row(align=True)
-    working.operator("dwgreader.mark_layers", text="Выбрать рабочие").mode = "working"
 
-    head = box.row(align=True)
-    head.label(text="", icon="CHECKBOX_HLT")
-    name, rest, tail = _layer_columns(head)
-    name.label(text="Слой")
-    rest.label(text="Тип")
-    tail.label(text="Отрисовка")
-    tail.label(text="DXF")
-    box.template_list(
-        "DWGREADER_UL_layers", "layers",
-        scene, "dwgreader_selected",
-        scene, "dwgreader_selected_index",
-        rows=10,
-    )
-    if summary["unknown"]:
-        warn = box.row(align=True)
-        warn.label(
-            text=f"{_layers_text(summary['unknown'])}, {_objects_text(summary['unknown_objects'])} — тип не распознан",
-            icon="ERROR",
+    if _fold(layout, scene, "dwgreader_show_layers", "Слои"):
+        layers = layout.box()
+        layers.prop(scene, "dwgreader_filter", text="", icon="VIEWZOOM")
+        marks = layers.row(align=True)
+        marks.operator("dwgreader.mark_layers", text="Снять все").mode = "none"
+        marks.operator("dwgreader.mark_layers", text="Выбрать все").mode = "all"
+        working = layers.row(align=True)
+        working.operator("dwgreader.mark_layers", text="Выбрать рабочие").mode = "working"
+        head = layers.row(align=True)
+        head.label(text="", icon="BLANK1")
+        name, rest, tail = _layer_columns(head)
+        name.label(text="Слой")
+        rest.label(text="Тип")
+        tail.label(text="Отрисовка")
+        tail.label(text="DXF")
+        _draw_layer_plan(layers, context, prefs)
+        layers.template_list(
+            "DWGREADER_UL_layers", "layers",
+            scene, "dwgreader_selected",
+            scene, "dwgreader_selected_index",
+            rows=10,
         )
-        warn.prop(
-            scene, "dwgreader_show_unknown",
-            text="Скрыть" if scene.dwgreader_show_unknown else "Показать",
-            toggle=True,
-        )
+        if summary["unknown"]:
+            warn = layers.row(align=True)
+            warn.label(
+                text=f"{_layers_text(summary['unknown'])}, {_objects_text(summary['unknown_objects'])} — тип не распознан",
+                icon="ERROR",
+            )
+            warn.prop(
+                scene, "dwgreader_show_unknown",
+                text="Скрыть" if scene.dwgreader_show_unknown else "Показать",
+                toggle=True,
+            )
 
-    if prefs is not None:
+    if prefs is not None and _fold(layout, scene, "dwgreader_show_params", "Параметры построения"):
         params = layout.box()
-        params.label(text="Параметры построения")
         col = params.column()
         col.use_property_split = True
         col.use_property_decorate = False
         col.prop(prefs, "scene_scale")
         col.prop(prefs, "origin_mode")
-        col.prop(prefs, "cut_vegetation")
+        col.prop(prefs, "omit_symbols")
+        cut = col.row()
+        cut.enabled = not prefs.omit_symbols
+        cut.prop(prefs, "cut_vegetation")
         _draw_geometry(col, prefs)
         _draw_split(col, prefs)
+
+    flags = layout.column(align=True)
+    flags.prop(scene, "dwgreader_auto_trees", text="Расстановка деревьев")
+    flags.prop(scene, "dwgreader_auto_maf", text="МАФ на площадках")
+    flags.prop(scene, "dwgreader_auto_buildings", text="Расстановка зданий")
 
     nav = layout.row(align=True)
     nav.scale_y = 1.3
@@ -1929,6 +2084,26 @@ def _draw_step_result(layout, context) -> None:
     if source:
         text.label(text=source)
     _draw_sheets(layout, context, root)
+    plants = layout.box()
+    plants.label(text="Деревья на газонах", icon="OUTLINER_OB_CURVES")
+    placement.draw_plant_controls(plants, context, all_lawns=True)
+    hint = plants.column(align=True)
+    hint.scale_y = 0.75
+    hint.label(text="Ползунки заново ставят деревья и кусты")
+    hint.label(text="на все газоны этой подложки.")
+    grounds = layout.box()
+    grounds.label(text="Площадки", icon="MESH_GRID")
+    names = placement.playground_layer_names()
+    if names:
+        for name in names[:8]:
+            grounds.label(text=name)
+        if len(names) > 8:
+            grounds.label(text=f"и ещё {len(names) - 8}")
+    else:
+        empty = grounds.column(align=True)
+        empty.scale_y = 0.75
+        empty.label(text="Пока площадок нет: имя «площад», «игров», «спорт»")
+        empty.label(text="или резиновое покрытие. ТБО не берём.")
 
     tree = layout.box()
     top = tree.row()
@@ -1974,7 +2149,7 @@ def _draw_building(layout, context) -> None:
     box.label(text="Здание · геометрические ноды", icon="HOME")
     text = box.column(align=True)
     text.scale_y = 0.8
-    text.label(text="Если выделен полигон, дом встаёт в его центр.")
+    text.label(text="Выделенный полигон задаёт контур дома.")
     text.label(text="Тип дома — в списке под кнопкой, не только номер.")
     run = box.row()
     run.scale_y = 1.3
@@ -2211,6 +2386,17 @@ def _poll_process(operator, context, event, on_ok: str, on_err: str, build: bool
     return {"FINISHED"}
 
 
+class _SceneHolder:
+    """Таймер сборки читает галочки той сцены, которую только что построил."""
+
+    def __init__(self, base, scene):
+        self._base = base
+        self.scene = scene
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
 def _schedule_underlay_replace(scene_name: str, json_path: str | None, empty_message: str | None = None) -> None:
     """Сборка после завершения оператора. Иначе Blender откатывает удаление старой подложки."""
 
@@ -2221,18 +2407,31 @@ def _schedule_underlay_replace(scene_name: str, json_path: str | None, empty_mes
         if scene is None:
             return None
         try:
+            placement.clear_placement()
+            building_export.clear_auto_buildings()
             if not json_path:
                 remove_root(UNDERLAY_ROOT)
                 if empty_message:
                     scene.dwgreader_status = empty_message[:180]
                 return None
             count = build_underlay(Path(json_path), scene)
+            placed = ""
+            base = bpy.context
+            if base is not None:
+                holder = base if getattr(base, "scene", None) is scene else _SceneHolder(base, scene)
+                try:
+                    placed = placement.furnish_underlay(holder)
+                except Exception as exc:
+                    placed = f"Расстановка не завершилась: {exc}"
         except Exception as exc:
             scene.dwgreader_status = f"Ошибка сборки: {exc}"
             return None
         scene.dwgreader_build_seconds = max(clock.time() - _BUILD_STARTED, 0.0) if _BUILD_STARTED else 0.0
         scene.dwgreader_step = 3
-        scene.dwgreader_status = f"Готово: объектов в сцене {count}"
+        status = f"Готово: объектов в сцене {count}"
+        if placed:
+            status = f"{status}. {placed}"
+        scene.dwgreader_status = status[:180]
         try:
             bpy.ops.ed.undo_push(message="Подложка DWG")
         except Exception:
@@ -2273,6 +2472,7 @@ CLASSES = (
     DWGREADER_OT_pick_file,
     DWGREADER_OT_classify,
     DWGREADER_OT_mark_layers,
+    DWGREADER_OT_plan_zoom,
     DWGREADER_OT_goto,
     DWGREADER_OT_sheet,
     DWGREADER_OT_open_chat,
@@ -2374,7 +2574,38 @@ def register() -> None:
         description="Показать в списке слои, которым модель не нашла тип",
         default=False,
     )
-    bpy.types.Scene.dwgreader_show_params = BoolProperty(name="Параметры разбора", default=False)
+    bpy.types.Scene.dwgreader_show_params = BoolProperty(
+        name="Параметры построения",
+        description="Показать масштаб, начало координат и вырезание отметок",
+        default=False,
+    )
+    bpy.types.Scene.dwgreader_show_layers = BoolProperty(
+        name="Слои",
+        description="Показать список слоёв и план активного слоя",
+        default=False,
+    )
+    bpy.types.Scene.dwgreader_plan_zoom = IntProperty(
+        name="Масштаб плана",
+        description="Во сколько раз увеличить план активного слоя",
+        default=1,
+        min=1,
+        max=4,
+    )
+    bpy.types.Scene.dwgreader_auto_trees = BoolProperty(
+        name="Расстановка деревьев",
+        description="После построения расставить деревья и кусты на всех газонах",
+        default=True,
+    )
+    bpy.types.Scene.dwgreader_auto_maf = BoolProperty(
+        name="МАФ на площадках",
+        description="После построения заполнить каждую площадку несколькими моделями, зона безопасности остаётся внутри полигона",
+        default=True,
+    )
+    bpy.types.Scene.dwgreader_auto_buildings = BoolProperty(
+        name="Расстановка зданий",
+        description="После построения поставить дом на каждый полигон зданий",
+        default=True,
+    )
     bpy.types.Scene.dwgreader_layer_memory = StringProperty(default="{}", options={"HIDDEN"})
     bpy.types.Scene.dwgreader_build_seconds = FloatProperty(default=0.0, options={"HIDDEN"})
     bpy.types.Scene.dwgreader_chatgpt_block = StringProperty(default="", options={"HIDDEN"})
@@ -2421,6 +2652,11 @@ def unregister() -> None:
         "dwgreader_build_seconds",
         "dwgreader_layer_memory",
         "dwgreader_show_params",
+        "dwgreader_show_layers",
+        "dwgreader_plan_zoom",
+        "dwgreader_auto_buildings",
+        "dwgreader_auto_maf",
+        "dwgreader_auto_trees",
         "dwgreader_show_unknown",
         "dwgreader_filter",
         "dwgreader_step",

@@ -34,9 +34,9 @@ def _square(document, layer: str, origin: tuple[float, float], size: float):
 
 
 class UnitScaleTests(unittest.TestCase):
-    def test_millimetre_header_scales_only_long_segments(self) -> None:
+    def test_millimetre_header_scales_regardless_of_segment_lengths(self) -> None:
         self.assertEqual(unit_scale(4, 488.0), 0.001)
-        self.assertEqual(unit_scale(4, 1.41), 1.0)
+        self.assertEqual(unit_scale(4, 1.41), 0.001)
         self.assertEqual(unit_scale(6, 488.0), 1.0)
         self.assertEqual(unit_scale(0, 488.0), 1.0)
 
@@ -51,16 +51,28 @@ class UnitScaleTests(unittest.TestCase):
         self.assertEqual(len(pieces), 1)
         self.assertAlmostEqual(_path_span(pieces[0].vertices), 59.0, places=3)
 
-    def test_short_millimetre_header_stays_in_drawing_units(self) -> None:
+    def test_short_millimetre_header_is_converted_to_metres(self) -> None:
         document = ezdxf.new()
         document.header["$INSUNITS"] = 4
         _square(document, "Контур", (0.0, 0.0), 10.0)
-        self.assertEqual(drawing_to_meters(document), 1.0)
-        pieces = extract_curve_pieces(
-            document, {"pavement": ["Контур"]}, lock_groups=True,
-        )
+        self.assertEqual(drawing_to_meters(document), 0.001)
+        with use_settings(PipelineSettings(min_arrangement_area_m2=0.0)):
+            pieces = extract_curve_pieces(
+                document, {"pavement": ["Контур"]}, lock_groups=True,
+            )
         self.assertEqual(len(pieces), 1)
-        self.assertAlmostEqual(_path_span(pieces[0].vertices), 10.0, places=3)
+        self.assertAlmostEqual(_path_span(pieces[0].vertices), 0.01, places=3)
+
+    def test_hatch_only_millimetre_drawing_uses_header(self) -> None:
+        document = ezdxf.new()
+        document.header["$INSUNITS"] = 4
+        hatch = document.modelspace().add_hatch(dxfattribs={"layer": "Газон"})
+        hatch.set_solid_fill()
+        hatch.paths.add_polyline_path([(0, 0), (1000, 0), (1000, 1000), (0, 1000)], is_closed=True)
+        self.assertEqual(drawing_to_meters(document), 0.001)
+        pieces = extract_classified_hatches(document, {"green": ["Газон"]}, lock_groups=True)
+        self.assertEqual(len(pieces), 1)
+        self.assertAlmostEqual(_path_span(pieces[0].vertices), 1.0, places=3)
 
     def test_fill_request_ignores_closed_polyline(self) -> None:
         document = ezdxf.new()

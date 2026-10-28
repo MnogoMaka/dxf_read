@@ -57,6 +57,20 @@ DISCORD_URL = "https://discord.gg/SNqPn4TcKQ"
 REQ_HEADERS = requests.utils.default_headers()
 REQ_HEADERS.update({"User-Agent": "blender-mcp"})
 
+
+def rodin_quality_settings(quality=None):
+    """Regular is the full model; Sketch is only an explicitly requested draft."""
+    value = str(quality or "high").strip().lower()
+    settings = {
+        "standard": {"tier": "Regular", "quality": "medium"},
+        "high": {"tier": "Regular", "quality": "high"},
+        "draft": {"tier": "Sketch", "quality": "low"},
+    }
+    if value not in settings:
+        raise ValueError("quality must be 'standard', 'high' or 'draft'")
+    return dict(settings[value])
+
+
 # Meshy, with the user's own key. Sidebar model id -> label; the id is what
 # the request sends. Text runs as a preview task, then one refine task.
 MESHY_API_BASE = "https://api.meshy.ai/openapi"
@@ -3539,7 +3553,8 @@ class BlenderMCPServer:
             self,
             text_prompt: str=None,
             images: list[tuple[str, str]]=None,
-            bbox_condition=None
+            bbox_condition=None,
+            quality: str="high"
         ):
         try:
             api_key = self._get_hyper3d_api_key()
@@ -3547,10 +3562,12 @@ class BlenderMCPServer:
                 return {"error": "Hyper3D API key is not given"}
             if images is None:
                 images = []
+            settings = rodin_quality_settings(quality)
             """Call Rodin API, get the job uuid and subscription key"""
             files = [
                 *[("images", (f"{i:04d}{img_suffix}", base64.b64decode(img) if isinstance(img, str) else img)) for i, (img_suffix, img) in enumerate(images)],
-                ("tier", (None, "Sketch")),
+                ("tier", (None, settings["tier"])),
+                ("quality", (None, settings["quality"])),
                 ("mesh_mode", (None, "Raw")),
                 ("texture_mode", (None, "high")),
             ]
@@ -3575,15 +3592,14 @@ class BlenderMCPServer:
             self,
             text_prompt: str=None,
             images: list[tuple[str, str]]=None,
-            bbox_condition=None
+            bbox_condition=None,
+            quality: str="high"
         ):
         try:
             api_key = self._get_hyper3d_api_key()
             if not api_key:
                 return {"error": "Hyper3D API key is not given"}
-            req_data = {
-                "tier": "Sketch",
-            }
+            req_data = rodin_quality_settings(quality)
             if images:
                 req_data["input_image_urls"] = images
             if text_prompt:
@@ -5174,10 +5190,13 @@ class BlenderMCPServer:
             encoded = base64.b64encode(handle.read()).decode("ascii")
         return f"data:{mime};base64,{encoded}", None
 
-    def create_meshy_job(self, text_prompt=None, image=None):
+    def create_meshy_job(self, text_prompt=None, image=None, quality="standard"):
         """Start a Meshy text preview task ("t2p") or image-to-3D task ("i2m")."""
         text_prompt = (text_prompt or "").strip()
         image = (image or "").strip()
+        quality = str(quality or "standard").strip().lower()
+        if quality not in ("standard", "high"):
+            return {"error": "quality must be 'standard' or 'high'"}
         if bool(text_prompt) == bool(image):
             return {"error": "Provide either a text prompt or an image, not both"}
         if len(text_prompt) > MESHY_PROMPT_MAX:
@@ -5188,6 +5207,8 @@ class BlenderMCPServer:
 
         if text_prompt:
             body = {"mode": "preview", "prompt": text_prompt, "ai_model": model, **MESHY_OUTPUT}
+            if quality == "high" and model == "latest":
+                body["geometry_resolution"] = "4k"
             task_id, error = self._meshy_post("/v2/text-to-3d", body)
             kind = "t2p"
         else:
@@ -5200,21 +5221,30 @@ class BlenderMCPServer:
             kind = "i2m"
         if error:
             return error
-        return {"task_id": task_id, "kind": kind, "model": model}
+        result = {"task_id": task_id, "kind": kind, "model": model, "quality": quality}
+        if kind == "t2p":
+            result["next_step"] = ("This preview has no textures. Poll it to SUCCEEDED, then call refine_meshy_job "
+                                   "with the same quality; only the finished refine is the final model.")
+        return result
 
-    def refine_meshy_job(self, preview_task_id=None):
+    def refine_meshy_job(self, preview_task_id=None, quality="standard"):
         """Texture a finished preview. At most one refine per preview: asking
         again returns the refine already started."""
+        quality = str(quality or "standard").strip().lower()
+        if quality not in ("standard", "high"):
+            return {"error": "quality must be 'standard' or 'high'"}
         if not preview_task_id:
             return {"error": "preview_task_id is required"}
         if preview_task_id in _meshy_refines:
             return {"task_id": _meshy_refines[preview_task_id], "kind": "t2r"}
         body = {"mode": "refine", "preview_task_id": preview_task_id, "enable_pbr": True, **MESHY_OUTPUT}
+        if quality == "high":
+            body["texture_resolution"] = "4k"
         task_id, error = self._meshy_post("/v2/text-to-3d", body)
         if error:
             return error
         _meshy_refines[preview_task_id] = task_id
-        return {"task_id": task_id, "kind": "t2r"}
+        return {"task_id": task_id, "kind": "t2r", "quality": quality}
 
     def poll_meshy_job_status(self, task_id=None, kind=None):
         """Query one Meshy task. Does not wait; the MCP client polls again."""
@@ -5737,7 +5767,8 @@ def _premium_fal_reply(result, note=None):
     return reply
 
 
-def premium_create_rodin_job(text_prompt=None, images=None, bbox_condition=None):
+def premium_create_rodin_job(text_prompt=None, images=None, bbox_condition=None, quality=None):
+    # Premium Rodin has one production tier; accept the common tool argument.
     image = images[0] if images else None
     result = premium_create_job("rodin", "high", text_prompt=text_prompt, image=image,
                                 bbox_condition=bbox_condition)
@@ -6577,7 +6608,7 @@ def register():
     bpy.types.Scene.blendermcp_hunyuan3d_octree_resolution = bpy.props.IntProperty(
         name="Octree Resolution",
         description="Octree resolution for the 3D generation",
-        default=256,
+        default=384,
         min=128,
         max=512,
     )
@@ -6585,7 +6616,7 @@ def register():
     bpy.types.Scene.blendermcp_hunyuan3d_num_inference_steps = bpy.props.IntProperty(
         name="Number of Inference Steps",
         description="Number of inference steps for the 3D generation",
-        default=20,
+        default=30,
         min=20,
         max=50,
     )
@@ -6601,7 +6632,7 @@ def register():
     bpy.types.Scene.blendermcp_hunyuan3d_texture = bpy.props.BoolProperty(
         name="Generate Texture",
         description="Whether to generate texture for the 3D model",
-        default=False,
+        default=True,
     )
     
     bpy.types.Scene.blendermcp_use_sketchfab = bpy.props.BoolProperty(

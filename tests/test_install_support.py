@@ -168,7 +168,7 @@ class SearchTests(unittest.TestCase):
 
 
 class BuilderTests(unittest.TestCase):
-    def test_pack_without_actual_node_reuses_building_from_zip(self) -> None:
+    def test_pack_uses_current_sources_and_reuses_only_building_from_zip(self) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         import builder
 
@@ -178,7 +178,8 @@ class BuilderTests(unittest.TestCase):
             (addon / "icons").mkdir(parents=True)
             (addon / "textures").mkdir()
             (addon / "mcp_for_blender").mkdir()
-            (addon / "__init__.py").write_text("addon = 1\n", encoding="utf-8")
+            (addon / "__init__.py").write_text("bl_info = {'version': (1, 5, 0)}\n", encoding="utf-8")
+            (addon / "placement.py").write_text("feature = 'new'\n", encoding="utf-8")
             (addon / "mcp_for_blender" / "addon.py").write_text("mcp = 1\n", encoding="utf-8")
             (addon / "icons" / "tile.png").write_bytes(b"png")
             for name in builder.SURFACE.values():
@@ -188,22 +189,32 @@ class BuilderTests(unittest.TestCase):
             (dxf / "__init__.py").write_text("", encoding="utf-8")
             library = project / "maf_blender_models"
             library.mkdir()
-            (library / "catalog.json").write_text("[]", encoding="utf-8")
+            (library / "catalog.json").write_text('[{"id": "new", "file": "new.glb"}]', encoding="utf-8")
+            (library / "new.glb").write_bytes(b"new model")
             dest = project / "blender_addon" / "dwgreader_underlay.zip"
             dest.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(dest, "w") as zf:
+                zf.writestr("dwgreader_underlay/placement.py", "feature = 'old'\n")
+                zf.writestr("dwgreader_underlay/library/catalog.json", "[]")
+                zf.writestr("dwgreader_underlay/library/old.glb", b"old model")
                 zf.writestr("dwgreader_underlay/building/Building 2.0.blend", b"blend")
                 zf.writestr("dwgreader_underlay/building/textures/wall.jpg", b"wall")
             built = builder.build_zip(project, dest)
             with zipfile.ZipFile(built) as zf:
                 names = set(zf.namelist())
+                placement = zf.read("dwgreader_underlay/placement.py")
+                catalog = zf.read("dwgreader_underlay/library/catalog.json")
             self.assertIn("dwgreader_underlay/__init__.py", names)
             self.assertIn("dwgreader_underlay/mcp_for_blender/addon.py", names)
             self.assertIn("dwgreader_underlay/building/Building 2.0.blend", names)
             self.assertIn("dwgreader_underlay/building/textures/wall.jpg", names)
             self.assertIn("dwgreader_underlay/textures/grass.jpg", names)
-            self.assertIn("dwgreader_underlay/library/catalog.json", names)
+            self.assertIn("dwgreader_underlay/library/new.glb", names)
+            self.assertNotIn("dwgreader_underlay/library/old.glb", names)
+            self.assertEqual(placement, (addon / "placement.py").read_bytes())
+            self.assertEqual(catalog, (library / "catalog.json").read_bytes())
             self.assertTrue(all("vendor" not in name for name in names))
+            self.assertEqual(builder.addon_version(project), (1, 5, 0))
 
 
 if __name__ == "__main__":

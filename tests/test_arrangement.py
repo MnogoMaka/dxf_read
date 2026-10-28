@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from dxf_read.arrangement import bounded_faces
+from dxf_read.arrangement import _snapped_endpoints, bounded_faces
 from dxf_read.config import PipelineSettings, use_settings
 from dxf_read.dxf import (
     HatchPiece,
     _curve_pieces_from_segments,
+    _keep_compact_copies,
     _layer_by_boundary,
     arrange_hatch_faces_by_layer,
     pieces_from_cache,
@@ -157,6 +158,60 @@ class ContourArrangementModeTests(unittest.TestCase):
         ])
 
 
+class EndpointSnapTests(unittest.TestCase):
+    def test_tolerance_chain_does_not_collapse_to_one_point(self) -> None:
+        segments: list[Segment] = [
+            ((0.0, 0.0), (0.5, 0.0), "A"),
+            ((0.019, 0.0), (0.519, 0.0), "A"),
+            ((0.038, 0.0), (0.538, 0.0), "A"),
+        ]
+        snapped = _snapped_endpoints(segments, 0.02)
+        starts = [segment[0][0] for segment in snapped]
+        self.assertEqual(len(set(starts)), 2)
+        self.assertNotEqual(starts[-1], 0.0)
+        for original, result in zip(segments, snapped):
+            self.assertGreater(result[1][0] - result[0][0], 0.49)
+            self.assertNotEqual(result[0], result[1])
+
+
+class FenceContourTests(unittest.TestCase):
+    def test_open_fence_becomes_a_narrow_obstacle(self) -> None:
+        categories = {"F": "fence"}
+        with use_settings(PipelineSettings(fence_width_m=0.2)):
+            pieces, _skipped = _curve_pieces_from_segments(
+                [((0.0, 0.0), (2.0, 0.0), "F")], categories.get, categories,
+            )
+        self.assertEqual(len(pieces), 1)
+        self.assertEqual(pieces[0].category, "fence")
+        self.assertAlmostEqual(sum(
+            abs(a[0] * b[1] - b[0] * a[1])
+            for a, b in zip(pieces[0].vertices, pieces[0].vertices[1:] + pieces[0].vertices[:1])
+        ) * 0.5, 0.4)
+
+    def test_closed_fence_is_not_replaced_by_a_filled_face(self) -> None:
+        categories = {"F": "fence"}
+        with use_settings(PipelineSettings(fence_width_m=0.2)):
+            pieces, _skipped = _curve_pieces_from_segments(square("F"), categories.get, categories)
+        self.assertEqual(len(pieces), 4)
+        self.assertTrue(all(piece.category == "fence" for piece in pieces))
+
+
+class SpatialCopyTests(unittest.TestCase):
+    def test_independent_distant_clusters_are_preserved(self) -> None:
+        pieces = [
+            HatchPiece("green", "Газон", _ring(0.0, 0.0, 10.0)),
+            HatchPiece("green", "Газон", _ring(10000.0, 0.0, 10.0)),
+        ]
+        kept = _keep_compact_copies(pieces, radius=100.0)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual({piece.vertices[0][0] for piece in kept}, {0.0, 10000.0})
+
+    def test_only_an_exact_duplicate_is_removed(self) -> None:
+        first = HatchPiece("green", "Газон", _ring(0.0, 0.0, 10.0))
+        duplicate = HatchPiece("green", "Газон", _ring(0.0, 0.0, 10.0), handle="other")
+        self.assertEqual(_keep_compact_copies([first, duplicate], radius=100.0), [first])
+
+
 def _hatch_cache(outer, holes=None) -> dict:
     return {
         "layers": ["Газон"],
@@ -207,8 +262,8 @@ def _ring(x: float, y: float, size: float) -> list[tuple[float, float, float]]:
     ]
 
 
-def _areas(pieces: list[HatchPiece], cut: bool) -> dict[str, float]:
-    settings = PipelineSettings(cut_vegetation=cut)
+def _areas(pieces: list[HatchPiece], cut: bool, omit: bool = False) -> dict[str, float]:
+    settings = PipelineSettings(cut_vegetation=cut, omit_symbols=omit)
     with use_settings(settings):
         arranged = arrange_hatch_faces_by_layer(pieces)
     return {layer: float(geometry.area) for geometry, _category, layer in arranged}
@@ -283,6 +338,54 @@ class SymbolCutoutTests(unittest.TestCase):
         areas = _areas(pieces, cut=True)
         self.assertAlmostEqual(areas["Дорога"], 96.0, places=3)
         self.assertAlmostEqual(areas["Лавки"], 4.0, places=3)
+
+    def test_omitted_marks_leave_the_drawing_whole(self) -> None:
+        pieces = [
+            HatchPiece("green", "Газон", _ring(0, 0, 10), [_ring(4, 4, 2)]),
+            HatchPiece("furniture", "Лавки", _ring(4, 4, 2)),
+            HatchPiece("vegetation", "Посадки", _ring(1, 1, 1)),
+            HatchPiece("pavement", "Площадка", _ring(20, 0, 8)),
+            HatchPiece("building", "Здание", _ring(30, 0, 4)),
+        ]
+        areas = _areas(pieces, cut=True, omit=True)
+        self.assertAlmostEqual(areas["Газон"], 100.0, places=3)
+        self.assertAlmostEqual(areas["Площадка"], 64.0, places=3)
+        self.assertAlmostEqual(areas["Здание"], 16.0, places=3)
+        self.assertNotIn("Лавки", areas)
+        self.assertNotIn("Посадки", areas)
+
+    def test_omitted_marks_keep_a_playground_typed_as_furniture(self) -> None:
+        pieces = [
+            HatchPiece("green", "Газон", _ring(0, 0, 10)),
+            HatchPiece("furniture", "Детская площадка", _ring(4, 4, 2)),
+            HatchPiece("furniture", "Лавки", _ring(1, 1, 1)),
+            HatchPiece("furniture", "Площадка ТБО", _ring(7, 7, 1)),
+        ]
+        areas = _areas(pieces, cut=False, omit=True)
+        self.assertAlmostEqual(areas["Газон"], 100.0, places=3)
+        self.assertAlmostEqual(areas["Детская площадка"], 4.0, places=3)
+        self.assertNotIn("Лавки", areas)
+        self.assertNotIn("Площадка ТБО", areas)
+
+    def test_omitted_marks_still_let_pavement_cut_ground(self) -> None:
+        pieces = [
+            HatchPiece("green", "Газон", _ring(0, 0, 10)),
+            HatchPiece("pavement", "Тротуар", _ring(4, 4, 2)),
+            HatchPiece("furniture", "Лавки", _ring(1, 1, 1)),
+        ]
+        areas = _areas(pieces, cut=False, omit=True)
+        self.assertAlmostEqual(areas["Газон"], 96.0, places=3)
+        self.assertAlmostEqual(areas["Тротуар"], 4.0, places=3)
+        self.assertNotIn("Лавки", areas)
+
+    def test_half_covered_hole_is_not_filled_completely(self) -> None:
+        half_symbol = [(4.0, 4.0, 0.0), (8.0, 4.0, 0.0), (8.0, 6.0, 0.0), (4.0, 6.0, 0.0)]
+        pieces = [
+            HatchPiece("green", "Газон", _ring(0, 0, 10), [_ring(4, 4, 4)]),
+            HatchPiece("furniture", "Лавки", half_symbol),
+        ]
+        areas = _areas(pieces, cut=False)
+        self.assertAlmostEqual(areas["Газон"], 84.0, places=3)
 
     def test_building_hole_stays_when_symbol_cutout_is_off(self) -> None:
         pieces = [

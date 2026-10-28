@@ -89,8 +89,8 @@ def layer_leaf(name: str) -> str:
     return SHEET_PREFIX_RE.sub("", text).strip() or normalize_name(name)
 
 
-# $INSUNITS. 0 и 6 не трогаем: чертёж уже в метрах. Остальные — только если
-# рёбра слишком длинные для метров. Иначе заголовок врёт, как у файлов в метрах с кодом «мм».
+# $INSUNITS — единственный автоматический источник масштаба. Эвристика по длине
+# сегментов молча меняла настоящие миллиметры на метры на HATCH и мелких чертежах.
 _INSUNITS_TO_M = {
     1: 0.0254,
     2: 0.3048,
@@ -99,12 +99,11 @@ _INSUNITS_TO_M = {
     7: 1000.0,
     14: 0.1,
 }
-def unit_scale(insunits: int, median_segment: float) -> float:
-    """Множитель к метрам. Короткие рёбра оставляем как есть: заголовок часто ошибочен."""
-    factor = _INSUNITS_TO_M.get(int(insunits), 1.0)
-    if factor == 1.0 or median_segment < 50.0:
-        return 1.0
-    return factor
+
+
+def unit_scale(insunits: int, median_segment: float = 0.0) -> float:
+    """Множитель к метрам по $INSUNITS; аргумент оставлен для совместимости вызовов."""
+    return _INSUNITS_TO_M.get(int(insunits), 1.0)
 
 
 def _median_segment_length(document: Drawing) -> float:
@@ -135,7 +134,7 @@ def drawing_to_meters(document: Drawing) -> float:
         code = int(document.header.get("$INSUNITS", 0) or 0)
     except (TypeError, ValueError):
         code = 0
-    scale = unit_scale(code, _median_segment_length(document))
+    scale = unit_scale(code)
     try:
         setattr(document, "_dwgreader_unit_scale", scale)
     except (AttributeError, TypeError):
@@ -270,6 +269,11 @@ def _virtual_block_entities(insert: Insert) -> list[DXFEntity]:
             return []
         return list(insert.virtual_entities())
     except Exception:
+        logging.warning(
+            "Не удалось развернуть блок %s (handle=%s, layer=%s)",
+            insert.dxf.get("name", ""), insert.dxf.get("handle", ""), insert.dxf.get("layer", ""),
+            exc_info=True,
+        )
         return []
 
 
@@ -802,6 +806,28 @@ def _parse_texture_assignment(reply: str, allowed: Mapping[str, str]) -> dict[st
             continue
         assigned[original] = key
     return assigned
+
+
+def resolve_saved_textures(
+    saved: Mapping[str, str] | None,
+    names: Sequence[str],
+) -> tuple[dict[str, str], list[str], bool]:
+    """Карта из разбора: пригодные ключи, слои без записи и был ли сам словарь.
+
+    none уже ответ модели, такой слой повторно не спрашивается.
+    """
+    if saved is None:
+        return {}, [], False
+    usable: dict[str, str] = {}
+    missing: list[str] = []
+    for name in names:
+        if name not in saved:
+            missing.append(name)
+            continue
+        key = str(saved.get(name) or "").strip().lower()
+        if key in SURFACE_TEXTURE_KEYS:
+            usable[name] = key
+    return usable, missing, True
 
 
 def assign_surface_textures(
@@ -1716,7 +1742,7 @@ def _curve_pieces_from_segments(
     for outer, holes, lengths in faces:
         layer = _layer_by_boundary(lengths, layer_to_category)
         category = category_of(layer) if layer else None
-        if not layer or not category:
+        if not layer or not category or category == "fence":
             continue
         if _path_span(outer) > max_span:
             skipped += 1
@@ -1732,6 +1758,24 @@ def _curve_pieces_from_segments(
         if polygon.area < minimum:
             continue
         found.append(HatchPiece(category=category, layer=layer, vertices=ring, holes=hole_rings))
+
+    # Ограждение обычно является открытой линией и не создаёт bounded face.
+    # Сохраняем его узкой полосой, чтобы оно не исчезало и блокировало зоны безопасности.
+    fence_width = max(float(getattr(cfg, "fence_width_m", 0.20)), 0.0)
+    if fence_width > 0.0:
+        for start, end, layer in segments:
+            if category_of(layer) != "fence" or start == end:
+                continue
+            strip = LineString([start, end]).buffer(fence_width * 0.5, cap_style=2, join_style=2)
+            for polygon in _iter_shapely_polygons(strip):
+                if polygon.area <= 0.0:
+                    continue
+                ring = [(float(x), float(y), 0.0) for x, y in list(polygon.exterior.coords)[:-1]]
+                holes = [
+                    [(float(x), float(y), 0.0) for x, y in list(hole.coords)[:-1]]
+                    for hole in polygon.interiors
+                ]
+                found.append(HatchPiece(category="fence", layer=layer, vertices=ring, holes=holes))
     return found, skipped
 
 
@@ -1854,29 +1898,26 @@ def extract_curve_pieces(
 
 
 def _keep_compact_copies(pieces: list[HatchPiece], radius: float) -> list[HatchPiece]:
-    """Одна копия площадки. Листы «Ном.пера» повторяют контур в десятках километров."""
-    if len(pieces) < 2:
-        return pieces
-    radius_sq = radius * radius
-    clusters: list[list[HatchPiece]] = []
-    remaining = list(pieces)
-    while remaining:
-        group = [remaining.pop(0)]
-        changed = True
-        while changed:
-            changed = False
-            next_remaining: list[HatchPiece] = []
-            centers = [_centroid_xy(item.vertices) for item in group]
-            for piece in remaining:
-                cx, cy = _centroid_xy(piece.vertices)
-                if any((cx - ox) ** 2 + (cy - oy) ** 2 <= radius_sq for ox, oy in centers):
-                    group.append(piece)
-                    changed = True
-                else:
-                    next_remaining.append(piece)
-            remaining = next_remaining
-        clusters.append(group)
-    return max(clusters, key=lambda group: sum(_ring_area(item.vertices) for item in group))
+    """Убирает точные дубли на том же слое, сохраняя все независимые участки.
+
+    radius оставлен в сигнатуре для совместимости: расстояние между участками
+    больше не является основанием выбросить целый пространственный кластер.
+    """
+    del radius
+    kept: list[HatchPiece] = []
+    seen: set[tuple[str, str, str]] = set()
+    for piece in pieces:
+        polygons = _piece_polygons(piece)
+        if not polygons:
+            kept.append(piece)
+            continue
+        geometry = unary_union(polygons).normalize()
+        key = (piece.category, normalize_name(piece.layer), geometry.wkb_hex)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(piece)
+    return kept
 
 
 def _path_span(points: Sequence[Sequence[float]]) -> float:
@@ -2186,15 +2227,32 @@ def _polygon_patch(polygon: ShapelyPolygon, color: tuple[float, float, float], m
     )
 
 
-def _is_overlay(category: str | None, _layer: str) -> bool:
-    """Типы «МАФ» и «Посадки» лежат поверх земли, пока галочка вырезания выключена."""
-    if config.settings().cut_vegetation:
+def _is_playground_name(layer: str) -> bool:
+    text = str(layer or "").casefold()
+    if "тбо" in text:
         return False
+    return "площад" in text or "игров" in text or "спорт" in text
+
+
+def _is_symbol(category: str | None) -> bool:
     return category in {"furniture", "vegetation"}
 
 
+def _is_overlay(category: str | None, _layer: str) -> bool:
+    """Типы «МАФ» и «Посадки» не режут землю, пока вырезание выключено или отметки убраны."""
+    if config.settings().omit_symbols:
+        return _is_symbol(category)
+    if config.settings().cut_vegetation:
+        return False
+    return _is_symbol(category)
+
+
 def _without_symbol_holes(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
-    """Дырка газона или покрытия, совпавшая с МАФ или посадкой, перестаёт быть дыркой."""
+    """Закрывает дырку только при её полном покрытии символами.
+
+    Частичное перекрытие оставляет исходную дырку: заполнять непокрытую часть
+    из-за порога в 50 % нельзя.
+    """
     symbols = [
         polygon
         for piece in pieces
@@ -2224,20 +2282,15 @@ def _without_symbol_holes(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
             area = float(hole_polygon.area)
             if area <= 0:
                 continue
-            drop = False
-            try:
-                hits = tree.query(hole_polygon)
-            except Exception:
-                hits = []
-            for index in hits:
+            hits = tree.query(hole_polygon)
+            covering = [symbols[int(index)] for index in hits]
+            covered = False
+            if covering:
                 try:
-                    overlap = float(hole_polygon.intersection(symbols[int(index)]).area)
+                    covered = unary_union(covering).covers(hole_polygon)
                 except Exception:
-                    continue
-                if overlap >= area * 0.5:
-                    drop = True
-                    break
-            if not drop:
+                    logging.warning("Не удалось проверить покрытие дырки на слое %s", piece.layer, exc_info=True)
+            if not covered:
                 kept.append(hole)
         if len(kept) == len(piece.holes):
             cleaned.append(piece)
@@ -2255,6 +2308,7 @@ def arrange_hatch_faces_by_layer(
 
     По умолчанию слои типов «МАФ» и «Посадки» не режут газоны и покрытия:
     они добавляются своим слоем поверх целой площадки.
+    Если отметки убраны, эти слои дырки закрывают и в сцену не попадают.
     """
     pieces = _without_symbol_holes(pieces)
     symbols = [piece for piece in pieces if _is_overlay(piece.category, piece.layer)]
@@ -2262,6 +2316,19 @@ def arrange_hatch_faces_by_layer(
         return _arrange_piece_polygons(pieces)
     base = [piece for piece in pieces if not _is_overlay(piece.category, piece.layer)]
     arranged = _arrange_piece_polygons(base)
+    if config.settings().omit_symbols:
+        kept = [
+            piece for piece in symbols
+            if piece.category == "furniture" and _is_playground_name(piece.layer)
+        ]
+        extra = [
+            (polygon, piece.category, piece.layer)
+            for piece in kept
+            for polygon in _piece_polygons(piece)
+        ]
+        if not extra:
+            return arranged
+        return _merge_arranged([*arranged, *extra])
     extra: list[tuple[BaseGeometry, str, str]] = []
     for piece in symbols:
         for polygon in _piece_polygons(piece):
@@ -2376,6 +2443,7 @@ def _layer_mesh(
         try:
             xy, tri = _earcut_polygon(polygon)
         except Exception:
+            logging.warning("Не удалось триангулировать полигон, bounds=%s", polygon.bounds, exc_info=True)
             continue
         if xy is None or tri is None:
             continue
@@ -2712,6 +2780,7 @@ def _write_layers_json(
     layers: Sequence[str],
     source: Path,
     counts: Mapping[str, Mapping[str, int]] | None = None,
+    textures: Mapping[str, str] | None = None,
 ) -> Path:
     kept = {name for names in groups.values() for name in names}
     selection.by_category = {key: list(names) for key, names in groups.items()}
@@ -2719,9 +2788,69 @@ def _write_layers_json(
     payload = selection.to_dict()
     payload["dxf"] = str(source)
     payload["counts"] = {name: dict(row) for name, row in (counts or {}).items()}
+    if textures is not None:
+        payload["textures"] = {str(name): str(key) for name, key in textures.items()}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def _layers_json_path(folder: Path, source: Path) -> Path:
+    return folder / f"{source.stem}_layers.json"
+
+
+def _read_saved_textures(path: Path) -> dict[str, str] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or "textures" not in payload:
+        return None
+    raw = payload.get("textures")
+    if not isinstance(raw, dict):
+        return None
+    return {str(name): str(key) for name, key in raw.items()}
+
+
+def _store_saved_textures(path: Path, textures: Mapping[str, str]) -> None:
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    payload["textures"] = {str(name): str(key) for name, key in textures.items()}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _textures_for_generation(path: Path, names: Sequence[str]) -> dict[str, str]:
+    """Берёт карту анализа. Модель вызывается только для слоёв, которых в ней нет."""
+    saved = _read_saved_textures(path)
+    usable, missing, found = resolve_saved_textures(saved, names)
+    if not found:
+        _status("Текстуры не назначены, повторите анализ чертежа")
+        print("Текстуры не назначены: в разборе нет карты. Повторите анализ чертежа.")
+        return {}
+    if not missing:
+        return usable
+    try:
+        fresh = assign_surface_textures(missing)
+    except ConnectionError as error:
+        _status("Текстуры не назначены, модель недоступна")
+        print(f"Текстуры не назначены: {error}")
+        return usable
+    merged = dict(saved or {})
+    for name in missing:
+        merged[name] = fresh.get(name, "none")
+    _store_saved_textures(path, merged)
+    usable, _missing, _found = resolve_saved_textures(merged, names)
+    chosen = ", ".join(f"{name}={key}" for name, key in sorted(usable.items()))
+    print(f"Текстуры: {chosen or 'нет'}")
+    return usable
 
 
 GEOMETRY_CACHE_VERSION = 2
@@ -3041,6 +3170,8 @@ def run_pipeline(
 
     selection: LayerSelection | None = None
     layers_json: Path | None = None
+    surface_textures: dict[str, str] = {}
+    classified_here = False
     if by_category is not None and lock_groups:
         groups = _confirmed_groups(by_category)
         _status("Генерация по подтверждённым слоям")
@@ -3061,6 +3192,7 @@ def run_pipeline(
             print(f"Модель недоступна, слои отбираются по именам: {error}")
             selection = LayerSelection(model=cfg.llm_model)
         groups = refine_layer_groups(selection.by_category, layers, entity_totals)
+        classified_here = True
         if llm_down:
             print("Слои отобраны по именам, без ответа модели.")
         print("Отобрано по категориям:")
@@ -3076,8 +3208,25 @@ def run_pipeline(
             counts = {}
         for name, total in entity_totals.items():
             counts.setdefault(name, {"fills": 0, "curves": 0})["entities"] = int(total)
+        texture_map: dict[str, str] | None = None
+        surface_textures: dict[str, str] = {}
+        asked = sorted({name for names in groups.values() for name in names})
+        if asked and not llm_down:
+            try:
+                found = assign_surface_textures(asked)
+            except ConnectionError as error:
+                _status("Текстуры не назначены, модель недоступна")
+                print(f"Текстуры не назначены: {error}")
+            else:
+                texture_map = {name: found.get(name, "none") for name in asked}
+                surface_textures = {
+                    name: key for name, key in texture_map.items() if key in SURFACE_TEXTURE_KEYS
+                }
+                chosen = ", ".join(f"{name}={key}" for name, key in sorted(surface_textures.items()))
+                print(f"Текстуры: {chosen or 'нет'}")
         layers_json = _write_layers_json(
             out / f"{source.stem}_layers.json", selection, groups, layers, source, counts,
+            textures=texture_map,
         )
         print(f"Классификация: {layers_json}")
         _status("Сохранение разбора чертежа")
@@ -3109,8 +3258,11 @@ def run_pipeline(
         prepared = pieces_from_cache(cached, groups, source_mode, geometry_by_layer)
         print(f"Фигур из сохранённого разбора: {len(prepared)}")
     texture_names = sorted({name for names in groups.values() for name in names})
-    surface_textures: dict[str, str] = {}
-    if texture_names:
+    if lock_groups:
+        surface_textures = _textures_for_generation(
+            _layers_json_path(out, source_file), texture_names,
+        )
+    elif not classified_here and texture_names:
         try:
             surface_textures = assign_surface_textures(texture_names)
         except ConnectionError as error:

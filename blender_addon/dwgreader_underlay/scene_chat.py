@@ -25,7 +25,7 @@ from .mcp_bridge import BridgeError, port_open, send_command
 
 
 RESPONSES_URL = "https://api.openai.com/v1/responses"
-MAX_ROUNDS = 6
+MAX_ROUNDS = 12
 MAX_MESSAGES = 30
 _JOB: dict = {"done": False, "error": "", "text": "", "image": "", "tools": [], "entries": []}
 _OUTGOING: list[str] = []
@@ -60,8 +60,17 @@ INSTRUCTIONS = (
     "look показывает текущий вид. execute_blender_code выполняет Python: bpy, bmesh, mathutils. "
     "Библиотеки и генерацию вызывай их инструментами. Если ответ говорит, что сервис выключен, "
     "попроси включить его галочку в панели MCP for Blender. "
-    "Печатай то, что нужно узнать. Делай короткие шаги и смотри результат через look. "
-    "Если к сообщению приложено фото, смотри его: это то, что пользователь просит сделать."
+    "Печатай то, что нужно узнать. Если к сообщению приложено фото, смотри его: это референс задачи. "
+    "Для моделей и объектов важен законченный результат, а не быстрая заглушка: сначала проверь референс, "
+    "пропорции, размеры и посадку, затем создай полноценную геометрию со всеми видимыми частями. "
+    "Используй сглаживание, bevel или subdivision только там, где это нужно форме; не оставляй лишних граней, "
+    "пересечений, неправильных нормалей и случайных материалов. Назначь подходящие материалы и текстуры. "
+    "После построения или импорта обязательно осмотри результат через look, сравни с задачей и исправь заметные "
+    "ошибки формы, пропорций, положения и материалов до финального ответа. Не выдавай черновик за готовую модель. "
+    "Для внешней 3D-генерации используй quality='high', если этот параметр доступен, кроме явной просьбы о черновике. "
+    "Для Meshy по тексту дождись SUCCEEDED preview, затем запусти refine_meshy_job, дождись SUCCEEDED refine и "
+    "импортируй именно текстурированный refine. Импорт preview допустим только по явной просьбе пользователя. "
+    "Для остальных генераторов дождись завершения задачи, импортируй результат и тоже проверь его через look."
 )
 
 _SELECTION_CODE = """
@@ -148,21 +157,21 @@ _COMMANDS = [
     _command("search_polypizza_models", "Поиск низкополигональных моделей Poly Pizza.", {"query": _text("Что искать"), "category": _text("Категория"), "licence": _text("Лицензия"), "animated": _bool("Только анимированные"), "limit": _int("Сколько результатов"), "page": _int("Страница")}, []),
     _command("download_polypizza_model", "Скачать модель Poly Pizza в сцену.", {"model_id": _text("Идентификатор модели"), "normalize_size": _bool("Подогнать размер"), "target_size": {"type": "number", "description": "Целевой размер"}}, ["model_id"]),
     _command("get_hyper3d_status", "Включён ли Hyper3D Rodin.", {}, []),
-    _command("create_rodin_job", "Начать генерацию Hyper3D Rodin.", {"text_prompt": _text("Описание модели"), "bbox_condition": {"type": "array", "items": {"type": "number"}, "description": "Габарит"}}, []),
+    _command("create_rodin_job", "Начать генерацию Hyper3D Rodin.", {"text_prompt": _text("Описание модели"), "bbox_condition": {"type": "array", "items": {"type": "number"}, "description": "Габарит"}, "quality": {"type": "string", "enum": ["standard", "high", "draft"], "description": "high — итоговая модель; draft — только явно запрошенный черновик"}}, []),
     _command("poll_rodin_job_status", "Статус генерации Hyper3D Rodin.", {"subscription_key": _text("Ключ задачи основного сайта"), "request_id": _text("Идентификатор задачи fal")}, []),
     _command("import_generated_asset", "Импортировать готовую модель Hyper3D Rodin.", {"task_uuid": _text("UUID задачи основного сайта"), "request_id": _text("Идентификатор задачи fal"), "name": _text("Имя объекта")}, ["name"]),
     _command("get_hunyuan3d_status", "Включён ли Hunyuan3D.", {}, []),
-    _command("create_hunyuan_job", "Начать генерацию Hunyuan3D.", {"text_prompt": _text("Описание модели"), "image": _text("Путь к картинке"), "quality": _text("Качество, если доступно")}, []),
+    _command("create_hunyuan_job", "Начать генерацию Hunyuan3D.", {"text_prompt": _text("Описание модели"), "image": _text("Путь к картинке"), "quality": {"type": "string", "enum": ["standard", "high"], "description": "Для итоговой модели high"}}, []),
     _command("poll_hunyuan_job_status", "Статус генерации Hunyuan3D.", {"job_id": _text("Идентификатор задачи")}, ["job_id"]),
     _command("import_generated_asset_hunyuan", "Импортировать готовую модель Hunyuan3D.", {"name": _text("Имя объекта"), "zip_file_url": _text("Ссылка на архив результата")}, ["name"]),
     _command("get_tripo_status", "Включён ли Tripo.", {}, []),
-    _command("create_tripo_job", "Начать генерацию Tripo.", {"text_prompt": _text("Описание модели"), "image": _text("Путь к картинке"), "quality": _text("Качество, если доступно")}, []),
+    _command("create_tripo_job", "Начать генерацию Tripo.", {"text_prompt": _text("Описание модели"), "image": _text("Путь к картинке"), "quality": {"type": "string", "enum": ["standard", "high"], "description": "Для итоговой модели high"}}, []),
     _command("poll_tripo_job_status", "Статус генерации Tripo.", {"request_id": _text("Идентификатор задачи")}, ["request_id"]),
     _command("import_generated_asset_tripo", "Импортировать готовую модель Tripo.", {"request_id": _text("Идентификатор задачи"), "name": _text("Имя объекта")}, ["request_id", "name"]),
     _command("get_meshy_status", "Включён ли Meshy.", {}, []),
-    _command("create_meshy_job", "Начать генерацию Meshy по тексту или картинке.", {"text_prompt": _text("Описание модели"), "image": _text("Путь к картинке")}, []),
-    _command("refine_meshy_job", "Наложить текстуру на превью Meshy.", {"preview_task_id": _text("Идентификатор превью")}, ["preview_task_id"]),
-    _command("poll_meshy_job_status", "Статус генерации Meshy.", {"task_id": _text("Идентификатор задачи"), "kind": _text("t2p или i2m")}, ["task_id"]),
+    _command("create_meshy_job", "Начать генерацию Meshy. По тексту создаётся preview без текстур: затем обязателен refine_meshy_job.", {"text_prompt": _text("Описание модели"), "image": _text("Путь к картинке"), "quality": {"type": "string", "enum": ["standard", "high"], "description": "high — детальная геометрия и текстуры 4K, где поддерживается"}}, []),
+    _command("refine_meshy_job", "Обязательный второй этап Meshy по тексту: наложить текстуру на завершённое preview.", {"preview_task_id": _text("Идентификатор превью"), "quality": {"type": "string", "enum": ["standard", "high"], "description": "Должно совпадать с качеством preview"}}, ["preview_task_id"]),
+    _command("poll_meshy_job_status", "Статус генерации Meshy.", {"task_id": _text("Идентификатор задачи"), "kind": _text("t2p — preview, t2r — текстурированный refine, i2m — изображение")}, ["task_id"]),
     _command("import_generated_asset_meshy", "Импортировать готовую модель Meshy.", {"name": _text("Имя объекта"), "model_url": _text("Ссылка на модель")}, ["name"]),
 ]
 
@@ -495,6 +504,8 @@ def _feature_for(raw: str) -> str | None:
     for where in (piece.lower() for piece in pieces):
         if "prompt_cache_key" in where:
             return "prompt_cache_key"
+        if "effort" in where:
+            return "reasoning_effort"
         if "summary" in where:
             return "reasoning_summary"
         if where.startswith("include") or "encrypted_content" in where:
@@ -517,8 +528,13 @@ def _request_payload(model: str, items: list) -> dict:
         "store": False,
         "stream": True,
     }
+    reasoning = {}
+    if "reasoning_effort" not in _DISABLED:
+        reasoning["effort"] = "high"
     if "reasoning_summary" not in _DISABLED:
-        body["reasoning"] = {"summary": "auto"}
+        reasoning["summary"] = "auto"
+    if reasoning:
+        body["reasoning"] = reasoning
     if "include" not in _DISABLED:
         body["include"] = ["reasoning.encrypted_content"]
     if "prompt_cache_key" not in _DISABLED:
@@ -839,7 +855,7 @@ def _run_tool(name: str, args: dict) -> tuple[str, str | None]:
             folder = Path(tempfile.gettempdir()) / "dwgreader_chat"
             folder.mkdir(exist_ok=True)
             path = folder / f"viewport_{int(time.time() * 1000)}.png"
-            size = int(args.get("max_size") or 800)
+            size = max(512, min(2048, int(args.get("max_size") or 1400)))
             send_command("get_viewport_screenshot", {"max_size": size, "filepath": str(path), "format": "png"})
             if not path.is_file():
                 return "Снимок не записан", None
@@ -1367,6 +1383,23 @@ def complete_turn(
         _TRANSCRIPT = recorded
 
 
+def release_turn() -> None:
+    """Гасит «Думаю» после отката. Указатель сцены к этому моменту уже мог умереть."""
+    _JOB["done"] = False
+    _LIVE["text"] = ""
+    _LIVE["tool"] = ""
+    _LIVE["tools"] = []
+    _LIVE["summary"] = ""
+    _LIVE["image"] = ""
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        return
+    try:
+        scene.dwgreader_chat_busy = False
+    except ReferenceError:
+        pass
+
+
 def load_log(scene) -> list:
     try:
         payload = json.loads(scene.dwgreader_chat_log or "[]")
@@ -1506,10 +1539,13 @@ def _finish_timer():
     scene = bpy.context.scene if bpy.context else None
     if scene is None:
         return None
-    if not _JOB.get("done"):
-        _redraw_view()
-        return 0.4
-    scene.dwgreader_chat_busy = False
+    try:
+        if not _JOB.get("done"):
+            _redraw_view()
+            return 0.4
+        scene.dwgreader_chat_busy = False
+    except ReferenceError:
+        return None
     items = load_log(scene)
     entries = [entry for entry in (_JOB.get("entries") or []) if isinstance(entry, dict)]
     if _JOB.get("error"):
@@ -1617,8 +1653,9 @@ class DWGREADER_OT_chat_send(Operator):
         history.append({"role": "user", "text": text, "images": images})
         save_log(scene, history)
         _clear_draft(scene)
-        scene.dwgreader_chat_busy = True
         scene.dwgreader_status = "Запрос к ChatGPT…" if chatgpt else "Запрос к модели…"
+        scene_changes.arm(scene)
+        scene.dwgreader_chat_busy = True
         _CANCEL.clear()
         _JOB["done"] = False
         _JOB["tools"] = []
@@ -1627,7 +1664,6 @@ class DWGREADER_OT_chat_send(Operator):
         _LIVE["tool"] = ""
         _LIVE["tools"] = []
         _LIVE["summary"] = ""
-        scene_changes.arm(scene)
         threading.Thread(
             target=_worker,
             args=(token, chosen_model(prefs), history[:-1], text, images, api),

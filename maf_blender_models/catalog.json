@@ -51,48 +51,330 @@
     "id": "play_01",
     "family": "playground",
     "placement": "area",
+    "playground_type": "children",
     "file": "Детский комплекс_1.glb",
     "name": "Детский комплекс 1",
-    "footprint": [6.13, 1.61, 2.84]
+    "footprint": [6.13, 1.61, 2.84],
+    "motion": "slide",
+    "clearance": [2.39, 2.39, 2.39, 4.39]
   },
   {
     "id": "play_02",
     "family": "playground",
     "placement": "area",
+    "playground_type": "children",
     "file": "Детский комплекс_2.glb",
     "name": "Детский комплекс 2",
-    "footprint": [2.81, 4.18, 2.5]
+    "footprint": [2.81, 4.18, 2.5],
+    "motion": "static",
+    "clearance": [2.17, 2.17, 2.17, 2.17]
   },
   {
     "id": "play_03",
     "family": "playground",
     "placement": "area",
+    "playground_type": "children",
     "file": "Детский комплекс_3.glb",
     "name": "Детский комплекс 3",
-    "footprint": [1.4, 1.4, 2.57]
+    "footprint": [1.4, 1.4, 2.57],
+    "motion": "static",
+    "clearance": [2.21, 2.21, 2.21, 2.21]
   },
   {
     "id": "play_big",
     "family": "playground",
     "placement": "area",
+    "playground_type": "sports",
     "file": "детский спортивный комплекс большой .glb",
     "name": "Спортивный комплекс",
-    "footprint": [9.38, 11.26, 5.98]
+    "footprint": [9.38, 11.26, 5.98],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
   },
   {
     "id": "swing_01",
     "family": "playground",
     "placement": "area",
+    "playground_type": "children",
     "file": "качель .glb",
     "name": "Качели",
-    "footprint": [3.71, 6.13, 2.64]
+    "footprint": [3.71, 6.13, 2.64],
+    "motion": "swing",
+    "clearance": [2.0, 2.0, 1.5, 1.5]
   },
   {
     "id": "swing_round",
     "family": "playground",
     "placement": "area",
+    "playground_type": "children",
     "file": "качель круглая.glb",
     "name": "Круглые качели",
-    "footprint": [1.51, 1.51, 0.87]
+    "footprint": [1.51, 1.51, 0.87],
+    "motion": "swing",
+    "clearance": [2.0, 2.0, 2.0, 2.0]
+  },
+  {
+    "id": "play_04",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_1.glb",
+    "name": "Игровой комплекс 1",
+    "footprint": [4.121, 6.483, 3.889],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_05",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_2.glb",
+    "name": "Игровой комплекс 2",
+    "footprint": [7.756, 4.833, 3.911],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_06",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_3.glb",
+    "name": "Игровой комплекс 3",
+    "footprint": [4.385, 5.727, 3.359],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_07",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_4.glb",
+    "name": "Игровой комплекс 4",
+    "footprint": [9.196, 4.491, 3.911],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_08",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_5.glb",
+    "name": "Игровой комплекс 5",
+    "footprint": [10.235, 6.628, 2.553],
+    "motion": "static",
+    "clearance": [2.202, 2.202, 2.202, 2.202]
+  },
+  {
+    "id": "play_09",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_6.glb",
+    "name": "Игровой комплекс 6",
+    "footprint": [5.027, 4.559, 2.733],
+    "motion": "static",
+    "clearance": [2.322, 2.322, 2.322, 2.322]
+  },
+  {
+    "id": "play_10",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_7.glb",
+    "name": "Игровой комплекс 7",
+    "footprint": [4.117, 2.863, 3.492],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_11",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_8.glb",
+    "name": "Игровой комплекс 8",
+    "footprint": [4.292, 4.88, 3.857],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_12",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_9.glb",
+    "name": "Игровой комплекс 9",
+    "footprint": [7.177, 7.185, 3.881],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_13",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_10.glb",
+    "name": "Игровой комплекс 10",
+    "footprint": [7.177, 7.185, 3.881],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_14",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_11.glb",
+    "name": "Игровой комплекс 11",
+    "footprint": [4.112, 6.294, 3.971],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_15",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_12.glb",
+    "name": "Игровой комплекс 12",
+    "footprint": [4.276, 5.718, 3.661],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_16",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_13.glb",
+    "name": "Игровой комплекс 13",
+    "footprint": [6.722, 6.969, 4.148],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "play_17",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Игровой комплекс_14.glb",
+    "name": "Игровой комплекс 14",
+    "footprint": [5.304, 4.441, 3.038],
+    "motion": "static",
+    "clearance": [2.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "slide_01",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "горка.glb",
+    "name": "Горка 1",
+    "footprint": [3.479, 1.463, 3.857],
+    "motion": "slide",
+    "clearance": [4.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "slide_02",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "горка_2.glb",
+    "name": "Горка 2",
+    "footprint": [4.127, 2.91, 3.857],
+    "motion": "slide",
+    "clearance": [4.5, 2.5, 2.5, 2.5]
+  },
+  {
+    "id": "sandbox_01",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Песочница.glb",
+    "name": "Песочница",
+    "footprint": [2.206, 2.207, 1.888],
+    "motion": "static",
+    "clearance": [1.759, 1.759, 1.759, 1.759]
+  },
+  {
+    "id": "house_01",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "домик.glb",
+    "name": "Домик",
+    "footprint": [1.378, 1.362, 2.342],
+    "motion": "static",
+    "clearance": [2.061, 2.061, 2.061, 2.061]
+  },
+  {
+    "id": "rocker_01",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Качалка_1.glb",
+    "name": "Качалка 1",
+    "footprint": [0.762, 0.442, 0.957],
+    "motion": "static",
+    "clearance": [1.5, 1.5, 1.5, 1.5]
+  },
+  {
+    "id": "rocker_02",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Качалка_2.glb",
+    "name": "Качалка 2",
+    "footprint": [0.658, 0.475, 0.857],
+    "motion": "static",
+    "clearance": [1.5, 1.5, 1.5, 1.5]
+  },
+  {
+    "id": "rocker_03",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Качалка_3.glb",
+    "name": "Качалка 3",
+    "footprint": [1.337, 0.411, 0.969],
+    "motion": "static",
+    "clearance": [1.5, 1.5, 1.5, 1.5]
+  },
+  {
+    "id": "rocker_04",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "Качалка_4.glb",
+    "name": "Качалка 4",
+    "footprint": [0.492, 2.154, 1.099],
+    "motion": "static",
+    "clearance": [1.5, 1.5, 1.5, 1.5]
+  },
+  {
+    "id": "swing_02",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "качель_1.glb",
+    "name": "Качели 2",
+    "footprint": [1.531, 3.529, 2.378],
+    "motion": "swing",
+    "clearance": [2.0, 2.0, 1.5, 1.5]
+  },
+  {
+    "id": "swing_03",
+    "family": "playground",
+    "placement": "area",
+    "playground_type": "children",
+    "file": "качель_2.glb",
+    "name": "Качели 3",
+    "footprint": [1.864, 3.428, 3.271],
+    "motion": "swing",
+    "clearance": [2.0, 2.0, 1.5, 1.5]
   }
 ]

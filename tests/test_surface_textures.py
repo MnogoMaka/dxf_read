@@ -50,6 +50,7 @@ from dxf_read.dxf import (  # noqa: E402
     _parse_texture_assignment,
     build_texture_prompt,
     normalize_name,
+    resolve_saved_textures,
 )
 
 
@@ -63,11 +64,11 @@ class SurfaceTextureTests(unittest.TestCase):
             self.assertIsNone(key(name), name)
 
     def test_tile_size_and_files(self) -> None:
-        self.assertEqual(build_scene.SURFACE_TEXTURES["grass"], ("grass.jpg", 4.0))
-        self.assertEqual(build_scene.SURFACE_TEXTURES["asphalt"], ("asphalt.png", 2.0))
-        self.assertEqual(build_scene.SURFACE_TEXTURES["tile"], ("pavers.jpg", 2.0))
-        self.assertEqual(build_scene.SURFACE_TEXTURES["sidewalk"], ("sidewalk.jpg", 2.0))
-        self.assertEqual(build_scene.SURFACE_TEXTURES["rubber"], ("rubber.jpg", 2.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["grass"], ("grass.jpg", 16.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["asphalt"], ("asphalt.png", 8.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["tile"], ("pavers.jpg", 8.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["sidewalk"], ("sidewalk.jpg", 8.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["rubber"], ("rubber.jpg", 8.0))
         names = {item[0] for item in build_scene.SURFACE_TEXTURES.values()}
         self.assertNotIn("асфальт1.jpg", names)
 
@@ -115,3 +116,16 @@ class TexturePromptTests(unittest.TestCase):
                 "Резина": "rubber",
             },
         )
+
+    def test_saved_map_skips_known_layers_including_none(self) -> None:
+        usable, missing, found = resolve_saved_textures(
+            {"Газон": "grass", "Борт": "none"},
+            ["Газон", "Борт", "Плитка"],
+        )
+        self.assertTrue(found)
+        self.assertEqual(usable, {"Газон": "grass"})
+        self.assertEqual(missing, ["Плитка"])
+        usable, missing, found = resolve_saved_textures(None, ["Газон"])
+        self.assertFalse(found)
+        self.assertEqual(usable, {})
+        self.assertEqual(missing, [])

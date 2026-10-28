@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import struct
@@ -18,7 +19,7 @@ import bpy
 from bpy.props import EnumProperty, StringProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper
-from mathutils import Matrix
+from mathutils import Euler, Matrix, Vector
 
 
 # Recommended names first; the old names remain supported for compatibility.
@@ -576,6 +577,7 @@ BUILDING_COLLECTION = "SITE_BUILDING"
 BUILDING_BLEND = "Building 2.0.blend"
 BUILDING_GROUP = "1_Building"
 BUILDING_SOURCE = "Circle"
+DEFAULT_BUILDING_PRESET = "main001"
 _SETTING_LABELS = {"Колчисетво этажей": "Количество этажей", "Тип модуля": "Номер формы"}
 _SKIP_COLLECTIONS = ("SITE_BUILDING", "SITE_PLACEMENT", "SITE_LIBRARY")
 
@@ -1230,6 +1232,8 @@ def preset_label(obj) -> str:
 def apply_preset(obj, key: str) -> None:
     values = next(item[2] for item in BUILDING_PRESETS if item[0] == key)
     modifier = building_modifier(obj)
+    if modifier is None:
+        return
     inputs = modifier.properties.inputs
     for ident, value in values.items():
         socket = getattr(inputs, ident, None)
@@ -1264,10 +1268,27 @@ def _exclude_collection(scene, collection) -> None:
         walk(view_layer.layer_collection)
 
 
+def _is_building_group(name: str) -> bool:
+    """Повторная загрузка файла дома даёт «1_Building.001», это тот же граф."""
+    text = str(name or "")
+    return text == BUILDING_GROUP or text.startswith(f"{BUILDING_GROUP}.")
+
+
 def building_modifier(obj):
-    for modifier in getattr(obj, "modifiers", []):
+    modifiers = list(getattr(obj, "modifiers", []))
+    for modifier in modifiers:
         group = getattr(modifier, "node_group", None)
-        if modifier.type == "NODES" and group is not None and group.name == BUILDING_GROUP:
+        if modifier.type == "NODES" and group is not None and _is_building_group(group.name):
+            return modifier
+    try:
+        marked = bool(obj.get("dwgreader_building"))
+    except ReferenceError:
+        return None
+    if not marked:
+        return None
+    for modifier in modifiers:
+        group = getattr(modifier, "node_group", None)
+        if modifier.type == "NODES" and group is not None:
             return modifier
     return None
 
@@ -1280,14 +1301,14 @@ def buildings_in(scene) -> list:
 
 
 def chosen_building(context):
-    """Выделенный дом. Если дом в сцене один, панель меняет его и без выделения."""
+    """Выделенный дом. Если выделен не дом, панель открывает последний поставленный."""
     active = context.view_layer.objects.active if context.view_layer is not None else None
     if active is not None and building_modifier(active) is not None:
         return active
     found = buildings_in(context.scene)
-    if len(found) == 1:
-        return found[0]
-    return None
+    if not found:
+        return None
+    return found[-1]
 
 
 def draw_controls(layout, context) -> None:
@@ -1307,12 +1328,16 @@ def draw_controls(layout, context) -> None:
     box.operator_menu_enum("dwgreader.building_preset", "kind", text=preset_label(obj))
     hint = box.column(align=True)
     hint.scale_y = 0.75
-    hint.label(text="Список меняет форму целиком. Круглая башня")
-    hint.label(text="стоит сразу: номер формы сам по себе её не сменяет.")
+    hint.label(text="Список меняет форму целиком. Новый дом — «Дом 1».")
+    hint.label(text="Номер формы сам по себе тип не сменяет.")
     if len(found) > 1:
         note = box.column(align=True)
         note.scale_y = 0.75
-        note.label(text="Меняется только выделенный дом.")
+        active = context.view_layer.objects.active if context.view_layer is not None else None
+        if active is obj:
+            note.label(text="Меняется только выделенный дом.")
+        else:
+            note.label(text="Выделите дом, чтобы менять именно его.")
     column = box.column(align=True)
     titled = False
     for item in modifier.node_group.interface.items_tree:
@@ -1397,20 +1422,98 @@ def _placement_spot(context) -> tuple[float, float, float]:
     return _cursor(context.scene)
 
 
-def place_building(context):
-    """Один дом в центр выделенного полигона. Повтор копирует уже стоящий дом."""
+def _mesh_faces(obj, edit: bool):
+    """Мировые вершины и грани выделенного полигона. В режиме объекта — весь меш."""
+    if edit and obj.mode == "EDIT":
+        import bmesh
+
+        mesh = bmesh.from_edit_mesh(obj.data)
+        faces = [face for face in mesh.faces if face.select]
+        if not faces:
+            return [], []
+        world = obj.matrix_world
+        vertices: list[tuple[float, float, float]] = []
+        index_of: dict[int, int] = {}
+        polygons: list[tuple[int, ...]] = []
+        for face in faces:
+            polygon = []
+            for vertex in face.verts:
+                if vertex.index not in index_of:
+                    index_of[vertex.index] = len(vertices)
+                    point = world @ vertex.co
+                    vertices.append((float(point.x), float(point.y), float(point.z)))
+                polygon.append(index_of[vertex.index])
+            polygons.append(tuple(polygon))
+        return vertices, polygons
+    if obj.data is None or not obj.data.polygons:
+        return [], []
+    world = obj.matrix_world
+    vertices = [tuple(float(point) for point in (world @ vertex.co)) for vertex in obj.data.vertices]
+    polygons = [tuple(int(index) for index in polygon.vertices) for polygon in obj.data.polygons]
+    return vertices, polygons
+
+
+def _islands(vertices, faces):
+    from .placement_math import face_groups
+
+    islands = []
+    for group in face_groups(faces):
+        remap: dict[int, int] = {}
+        island_vertices: list[tuple[float, float, float]] = []
+        island_faces: list[tuple[int, ...]] = []
+        for face_index in group:
+            polygon = []
+            for index in faces[face_index]:
+                if index not in remap:
+                    remap[index] = len(island_vertices)
+                    island_vertices.append(vertices[index])
+                polygon.append(remap[index])
+            island_faces.append(tuple(polygon))
+        if len(island_vertices) >= 3 and island_faces:
+            islands.append((island_vertices, island_faces))
+    return islands
+
+
+def _selected_islands(context):
+    active = context.view_layer.objects.active if context.view_layer is not None else None
+    ordered = []
+    if active is not None:
+        ordered.append(active)
+    for obj in list(getattr(context, "selected_objects", []) or []):
+        if obj not in ordered:
+            ordered.append(obj)
+    edit = getattr(context, "mode", "") == "EDIT_MESH"
+    found = []
+    for obj in ordered:
+        if obj.type != "MESH" or building_modifier(obj) is not None or _blocked_collection(obj):
+            continue
+        vertices, faces = _mesh_faces(obj, edit and obj == active)
+        found.extend(_islands(vertices, faces))
+    return found
+
+
+def _mark_building(obj):
+    obj["dwgreader_building"] = True
+    return obj
+
+
+def _spawn_building(context, template=None):
     scene = context.scene
     root = _building_collection(scene)
-    spot = _placement_spot(context)
+    if template is not None:
+        copy = template.copy()
+        copy.data = template.data
+        copy.name = "Здание"
+        root.objects.link(copy)
+        return _mark_building(copy)
     existing = [obj for obj in root.objects if building_modifier(obj) is not None]
     if existing:
         source = chosen_building(context) or existing[-1]
         copy = source.copy()
         copy.data = source.data
-        copy.location = spot
         copy.name = "Здание"
         root.objects.link(copy)
-        return copy
+        return _mark_building(copy)
     path = blend_path()
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -1423,15 +1526,326 @@ def place_building(context):
     if not created:
         raise RuntimeError("В файле здания нет объекта дома")
     obj = created[0]
-    obj.location = spot
     obj.name = "Здание"
     root.objects.link(obj)
+    _mark_building(obj)
     for collection in data_to.collections:
         if collection is None or collection.name in {child.name for child in root.children}:
             continue
         root.children.link(collection)
         _exclude_collection(scene, collection)
     return obj
+
+
+def _use_house_preset(obj) -> None:
+    """Файл здания открывается круглой башней. Для контура нужен обычный дом."""
+    if preset_label(obj) == "Круглая башня":
+        apply_preset(obj, DEFAULT_BUILDING_PRESET)
+
+
+def _boundary_loops(faces: list[tuple[int, ...]]) -> list[list[int]]:
+    """Внешние рёбра полигона, по одному замкнутому контуру."""
+    counts: dict[tuple[int, int], int] = {}
+    for face in faces:
+        count = len(face)
+        for index in range(count):
+            a = face[index]
+            b = face[(index + 1) % count]
+            key = (a, b) if a < b else (b, a)
+            counts[key] = counts.get(key, 0) + 1
+    neighbors: dict[int, list[int]] = {}
+    unused: set[tuple[int, int]] = set()
+    for (a, b), count in counts.items():
+        if count != 1:
+            continue
+        neighbors.setdefault(a, []).append(b)
+        neighbors.setdefault(b, []).append(a)
+        unused.add((a, b))
+    loops: list[list[int]] = []
+    while unused:
+        a, b = unused.pop()
+        loop = [a, b]
+        previous, current = a, b
+        while True:
+            nxt = next((item for item in neighbors.get(current, []) if item != previous), None)
+            if nxt is None:
+                break
+            key = (current, nxt) if current < nxt else (nxt, current)
+            if key not in unused:
+                break
+            if nxt == loop[0]:
+                unused.discard(key)
+                break
+            unused.discard(key)
+            loop.append(nxt)
+            previous, current = current, nxt
+            if len(loop) > len(counts) + 2:
+                break
+        if len(loop) >= 3:
+            loops.append(loop)
+    return loops
+
+
+def _ring_area(points: list[tuple[float, float, float]]) -> float:
+    area = 0.0
+    count = len(points)
+    for index in range(count):
+        x1, y1 = points[index][0], points[index][1]
+        x2, y2 = points[(index + 1) % count][0], points[(index + 1) % count][1]
+        area += x1 * y2 - x2 * y1
+    return area * 0.5
+
+
+def _oriented_loops(vertices, faces, origin) -> list[list[tuple[float, float, float]]]:
+    """Внешний контур против часовой, дыры по часовой. Координаты в метрах от центроида."""
+    cx, cy = float(origin[0]), float(origin[1])
+    rings: list[list[tuple[float, float, float]]] = []
+    for loop in _boundary_loops(faces):
+        points = []
+        for vertex_index in loop:
+            x, y, _z = vertices[vertex_index]
+            points.append((float(x) - cx, float(y) - cy, 0.0))
+        if abs(_ring_area(points)) > 1e-6:
+            rings.append(points)
+    if not rings:
+        return []
+    rings.sort(key=lambda points: abs(_ring_area(points)), reverse=True)
+    outer = rings[0]
+    if _ring_area(outer) < 0:
+        outer = list(reversed(outer))
+    holes = []
+    for hole in rings[1:]:
+        if _ring_area(hole) > 0:
+            hole = list(reversed(hole))
+        holes.append(hole)
+    return [outer, *holes]
+
+
+def _footprint_mesh(loops: list[list[tuple[float, float, float]]]):
+    """Грань внешнего контура и рёбра дыр. Диагоналей нет, нода читает сам контур."""
+    verts: list[tuple[float, float, float]] = [point for loop in loops for point in loop]
+    edges: list[tuple[int, int]] = []
+    start = len(loops[0])
+    for loop in loops[1:]:
+        count = len(loop)
+        for index in range(count):
+            edges.append((start + index, start + (index + 1) % count))
+        start += count
+    mesh = bpy.data.meshes.new("Здание.след")
+    mesh.from_pydata(verts, edges, [tuple(range(len(loops[0])))])
+    mesh.update()
+    return mesh
+
+
+def _prism_mesh(loops: list[list[tuple[float, float, float]]]):
+    """Высокая призма контура с дырами. По ней дом обрезается в плане, не по высоте."""
+    from mathutils.geometry import tessellate_polygon
+
+    flat: list[Vector] = []
+    vectors: list[list[Vector]] = []
+    for loop in loops:
+        ring = [Vector((point[0], point[1], 0.0)) for point in loop]
+        vectors.append(ring)
+        flat.extend(ring)
+    triangles = tessellate_polygon(vectors)
+    if not triangles:
+        return None
+    count = len(flat)
+    verts = [(point.x, point.y, -50.0) for point in flat]
+    verts.extend((point.x, point.y, 500.0) for point in flat)
+    faces: list[tuple[int, ...]] = []
+    for tri in triangles:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        faces.append((a, c, b))
+        faces.append((a + count, b + count, c + count))
+    offset = 0
+    for index, loop in enumerate(loops):
+        size = len(loop)
+        for step in range(size):
+            nxt = (step + 1) % size
+            bottom0 = offset + step
+            bottom1 = offset + nxt
+            top0 = bottom0 + count
+            top1 = bottom1 + count
+            if index == 0:
+                faces.append((bottom0, bottom1, top1, top0))
+            else:
+                faces.append((bottom0, top0, top1, bottom1))
+        offset += size
+    mesh = bpy.data.meshes.new("Здание.призма")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    _outward_normals(mesh)
+    return mesh
+
+
+def _outward_normals(mesh) -> None:
+    import bmesh
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    if bm.calc_volume(signed=True) < 0:
+        bmesh.ops.reverse_faces(bm, faces=bm.faces)
+    bm.to_mesh(mesh)
+    bm.free()
+
+
+def _drop_clip(obj) -> None:
+    for modifier in list(obj.modifiers):
+        if modifier.type == "BOOLEAN" and modifier.name == "Полигон":
+            obj.modifiers.remove(modifier)
+    for child in list(obj.children):
+        if not child.name.startswith("Здание.контур"):
+            continue
+        mesh = child.data
+        bpy.data.objects.remove(child, do_unlink=True)
+        if mesh is not None and getattr(mesh, "users", 1) == 0 and isinstance(mesh, bpy.types.Mesh):
+            bpy.data.meshes.remove(mesh)
+
+
+def _clip_to_polygon(obj, loops: list[list[tuple[float, float, float]]]) -> None:
+    """Пересечение с призмой контура. Свес и двор срезаются, этажи остаются."""
+    _drop_clip(obj)
+    collection = next(iter(obj.users_collection), None)
+    if collection is None:
+        return
+    mesh = _prism_mesh(loops)
+    if mesh is None:
+        return
+    cutter = bpy.data.objects.new("Здание.контур", mesh)
+    collection.objects.link(cutter)
+    cutter.parent = obj
+    cutter.matrix_parent_inverse.identity()
+    cutter.location = (0.0, 0.0, 0.0)
+    cutter.rotation_euler = (0.0, 0.0, 0.0)
+    cutter.scale = (1.0, 1.0, 1.0)
+    cutter.hide_render = True
+    cutter.hide_select = True
+    try:
+        cutter.hide_set(True)
+    except Exception:
+        pass
+    modifier = obj.modifiers.new("Полигон", "BOOLEAN")
+    modifier.operation = "INTERSECT"
+    modifier.object = cutter
+    solvers = {item.identifier for item in modifier.bl_rna.properties["solver"].enum_items}
+    modifier.solver = "MANIFOLD" if "MANIFOLD" in solvers else "FLOAT"
+
+
+def _apply_polygon(obj, vertices, faces, origin, height: float) -> None:
+    """След дома — сам полигон в метрах. Масштаб X и Y равен 1, высота не меняется."""
+    loops = _oriented_loops(vertices, faces, origin)
+    cx, cy = float(origin[0]), float(origin[1])
+    if loops:
+        mesh = _footprint_mesh(loops)
+        previous = obj.data
+        obj.data = mesh
+        if previous is not None and previous.users == 0:
+            bpy.data.meshes.remove(previous)
+    kept_z = float(obj.scale.z)
+    obj.location = (cx, cy, float(height))
+    obj.rotation_euler = Euler((obj.rotation_euler.x, obj.rotation_euler.y, 0.0), "XYZ")
+    obj.scale = (1.0, 1.0, kept_z)
+    if loops:
+        _clip_to_polygon(obj, loops)
+
+
+def place_building(context):
+    """Дом повторяет контур выделенного полигона. Без полигона — один дом в 3D-курсор."""
+    islands = _selected_islands(context)
+    if not islands:
+        obj = _spawn_building(context)
+        _use_house_preset(obj)
+        obj.location = _cursor(context.scene)
+        return [obj]
+    return _place_islands(context, islands)
+
+
+def _place_islands(context, islands, template=None, auto: bool = False):
+    from .placement_math import polygon_centroid_xy
+
+    made = []
+    for vertices, faces in islands:
+        centroid = polygon_centroid_xy(vertices, faces)
+        if centroid is None:
+            origin = (vertices[0][0], vertices[0][1])
+            height = float(vertices[0][2])
+        else:
+            origin = (float(centroid[0]), float(centroid[1]))
+            height = float(centroid[2])
+        obj = _spawn_building(context, template)
+        if auto:
+            apply_preset(obj, DEFAULT_BUILDING_PRESET)
+        else:
+            _use_house_preset(obj)
+        template = obj
+        _apply_polygon(obj, vertices, faces, origin, height)
+        if auto:
+            obj["dwgreader_auto"] = True
+        made.append(obj)
+    return made
+
+
+def clear_auto_buildings() -> None:
+    """Удаляет дома прошлой авторасстановки. Дом, поставленный кнопкой, остаётся."""
+    collection = bpy.data.collections.get(BUILDING_COLLECTION)
+    if collection is None:
+        return
+    for obj in list(collection.objects):
+        try:
+            auto = bool(obj.get("dwgreader_auto"))
+        except ReferenceError:
+            continue
+        if not auto:
+            continue
+        _drop_clip(obj)
+        mesh = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh is not None and getattr(mesh, "users", 1) == 0 and isinstance(mesh, bpy.types.Mesh):
+            bpy.data.meshes.remove(mesh)
+
+
+def place_auto_buildings(context) -> str:
+    """Дом на каждый полигон зданий подложки. Сбой одного полигона не останавливает остальные."""
+    scene = getattr(context, "scene", None)
+    if scene is None or not bool(getattr(scene, "dwgreader_auto_buildings", False)):
+        return ""
+    from .build_scene import ROOT_NAME
+
+    root = bpy.data.collections.get(ROOT_NAME)
+    if root is None:
+        return ""
+    made = 0
+    template = None
+    for source in list(root.all_objects):
+        if source.type != "MESH" or str(source.get("category") or "") != "building":
+            continue
+        if getattr(source, "data", None) is None or not source.data.polygons:
+            continue
+        vertices, faces = _mesh_faces(source, False)
+        for island in _islands(vertices, faces):
+            try:
+                built = _place_islands(context, [island], template, auto=True)
+            except Exception:
+                logging.warning("Не удалось построить здание из %s", source.name, exc_info=True)
+                continue
+            if not built:
+                continue
+            template = built[-1]
+            made += len(built)
+    if made <= 0:
+        return ""
+    view_layer = getattr(context, "view_layer", None)
+    if template is not None and view_layer is not None:
+        try:
+            for item in list(context.selected_objects):
+                item.select_set(False)
+            template.select_set(True)
+            view_layer.objects.active = template
+        except (AttributeError, ReferenceError):
+            logging.warning("Не удалось выделить поставленный дом", exc_info=True)
+    return f"здания {made}"
 
 
 class DWGREADER_OT_building_preset(Operator):
@@ -1466,7 +1880,7 @@ class DWGREADER_OT_building_preset(Operator):
 class DWGREADER_OT_place_building(Operator):
     bl_idname = "dwgreader.place_building"
     bl_label = "Поставить здание"
-    bl_description = "Ставит дом в центр выделенного полигона. Без полигона — в 3D-курсор"
+    bl_description = "Ставит дом по контуру выделенного полигона. Без полигона — в 3D-курсор"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1474,16 +1888,21 @@ class DWGREADER_OT_place_building(Operator):
             self.report({"ERROR"}, "В аддоне нет файла здания")
             return {"CANCELLED"}
         try:
-            obj = place_building(context)
+            made = place_building(context)
         except Exception as error:
             self.report({"ERROR"}, f"Не удалось поставить здание: {error}")
             return {"CANCELLED"}
         for item in list(context.selected_objects):
             item.select_set(False)
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-        context.scene.dwgreader_status = "Здание поставлено. Параметры ниже меняют выделенный дом"
-        self.report({"INFO"}, "Здание поставлено")
+        for obj in made:
+            obj.select_set(True)
+        context.view_layer.objects.active = made[-1]
+        if len(made) == 1:
+            note = "Здание поставлено. Параметры ниже меняют выделенный дом"
+        else:
+            note = f"Здания поставлены: {len(made)}. Параметры ниже меняют выделенный дом"
+        context.scene.dwgreader_status = note
+        self.report({"INFO"}, note)
         return {"FINISHED"}
 
 

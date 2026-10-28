@@ -1814,22 +1814,32 @@ def _move(delta_row: int, delta_col: int, extend: bool = False) -> None:
 def _apply_changes(context, checkpoint: str, mode: str) -> None:
     from . import scene_changes
 
-    scene = getattr(context, "scene", None)
-    if scene is None or not checkpoint:
+    if not checkpoint:
         return
     if mode == "undone":
         scene_changes.revert(checkpoint)
     else:
         scene_changes.keep(checkpoint)
     chat = _chat()
-    items = chat.load_log(scene)
+    if mode == "undone":
+        chat.release_turn()
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        return
+    try:
+        items = chat.load_log(scene)
+    except ReferenceError:
+        return
     for item in items:
         if item.get("role") == "changes" and str(item.get("checkpoint") or "") == checkpoint:
             item["resolved"] = mode
             if mode == "undone":
                 item["text"] = "Откатили"
                 item["lines"] = []
-    chat.save_log(scene, items)
+    try:
+        chat.save_log(scene, items)
+    except ReferenceError:
+        return
     _FRAME["key"] = None
 
 
