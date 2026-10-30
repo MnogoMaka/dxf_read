@@ -99,6 +99,9 @@ _UI = {
     "photos": [],
     "caret_at": 0.0,
     "changes_open": set(),
+    "history": False,
+    "history_scroll": 0.0,
+    "history_max": 0.0,
 }
 
 
@@ -781,6 +784,97 @@ def _draw_changes(row: dict, x: float, bottom: float, scale: float, size: int, s
         _hit(hits, f"undo:{checkpoint}", (undo_x, button_y, undo_w, button_h))
 
 
+def _use_saved(context, chat_id: str) -> None:
+    if _chat_busy(context):
+        return
+    if not _chat().use_chat(context.scene, chat_id):
+        return
+    _show_thread(context)
+
+
+def _forget_saved(context, chat_id: str) -> None:
+    if _chat_busy(context):
+        return
+    active = str(getattr(context.scene, "dwgreader_chat_id", "") or "")
+    _chat().forget_chat(context.scene, chat_id)
+    _FRAME["key"] = None
+    if active != chat_id:
+        return
+    _UI["open"] = set()
+    _UI["changes_open"] = set()
+    _UI["stick"] = True
+    _UI["scroll"] = 0.0
+
+
+def _paint_history(context, area, scale: float, size: int, small: int, hits: list) -> None:
+    x, y, width, height = area
+    _fill(x, y, width, height, 8 * scale, CARD)
+    _hit(hits, "history-sheet", area)
+    try:
+        rows = _chat().list_chats()
+        active = str(getattr(context.scene, "dwgreader_chat_id", "") or "")
+    except Exception:
+        rows = []
+        active = ""
+    busy = _chat_busy(context)
+    if not rows:
+        _UI["history_max"] = 0.0
+        _UI["history_scroll"] = 0.0
+        _font(size, TEXT_MUTED)
+        label = "Нет сохранённых чатов"
+        blf.position(0, x + (width - _text_width(label, size)) * 0.5, y + height * 0.5, 0)
+        blf.draw(0, label)
+        return
+    row_h = 46 * scale
+    gap = 4 * scale
+    step = row_h + gap
+    max_scroll = max(0.0, len(rows) * step - gap - height)
+    _UI["history_max"] = max_scroll
+    _UI["history_scroll"] = min(max_scroll, max(0.0, float(_UI.get("history_scroll") or 0.0)))
+    previous = gpu.state.scissor_get()
+    gpu.state.scissor_test_set(True)
+    gpu.state.scissor_set(int(x), int(y), int(width), int(max(1.0, height)))
+    blf.enable(0, blf.CLIPPING)
+    _CLIP["on"] = True
+    blf.clipping(0, x, y, x + width, y + height)
+    try:
+        for index, row in enumerate(rows):
+            bottom = y + height - (index + 1) * step + _UI["history_scroll"]
+            top = bottom + row_h
+            if top < y or bottom > y + height:
+                continue
+            chat_id = str(row.get("id") or "")
+            chosen = chat_id == active
+            hovered = _UI["hover"] in {f"hist:{chat_id}", f"forget:{chat_id}"}
+            if chosen or hovered:
+                _fill(x + 4 * scale, bottom, width - 8 * scale, row_h, 6 * scale, GHOST)
+            if chosen:
+                _fill(x + 6 * scale, bottom + 8 * scale, 2 * scale, row_h - 16 * scale, 1 * scale, ACCENT)
+            title = _ellipsize(str(row.get("title") or "Чат"), max(24.0, width - 52 * scale), size)
+            when = _chat_when(float(row.get("updated") or 0))
+            _font(size, TEXT)
+            blf.position(0, x + 16 * scale, bottom + row_h - _line_height(size) - 6 * scale, 0)
+            blf.draw(0, title)
+            if when:
+                _font(small, TEXT_FAINT)
+                blf.position(0, x + 16 * scale, bottom + 6 * scale, 0)
+                blf.draw(0, when)
+            _hit(hits, f"hist:{chat_id}", (x + 4 * scale, bottom, width - 8 * scale, row_h))
+            if hovered and not busy:
+                knob = 16 * scale
+                kx = x + width - knob - 10 * scale
+                ky = bottom + (row_h - knob) * 0.5
+                _font(size, TEXT_MUTED)
+                blf.position(0, kx + 3 * scale, ky + 1 * scale, 0)
+                blf.draw(0, "×")
+                _hit(hits, f"forget:{chat_id}", (kx - 4 * scale, ky - 4 * scale, knob + 8 * scale, knob + 8 * scale))
+    finally:
+        blf.disable(0, blf.CLIPPING)
+        _CLIP["on"] = False
+        gpu.state.scissor_set(previous[0], previous[1], previous[2], previous[3])
+        gpu.state.scissor_test_set(False)
+
+
 def _version_label() -> str:
     module = sys.modules.get(__package__ or "")
     parts = getattr(module, "bl_info", {}).get("version", ())
@@ -796,19 +890,61 @@ def _model_label(context) -> str:
         return "ChatGPT"
 
 
+def _draw_history_icon(x: float, y: float, box: float, color) -> None:
+    """Три полоски. В шрифте Blender нет значка списка."""
+    bar_w = box * 0.56
+    bar_h = max(1.5, box * 0.09)
+    left = x + (box - bar_w) * 0.5
+    gap = (box - 3 * bar_h) / 4
+    for index in range(3):
+        bar_y = y + gap + index * (bar_h + gap)
+        _fill(left, bar_y, bar_w, bar_h, bar_h * 0.5, color)
+
+
+def _chat_busy(context) -> bool:
+    scene = getattr(context, "scene", None)
+    return bool(scene is not None and getattr(scene, "dwgreader_chat_busy", False))
+
+
+def _chat_when(stamp: float) -> str:
+    try:
+        moment = time.localtime(float(stamp))
+        now = time.localtime()
+    except (OverflowError, OSError, TypeError, ValueError):
+        return ""
+    if (moment.tm_year, moment.tm_yday) == (now.tm_year, now.tm_yday):
+        return "сегодня"
+    yesterday = time.localtime(time.time() - 86400)
+    if (moment.tm_year, moment.tm_yday) == (yesterday.tm_year, yesterday.tm_yday):
+        return "вчера"
+    months = ("янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
+    return f"{moment.tm_mday} {months[moment.tm_mon - 1]}"
+
+
+def _show_thread(context) -> None:
+    _UI["history"] = False
+    _UI["open"] = set()
+    _UI["changes_open"] = set()
+    _UI["stick"] = True
+    _UI["scroll"] = 0.0
+    _FRAME["key"] = None
+    if context.area is not None:
+        context.area.tag_redraw()
+
+
 def _clear_log(context) -> None:
+    if _chat_busy(context):
+        return
     chat = _chat()
-    chat.save_log(context.scene, [])
+    chat.begin_chat(context.scene)
     _UI["lines"] = [""]
     _UI["row"] = 0
     _UI["col"] = 0
     _UI["anchor"] = None
     _UI["undo"] = []
     _UI["undo_mark"] = None
-    _UI["open"] = set()
     _UI["photos"] = []
-    _UI["stick"] = True
-    _UI["scroll"] = 0.0
+    _show_thread(context)
 
 
 def _paint(context) -> None:
@@ -849,15 +985,20 @@ def _paint(context) -> None:
         box = 24 * scale
         gap = 2 * scale
         right = x + width - pad
-        for hit_id, glyph in (("close", "×"), ("new", "+")):
+        for hit_id, glyph in (("close", "×"), ("new", "+"), ("history", "")):
             left = right - box
             top = header_y + (header_h - box) * 0.5
-            if _UI["hover"] == hit_id:
+            active = hit_id == "history" and bool(_UI.get("history"))
+            if _UI["hover"] == hit_id or active:
                 _fill(left, top, box, box, 5 * scale, GHOST)
-            _font(size, TEXT if _UI["hover"] == hit_id else TEXT_MUTED)
-            glyph_w = _text_width(glyph, size)
-            blf.position(0, left + (box - glyph_w) * 0.5, header_y + 9 * scale, 0)
-            blf.draw(0, glyph)
+            ink = TEXT if _UI["hover"] == hit_id or active else TEXT_MUTED
+            if hit_id == "history":
+                _draw_history_icon(left, top, box, ink)
+            else:
+                _font(size, ink)
+                glyph_w = _text_width(glyph, size)
+                blf.position(0, left + (box - glyph_w) * 0.5, header_y + 9 * scale, 0)
+                blf.draw(0, glyph)
             _hit(hits, hit_id, (left, header_y, box, header_h))
             right = left - gap
 
@@ -999,114 +1140,117 @@ def _paint(context) -> None:
         area_top = header_y - banner_h - 8 * scale
         area_h = max(20.0, area_top - area_bottom)
         area = (x + pad, area_bottom, width - 2 * pad, area_h)
-        laid = _laid_rows(context, area[2], size, scale)
-        content_h = laid[-1]["top"] + laid[-1]["height"] if laid else 0.0
-        max_scroll = max(0.0, content_h - area_h)
-        if _UI["stick"]:
-            _UI["scroll"] = 0.0
-        _UI["scroll"] = min(max_scroll, max(0.0, float(_UI["scroll"])))
-        _UI["max_scroll"] = max_scroll
-        scroll_top = max_scroll - _UI["scroll"]
-        content_top = area_bottom + area_h + scroll_top
+        if _UI.get("history"):
+            _paint_history(context, area, scale, size, small, hits)
+        else:
+            laid = _laid_rows(context, area[2], size, scale)
+            content_h = laid[-1]["top"] + laid[-1]["height"] if laid else 0.0
+            max_scroll = max(0.0, content_h - area_h)
+            if _UI["stick"]:
+                _UI["scroll"] = 0.0
+            _UI["scroll"] = min(max_scroll, max(0.0, float(_UI["scroll"])))
+            _UI["max_scroll"] = max_scroll
+            scroll_top = max_scroll - _UI["scroll"]
+            content_top = area_bottom + area_h + scroll_top
 
-        if not laid:
-            _font(size, TEXT)
-            blf.position(0, area[0], area_bottom + area_h - _line_height(size) - 4 * scale, 0)
-            blf.draw(0, "Спросите, что сделать со сценой")
-        if laid:
-            previous = gpu.state.scissor_get()
-            gpu.state.scissor_test_set(True)
-            gpu.state.scissor_set(int(area[0]), int(area[1]), int(area[2]), int(area[3]))
-            blf.enable(0, blf.CLIPPING)
-            _CLIP["on"] = True
-            blf.clipping(0, area[0], area[1], area[0] + area[2], area[1] + area[3])
-            try:
-                for row in laid:
-                    top = content_top - row["top"]
-                    bottom = top - row["height"]
-                    if top < area_bottom or bottom > area_bottom + area_h:
-                        continue
-                    if row["kind"] == "changes":
-                        _draw_changes(row, area[0], bottom, scale, size, small, hits)
-                        continue
-                    if row["kind"] == "tool":
-                        _stroke(area[0], bottom, row["width"], row["height"], 8 * scale, WARN if row.get("live") else CARD_BORDER)
-                        text_y = bottom + row["height"] - _line_height(size) - 6 * scale
-                        blf.clipping(0, area[0] + 4 * scale, bottom, area[0] + row["width"] - 6 * scale, bottom + row["height"])
-                        if row.get("live"):
-                            _draw_spinner(area[0] + 16 * scale, text_y + size * 0.35, 5.5 * scale, WARN)
+            if not laid:
+                _font(size, TEXT)
+                blf.position(0, area[0], area_bottom + area_h - _line_height(size) - 4 * scale, 0)
+                blf.draw(0, "Спросите, что сделать со сценой")
+            if laid:
+                previous = gpu.state.scissor_get()
+                gpu.state.scissor_test_set(True)
+                gpu.state.scissor_set(int(area[0]), int(area[1]), int(area[2]), int(area[3]))
+                blf.enable(0, blf.CLIPPING)
+                _CLIP["on"] = True
+                blf.clipping(0, area[0], area[1], area[0] + area[2], area[1] + area[3])
+                try:
+                    for row in laid:
+                        top = content_top - row["top"]
+                        bottom = top - row["height"]
+                        if top < area_bottom or bottom > area_bottom + area_h:
+                            continue
+                        if row["kind"] == "changes":
+                            _draw_changes(row, area[0], bottom, scale, size, small, hits)
+                            continue
+                        if row["kind"] == "tool":
+                            _stroke(area[0], bottom, row["width"], row["height"], 8 * scale, WARN if row.get("live") else CARD_BORDER)
+                            text_y = bottom + row["height"] - _line_height(size) - 6 * scale
+                            blf.clipping(0, area[0] + 4 * scale, bottom, area[0] + row["width"] - 6 * scale, bottom + row["height"])
+                            if row.get("live"):
+                                _draw_spinner(area[0] + 16 * scale, text_y + size * 0.35, 5.5 * scale, WARN)
+                            else:
+                                glyph, glyph_color = ("✕", ERROR) if row.get("failed") else ("✓", OK)
+                                _font(size, glyph_color)
+                                blf.position(0, area[0] + 10 * scale, text_y, 0)
+                                blf.draw(0, glyph)
+                            label = str(row.get("fit_label") or "")
+                            name = str(row.get("fit_name") or "")
+                            name_w = float(row.get("fit_name_w") or 0.0)
+                            _font(size, TEXT_MUTED)
+                            blf.position(0, area[0] + 28 * scale, text_y, 0)
+                            blf.draw(0, label)
+                            if name:
+                                _font(small, TEXT_FAINT)
+                                blf.position(0, area[0] + row["width"] - name_w - 10 * scale, text_y + 1, 0)
+                                blf.draw(0, name)
+                            blf.clipping(0, area[0], area[1], area[0] + area[2], area[1] + area[3])
+                            _hit(hits, "tool:" + str(row.get("key") or ""), (area[0], bottom + row["height"] - row["head"], row["width"], row["head"]))
+                            pen_y = bottom + row["height"] - row["head"] - 4 * scale
+                            if row.get("code_rows"):
+                                code_h = sum(block[2] + 4 for block in row["code_rows"])
+                                _fill(area[0] + 8 * scale, pen_y - code_h, row["width"] - 16 * scale, code_h, 4 * scale, CODE_BG)
+                                _draw_lines(row["code_rows"], area[0] + 12 * scale, pen_y, row["width"] - 24, small, CODE_TEXT)
+                                pen_y -= sum(block[2] + 4 for block in row["code_rows"])
+                            if row.get("out_rows"):
+                                _draw_lines(row["out_rows"], area[0] + 12 * scale, pen_y, row["width"] - 24, small, ERROR if row.get("failed") else TEXT_MUTED)
+                                pen_y -= sum(block[2] + 4 for block in row["out_rows"])
+                            opened = row.get("key") in _UI["open"] and not row.get("live")
+                            if opened and row.get("image") and os.path.isfile(row["image"]):
+                                info = _shot_info(row["image"])
+                                src_w, src_h = (info[1], info[2]) if info else (1, 1)
+                                fit_w, fit_h = _fit_box(src_w, src_h, max(12.0, row["width"] - 24), 132)
+                                _draw_shot(row["image"], area[0] + 12 * scale, pen_y - fit_h - 8 * scale, fit_w, fit_h)
+                            continue
+                        card = row["kind"] == "user"
+                        error = row["kind"] != "user" and _error_text(row.get("text") or "")
+                        if card:
+                            _fill(area[0], bottom, row["width"], row["height"], 8 * scale, CARD)
+                        elif error:
+                            _fill(area[0], bottom, row["width"], row["height"], 8 * scale, ERROR_BG)
+                        pen_x = area[0] + (10 * scale if card or error else 0)
+                        pen_top = top - (8 * scale if card or error else 0)
+                        ink = ERROR if error else TEXT
+                        if row["kind"] == "live" and not row.get("text"):
+                            ink = TEXT_MUTED
+                        if row.get("summary_rows"):
+                            _draw_lines(row["summary_rows"], pen_x, pen_top, row["width"] - 20, small, TEXT_MUTED)
+                            summary_h = sum(block[2] + 4 for block in row["summary_rows"])
+                            pen_top -= summary_h
+                        if row.get("thinking"):
+                            base = pen_top - _line_height(size)
+                            radius = 5.5 * scale
+                            _draw_spinner(pen_x + radius, base + size * 0.35, radius, TEXT)
+                            _draw_shimmer("Думаю", pen_x + radius * 2 + 8 * scale, base, size)
                         else:
-                            glyph, glyph_color = ("✕", ERROR) if row.get("failed") else ("✓", OK)
-                            _font(size, glyph_color)
-                            blf.position(0, area[0] + 10 * scale, text_y, 0)
-                            blf.draw(0, glyph)
-                        label = str(row.get("fit_label") or "")
-                        name = str(row.get("fit_name") or "")
-                        name_w = float(row.get("fit_name_w") or 0.0)
-                        _font(size, TEXT_MUTED)
-                        blf.position(0, area[0] + 28 * scale, text_y, 0)
-                        blf.draw(0, label)
-                        if name:
-                            _font(small, TEXT_FAINT)
-                            blf.position(0, area[0] + row["width"] - name_w - 10 * scale, text_y + 1, 0)
-                            blf.draw(0, name)
-                        blf.clipping(0, area[0], area[1], area[0] + area[2], area[1] + area[3])
-                        _hit(hits, "tool:" + str(row.get("key") or ""), (area[0], bottom + row["height"] - row["head"], row["width"], row["head"]))
-                        pen_y = bottom + row["height"] - row["head"] - 4 * scale
-                        if row.get("code_rows"):
-                            code_h = sum(block[2] + 4 for block in row["code_rows"])
-                            _fill(area[0] + 8 * scale, pen_y - code_h, row["width"] - 16 * scale, code_h, 4 * scale, CODE_BG)
-                            _draw_lines(row["code_rows"], area[0] + 12 * scale, pen_y, row["width"] - 24, small, CODE_TEXT)
-                            pen_y -= sum(block[2] + 4 for block in row["code_rows"])
-                        if row.get("out_rows"):
-                            _draw_lines(row["out_rows"], area[0] + 12 * scale, pen_y, row["width"] - 24, small, ERROR if row.get("failed") else TEXT_MUTED)
-                            pen_y -= sum(block[2] + 4 for block in row["out_rows"])
-                        opened = row.get("key") in _UI["open"] and not row.get("live")
-                        if opened and row.get("image") and os.path.isfile(row["image"]):
-                            info = _shot_info(row["image"])
-                            src_w, src_h = (info[1], info[2]) if info else (1, 1)
-                            fit_w, fit_h = _fit_box(src_w, src_h, max(12.0, row["width"] - 24), 132)
-                            _draw_shot(row["image"], area[0] + 12 * scale, pen_y - fit_h - 8 * scale, fit_w, fit_h)
-                        continue
-                    card = row["kind"] == "user"
-                    error = row["kind"] != "user" and _error_text(row.get("text") or "")
-                    if card:
-                        _fill(area[0], bottom, row["width"], row["height"], 8 * scale, CARD)
-                    elif error:
-                        _fill(area[0], bottom, row["width"], row["height"], 8 * scale, ERROR_BG)
-                    pen_x = area[0] + (10 * scale if card or error else 0)
-                    pen_top = top - (8 * scale if card or error else 0)
-                    ink = ERROR if error else TEXT
-                    if row["kind"] == "live" and not row.get("text"):
-                        ink = TEXT_MUTED
-                    if row.get("summary_rows"):
-                        _draw_lines(row["summary_rows"], pen_x, pen_top, row["width"] - 20, small, TEXT_MUTED)
-                        summary_h = sum(block[2] + 4 for block in row["summary_rows"])
-                        pen_top -= summary_h
-                    if row.get("thinking"):
-                        base = pen_top - _line_height(size)
-                        radius = 5.5 * scale
-                        _draw_spinner(pen_x + radius, base + size * 0.35, radius, TEXT)
-                        _draw_shimmer("Думаю", pen_x + radius * 2 + 8 * scale, base, size)
-                    else:
-                        _draw_lines(row.get("text_rows") or [], pen_x, pen_top, row["width"] - 20, size, ink)
-                        if row.get("text_rows"):
-                            pen_top -= sum(block[2] + 4 for block in row["text_rows"])
-                    if row.get("shot_boxes"):
-                        sx = pen_x
-                        for path, fit_w, fit_h in row["shot_boxes"]:
-                            _draw_shot(path, sx, pen_top - fit_h - 6, fit_w, fit_h)
-                            sx += fit_w + 6
-            finally:
-                blf.disable(0, blf.CLIPPING)
-                _CLIP["on"] = False
-                gpu.state.scissor_set(previous[0], previous[1], previous[2], previous[3])
-                gpu.state.scissor_test_set(False)
-            if max_scroll > 1:
-                bar_h = max(24 * scale, area_h * area_h / content_h)
-                travel = area_h - bar_h
-                bar_y = area_bottom + travel * (1.0 - _UI["scroll"] / max_scroll)
-                _fill(x + width - 7 * scale, bar_y, 3 * scale, bar_h, 2 * scale, TEXT_FAINT)
+                            _draw_lines(row.get("text_rows") or [], pen_x, pen_top, row["width"] - 20, size, ink)
+                            if row.get("text_rows"):
+                                pen_top -= sum(block[2] + 4 for block in row["text_rows"])
+                        if row.get("shot_boxes"):
+                            sx = pen_x
+                            for path, fit_w, fit_h in row["shot_boxes"]:
+                                _draw_shot(path, sx, pen_top - fit_h - 6, fit_w, fit_h)
+                                sx += fit_w + 6
+                finally:
+                    blf.disable(0, blf.CLIPPING)
+                    _CLIP["on"] = False
+                    gpu.state.scissor_set(previous[0], previous[1], previous[2], previous[3])
+                    gpu.state.scissor_test_set(False)
+                if max_scroll > 1:
+                    bar_h = max(24 * scale, area_h * area_h / content_h)
+                    travel = area_h - bar_h
+                    bar_y = area_bottom + travel * (1.0 - _UI["scroll"] / max_scroll)
+                    _fill(x + width - 7 * scale, bar_y, 3 * scale, bar_h, 2 * scale, TEXT_FAINT)
         _HITS[region.as_pointer()] = hits
     finally:
         gpu.state.blend_set("NONE")
@@ -1148,48 +1292,6 @@ def _window_region(area):
         if region.type == "WINDOW":
             return region
     return None
-
-
-def _quiet_space(space) -> None:
-    for name in (
-        "show_region_ui",
-        "show_region_toolbar",
-        "show_region_header",
-        "show_region_tool_header",
-        "show_region_hud",
-    ):
-        if hasattr(space, name):
-            setattr(space, name, False)
-    if hasattr(space, "show_gizmo"):
-        space.show_gizmo = False
-    for name in (
-        "show_object_viewport_mesh",
-        "show_object_viewport_curve",
-        "show_object_viewport_surf",
-        "show_object_viewport_meta",
-        "show_object_viewport_font",
-        "show_object_viewport_armature",
-        "show_object_viewport_lattice",
-        "show_object_viewport_grease_pencil",
-        "show_object_viewport_pointcloud",
-        "show_object_viewport_volume",
-        "show_object_viewport_curves",
-    ):
-        if hasattr(space, name):
-            setattr(space, name, False)
-    overlay = getattr(space, "overlay", None)
-    if overlay is not None:
-        overlay.show_overlays = False
-    shading = getattr(space, "shading", None)
-    if shading is not None:
-        shading.type = "SOLID"
-        shading.background_type = "VIEWPORT"
-        shading.background_color = (BG[0], BG[1], BG[2])
-        if hasattr(shading, "use_compositor"):
-            try:
-                shading.use_compositor = "DISABLED"
-            except (TypeError, ValueError):
-                pass
 
 
 def _drop_marker() -> None:
@@ -1288,9 +1390,6 @@ def _make_chat_space(window) -> None:
             area.type = "IMAGE_EDITOR"
         except Exception as error:
             print(f"Подложка DWG: лёгкий вид чата: {error}")
-            for space in area.spaces:
-                if space.type == "VIEW_3D":
-                    _quiet_space(space)
             return
     _hide_editor_chrome(window, _chat_area(window) or area)
 
@@ -1933,16 +2032,28 @@ class DWGREADER_OT_chat_view(bpy.types.Operator):
         inside = _contains(panel, event.mouse_region_x, event.mouse_region_y)
         if event.type == "TIMER":
             return {"PASS_THROUGH"}
-        if event.type == "ESC" and event.value == "PRESS" and _UI["focus"]:
-            _UI["focus"] = False
-            return {"RUNNING_MODAL"}
+        if event.type == "ESC" and event.value == "PRESS":
+            if _UI.get("history"):
+                _UI["history"] = False
+                if context.area is not None:
+                    context.area.tag_redraw()
+                return {"RUNNING_MODAL"}
+            if _UI["focus"]:
+                _UI["focus"] = False
+                return {"RUNNING_MODAL"}
         if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and inside:
             step = 56 * scale
-            if event.type == "WHEELUPMOUSE":
+            if _UI.get("history"):
+                if event.type == "WHEELUPMOUSE":
+                    _UI["history_scroll"] = max(0.0, _UI["history_scroll"] - step)
+                else:
+                    _UI["history_scroll"] = min(_UI["history_max"], _UI["history_scroll"] + step)
+            elif event.type == "WHEELUPMOUSE":
                 _UI["scroll"] = min(_UI["max_scroll"], _UI["scroll"] + step)
             else:
                 _UI["scroll"] = max(0.0, _UI["scroll"] - step)
-            _UI["stick"] = _UI["scroll"] <= 1
+            if not _UI.get("history"):
+                _UI["stick"] = _UI["scroll"] <= 1
             if context.area is not None:
                 context.area.tag_redraw()
             return {"RUNNING_MODAL"}
@@ -1968,7 +2079,9 @@ class DWGREADER_OT_chat_view(bpy.types.Operator):
                 _UI["focus"] = False
                 return {"RUNNING_MODAL"}
             hover = _hover(region, event.mouse_region_x, event.mouse_region_y)
-            _UI["focus"] = hover in {"", "input", "attach"} or hover.startswith("unphoto:")
+            sheet = hover == "history-sheet" or hover.startswith(("hist:", "forget:"))
+            if not sheet:
+                _UI["focus"] = hover in {"", "input", "attach"} or hover.startswith("unphoto:")
             _UI["selecting"] = False
             if hover == "input":
                 now = time.monotonic()
@@ -2010,9 +2123,24 @@ class DWGREADER_OT_chat_view(bpy.types.Operator):
                 photos = _UI.get("photos") or []
                 if 0 <= index < len(photos):
                     del photos[index]
-            if hover == "new":
-                _clear_log(context)
-                _UI["focus"] = True
+            if hover == "history":
+                opening = not bool(_UI.get("history"))
+                if opening:
+                    try:
+                        chat = _chat()
+                        chat.save_log(context.scene, chat.load_log(context.scene))
+                    except Exception:
+                        pass
+                _UI["history"] = opening
+                _UI["history_scroll"] = 0.0
+            elif hover == "new":
+                if not _chat_busy(context):
+                    _clear_log(context)
+                    _UI["focus"] = True
+            elif hover.startswith("hist:"):
+                _use_saved(context, hover.split(":", 1)[1])
+            elif hover.startswith("forget:"):
+                _forget_saved(context, hover.split(":", 1)[1])
             elif hover == "stop":
                 bpy.ops.dwgreader.chat_stop()
             elif hover == "mcp":

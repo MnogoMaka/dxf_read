@@ -58,6 +58,33 @@ def polygon_area_xy(vertices: list[tuple[float, float, float]], faces: list[tupl
     return sum(triangle[3] for triangle in _mesh_triangles(vertices, faces))
 
 
+def footprint_longer_side(vertices, faces) -> float:
+    """Длинная сторона пятна в единицах сетки."""
+    xs: list[float] = []
+    ys: list[float] = []
+    for face in faces:
+        for index in face:
+            point = vertices[index]
+            xs.append(float(point[0]))
+            ys.append(float(point[1]))
+    if not xs:
+        return 0.0
+    return max(max(xs) - min(xs), max(ys) - min(ys))
+
+
+def areas_to_square_meters(areas: list[float], longer_sides: list[float]) -> list[float]:
+    """Площади контуров в м². Один множитель на все пятна плана.
+
+    Длинная сторона больше 2000 единиц сцены — чертёж ещё в миллиметрах.
+    """
+    if not areas:
+        return []
+    sides = [float(side) for side in longer_sides]
+    median = sorted(sides)[len(sides) // 2] if sides else 0.0
+    factor = 1e-6 if median > 2000.0 else 1.0
+    return [max(float(area), 0.0) * factor for area in areas]
+
+
 def face_groups(faces: list[tuple[int, ...]]) -> list[list[int]]:
     """Грани одного полигона склеены общим ребром. Отдельные пятна слоя — отдельные группы."""
     parent = list(range(len(faces)))
@@ -160,11 +187,21 @@ def split_far_parts(
     gap_m: float,
 ) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]]:
     """Близкие пятна одного слоя остаются вместе. Далёкие становятся отдельными сетками."""
+    return [(part_vertices, part_faces) for part_vertices, part_faces, _faces in _gap_meshes(vertices, faces, gap_m)]
+
+
+def _gap_meshes(
+    vertices: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    gap_m: float,
+) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]], list[int]]]:
+    if not faces:
+        return []
     if len(faces) <= 1:
-        return [(vertices, faces)] if faces else []
+        return [(vertices, faces, list(range(len(faces))))]
     groups = face_groups(faces)
     if len(groups) <= 1:
-        return [(vertices, faces)]
+        return [(vertices, faces, list(range(len(faces))))]
     boxes: list[tuple[float, float, float, float]] = []
     for group in groups:
         xs: list[float] = []
@@ -200,16 +237,16 @@ def split_far_parts(
     clustered: dict[int, list[int]] = {}
     for index, group in enumerate(groups):
         clustered.setdefault(find(index), []).extend(group)
-    return _sub_meshes(vertices, faces, list(clustered.values()))
+    return _mesh_parts(vertices, faces, list(clustered.values()))
 
 
-def _sub_meshes(
+def _mesh_parts(
     vertices: list[tuple[float, float, float]],
     faces: list[tuple[int, ...]],
     face_sets: list[list[int]],
-) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]]:
-    """Сетки по наборам граней, слева направо (min x, затем min y)."""
-    parts: list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]] = []
+) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]], list[int]]]:
+    """Сетки по наборам граней, слева направо. Третий элемент — исходные номера граней."""
+    parts: list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]], list[int]]] = []
     for face_indices in face_sets:
         if not face_indices:
             continue
@@ -224,9 +261,93 @@ def _sub_meshes(
                     part_vertices.append(vertices[index])
                 polygon.append(remap[index])
             part_faces.append(tuple(polygon))
-        parts.append((part_vertices, part_faces))
+        parts.append((part_vertices, part_faces, list(face_indices)))
     parts.sort(key=lambda item: (min(vertex[0] for vertex in item[0]), min(vertex[1] for vertex in item[0])))
     return parts
+
+
+def _sub_meshes(
+    vertices: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    face_sets: list[list[int]],
+) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]]:
+    """Сетки по наборам граней, слева направо (min x, затем min y)."""
+    return [(part_vertices, part_faces) for part_vertices, part_faces, _faces in _mesh_parts(vertices, faces, face_sets)]
+
+
+def polygon_tags_for_faces(
+    face_indices: list[int],
+    polygon_face_counts: list[int],
+    polygon_areas: list[float],
+) -> tuple[list[int], list[float]]:
+    """Пятна в порядке граней одной сетки: число треугольников и площадь, м².
+
+    Соседние пятна не склеиваются, даже если у них общее ребро.
+    Без пары «число треугольников — площадь» списки пустые, и площадь считается по контуру.
+    """
+    if len(polygon_face_counts) != len(polygon_areas):
+        return [], []
+    owners: list[int] = []
+    for polygon_index, count in enumerate(polygon_face_counts):
+        owners.extend([polygon_index] * int(count))
+    if not face_indices or any(index < 0 or index >= len(owners) for index in face_indices):
+        return [], []
+    counts: list[int] = []
+    areas: list[float] = []
+    current: int | None = None
+    running = 0
+    for face_index in face_indices:
+        owner = owners[face_index]
+        if owner != current:
+            if current is not None:
+                counts.append(running)
+                areas.append(float(polygon_areas[current]) if current < len(polygon_areas) else 0.0)
+            current = owner
+            running = 0
+        running += 1
+    if current is not None:
+        counts.append(running)
+        areas.append(float(polygon_areas[current]) if current < len(polygon_areas) else 0.0)
+    return counts, areas
+
+
+def _polygon_face_sets(
+    faces: list[tuple[int, ...]],
+    polygon_faces: list[int] | None,
+) -> list[list[int]]:
+    counts = [int(count) for count in (polygon_faces or []) if int(count) > 0]
+    if counts and sum(counts) == len(faces):
+        face_sets: list[list[int]] = []
+        start = 0
+        for count in counts:
+            face_sets.append(list(range(start, start + count)))
+            start += count
+        return face_sets
+    return face_groups(faces)
+
+
+def tagged_mesh_parts(
+    vertices: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    split_mode: str,
+    part_gap_m: float,
+    polygon_face_counts: list[int],
+    polygon_areas: list[float],
+) -> list[tuple[list[tuple[float, float, float]], list[tuple[int, ...]], list[int], list[float]]]:
+    """Сетки выбранного режима и пятна каждой сетки в порядке её граней."""
+    if not faces:
+        return []
+    if split_mode == "layer":
+        meshes = [(vertices, faces, list(range(len(faces))))]
+    elif split_mode == "polygon":
+        meshes = _mesh_parts(vertices, faces, _polygon_face_sets(faces, polygon_face_counts))
+    else:
+        meshes = _gap_meshes(vertices, faces, part_gap_m)
+    tagged = []
+    for part_vertices, part_faces, face_indices in meshes:
+        counts, areas = polygon_tags_for_faces(face_indices, polygon_face_counts, polygon_areas)
+        tagged.append((part_vertices, part_faces, counts, areas))
+    return tagged
 
 
 def split_polygons(
@@ -241,16 +362,7 @@ def split_polygons(
     """
     if not faces:
         return []
-    counts = [int(count) for count in (polygon_faces or []) if int(count) > 0]
-    if counts and sum(counts) == len(faces):
-        face_sets: list[list[int]] = []
-        start = 0
-        for count in counts:
-            face_sets.append(list(range(start, start + count)))
-            start += count
-    else:
-        face_sets = face_groups(faces)
-    return _sub_meshes(vertices, faces, face_sets)
+    return _sub_meshes(vertices, faces, _polygon_face_sets(faces, polygon_faces))
 
 
 def convex_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -625,6 +737,20 @@ def cluster_boxes(
         )
 
     return [members for _root, members in sorted(groups.items(), key=lambda item: origin(item[1]))]
+
+
+def small_sheet_indexes(counts: list[int], keep_ratio: float = 0.75) -> list[int]:
+    """Индексы групп, в которых объектов строго меньше keep_ratio от самой большой.
+
+    Самая большая остаётся. Группа с долей keep_ratio и выше тоже остаётся.
+    """
+    if not counts:
+        return []
+    largest = max(int(count) for count in counts)
+    if largest <= 0:
+        return []
+    limit = largest * float(keep_ratio)
+    return [index for index, count in enumerate(counts) if int(count) < limit]
 
 
 def impact_margin(height: float) -> float:

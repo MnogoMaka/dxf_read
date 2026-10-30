@@ -77,6 +77,89 @@ class PkceTests(unittest.TestCase):
             self.assertTrue(chatgpt_auth._open_browser("https://auth.openai.com/example"))
         self.assertEqual(run.call_args.args[0][:2], ["/usr/bin/open", "https://auth.openai.com/example"])
 
+    def test_windows_command_keeps_the_query_intact(self) -> None:
+        url = "https://auth.openai.com/api/accounts/authorize?a=1&b=2&c=hello%20world"
+        command = chatgpt_auth._windows_browser_command(url)
+        self.assertEqual(
+            command,
+            'cmd /d /c start "" "https://auth.openai.com/api/accounts/authorize?a=1&b=2&c=hello%%20world"',
+        )
+
+    def test_windows_opens_a_child_process(self) -> None:
+        url = "https://auth.openai.com/example?a=1&b=2"
+        with patch.object(chatgpt_auth.sys, "platform", "win32"), patch.object(
+            chatgpt_auth.subprocess, "Popen",
+        ) as popen, patch.object(chatgpt_auth.webbrowser, "open") as browser:
+            self.assertTrue(chatgpt_auth._open_browser(url))
+        browser.assert_not_called()
+        self.assertEqual(popen.call_args.args[0], chatgpt_auth._windows_browser_command(url))
+        flags = popen.call_args.kwargs["creationflags"]
+        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+            bit = getattr(chatgpt_auth.subprocess, name, 0)
+            if bit:
+                self.assertTrue(flags & bit)
+
+    def test_login_browser_starts_once(self) -> None:
+        job = chatgpt_auth.LoginJob()
+        self.assertIsNone(chatgpt_auth.launch_pending_browser(job))
+        job.url = "https://auth.openai.com/example?a=1&b=2"
+        with patch.object(chatgpt_auth, "_open_browser", return_value=True) as open_browser:
+            self.assertTrue(chatgpt_auth.launch_pending_browser(job))
+            self.assertTrue(chatgpt_auth.launch_pending_browser(job))
+        open_browser.assert_called_once_with(job.url)
+
+    def test_inside_blender_token_check_stays_out_of_process(self) -> None:
+        import types
+
+        previous = sys.modules.get("bpy")
+        sys.modules["bpy"] = types.ModuleType("bpy")
+        self.addCleanup(lambda: sys.modules.__setitem__("bpy", previous) if previous is not None else sys.modules.pop("bpy", None))
+        payload = {
+            "iss": chatgpt_auth.ISSUER,
+            "aud": "oaiapp_test",
+            "nonce": "nonce-1",
+            "exp": time.time() + 3600,
+            "sub": "subject-1",
+            "email": "person@example.com",
+        }
+        completed = chatgpt_auth.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload), stderr="",
+        )
+        with patch.object(chatgpt_auth, "_import_jwt", side_effect=AssertionError("jwt loaded")), patch.object(
+            chatgpt_auth, "_discovery", return_value={"jwks_uri": "https://auth.openai.com/jwks"},
+        ), patch.object(
+            chatgpt_auth, "_python_for_token_check", return_value=Path("python.exe"),
+        ), patch.object(chatgpt_auth.subprocess, "run", return_value=completed) as run:
+            claims = chatgpt_auth.verify_id_token("a.b.c", "oaiapp_test", "nonce-1")
+        self.assertEqual(claims["email"], "person@example.com")
+        self.assertEqual(run.call_args.args[0][0], "python.exe")
+        self.assertEqual(run.call_args.args[0][1], "-c")
+        sent = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(sent["token"], "a.b.c")
+        self.assertEqual(sent["audience"], "oaiapp_test")
+
+    def test_child_crash_is_an_auth_error(self) -> None:
+        import types
+
+        previous = sys.modules.get("bpy")
+        sys.modules["bpy"] = types.ModuleType("bpy")
+        self.addCleanup(lambda: sys.modules.__setitem__("bpy", previous) if previous is not None else sys.modules.pop("bpy", None))
+        completed = chatgpt_auth.subprocess.CompletedProcess(args=[], returncode=3221225477, stdout="", stderr="")
+        with patch.object(chatgpt_auth, "_import_jwt", side_effect=AssertionError("jwt loaded")), patch.object(
+            chatgpt_auth, "_discovery", return_value={"jwks_uri": "https://auth.openai.com/jwks"},
+        ), patch.object(
+            chatgpt_auth, "_python_for_token_check", return_value=Path("python.exe"),
+        ), patch.object(chatgpt_auth.subprocess, "run", return_value=completed):
+            with self.assertRaises(chatgpt_auth.AuthError):
+                chatgpt_auth.verify_id_token("a.b.c", "oaiapp_test", "nonce-1")
+
+    def test_token_checker_does_not_import_jwt(self) -> None:
+        with patch.object(chatgpt_auth, "_import_jwt", side_effect=AssertionError("jwt loaded")):
+            try:
+                chatgpt_auth.ensure_token_checker()
+            except chatgpt_auth.AuthError:
+                pass
+
     def test_matching_callback_is_accepted(self) -> None:
         chatgpt_auth.accept_callback(
             {"state": "expected", "code": "abc", "client_id": "oaiapp_test"},
@@ -141,6 +224,12 @@ class SessionTests(unittest.TestCase):
         loaded = chatgpt_auth.load_session()
         assert loaded is not None
         self.assertEqual(loaded["access_token"], "old-access")
+
+    def test_unreadable_session_stays_quiet(self) -> None:
+        path = Path(self.tmp.name) / "session.bin"
+        path.write_bytes(b"not-a-session")
+        self.assertIsNone(chatgpt_auth.load_session())
+        self.assertIsNone(chatgpt_auth.public_profile())
 
     def test_host_id_stays_stable(self) -> None:
         self.assertEqual(chatgpt_auth.host_id(), chatgpt_auth.host_id())

@@ -209,21 +209,61 @@ def public_profile() -> dict | None:
     }
 
 
+_SESSION_STAMP: tuple | None = None
+_SESSION_CACHE: dict | None = None
+
+
+def _drop_session_cache() -> None:
+    global _SESSION_STAMP, _SESSION_CACHE
+    _SESSION_STAMP = None
+    _SESSION_CACHE = None
+
+
+def _remember_written_session(path: Path, session: dict) -> None:
+    global _SESSION_STAMP, _SESSION_CACHE
+    try:
+        stat = path.stat()
+        _SESSION_STAMP = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        _SESSION_STAMP = None
+    _SESSION_CACHE = dict(session)
+
+
 def load_session() -> dict | None:
+    """Сессия с диска. Повторный вызов из draw() не трогает DPAPI, пока файл не сменился."""
+    global _SESSION_STAMP, _SESSION_CACHE
     path = storage_dir() / "session.bin"
     if not path.is_file():
+        _drop_session_cache()
         return None
     try:
-        payload = json.loads(_unprotect(path.read_bytes()).decode("utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+        stat = path.stat()
+        stamp = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        _drop_session_cache()
         return None
-    return payload if isinstance(payload, dict) else None
+    if stamp == _SESSION_STAMP:
+        return None if _SESSION_CACHE is None else dict(_SESSION_CACHE)
+    try:
+        payload = json.loads(_unprotect(path.read_bytes()).decode("utf-8"))
+    except Exception:
+        _SESSION_STAMP = stamp
+        _SESSION_CACHE = None
+        return None
+    if not isinstance(payload, dict):
+        _SESSION_STAMP = stamp
+        _SESSION_CACHE = None
+        return None
+    _SESSION_STAMP = stamp
+    _SESSION_CACHE = payload
+    return dict(payload)
 
 
 def save_session(session: dict) -> None:
     path = storage_dir() / "session.bin"
     raw = json.dumps(session, ensure_ascii=False).encode("utf-8")
     _write_secret(path, _protect(raw))
+    _remember_written_session(path, session)
 
 
 def clear_tokens() -> None:
@@ -240,6 +280,7 @@ def clear_tokens() -> None:
     path = storage_dir() / "session.bin"
     if path.is_file():
         path.unlink()
+    _drop_session_cache()
 
 
 def sign_out() -> None:
@@ -319,6 +360,7 @@ class LoginJob:
         self.cancelled = False
         self.another = False
         self.url = ""
+        self.browser_started = False
         self._server: http.server.HTTPServer | None = None
         self._socket: socket.socket | None = None
 
@@ -366,6 +408,17 @@ def login_url() -> str:
     if job is None or job.done:
         return ""
     return str(job.url or "")
+
+
+def launch_pending_browser(job: LoginJob) -> bool | None:
+    """Открывает ссылку один раз. None — адрес ещё не готов, False — процесс браузера не стартовал."""
+    if job.browser_started:
+        return True
+    url = str(job.url or "")
+    if not url:
+        return None
+    job.browser_started = True
+    return _open_browser(url)
 
 
 def list_models(access_token: str) -> list[dict[str, str]]:
@@ -457,9 +510,6 @@ def _authorize(job: LoginJob, saved: dict) -> dict:
         params["prompt"] = "login"
     url = AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
     job.url = url
-    if not _open_browser(url):
-        server.server_close()
-        raise AuthError("Не удалось открыть браузер")
     server.timeout = 0.5
     deadline = time.monotonic() + LOGIN_TIMEOUT_S
     while time.monotonic() < deadline and not job.cancelled:
@@ -560,7 +610,38 @@ def ensure_vendor_path() -> None:
         sys.path.insert(0, folder)
 
 
+_VERIFY_SCRIPT = """
+import json
+import sys
+
+payload = json.loads(sys.stdin.read())
+vendor = str(payload.get("vendor") or "")
+if vendor and vendor not in sys.path:
+    sys.path.insert(0, vendor)
+import jwt
+from jwt import PyJWKClient
+
+key = PyJWKClient(payload["jwks_uri"]).get_signing_key_from_jwt(payload["token"])
+claims = jwt.decode(
+    payload["token"],
+    key.key,
+    algorithms=["RS256"],
+    audience=payload["audience"],
+    issuer=payload["issuer"],
+    options={"require": ["exp", "iat", "sub"]},
+)
+sys.stdout.write(json.dumps(claims))
+"""
+
+
+def _inside_blender() -> bool:
+    return "bpy" in sys.modules
+
+
 def _import_jwt():
+    """Только вне Blender. В blender.exe нативный cryptography роняет процесс."""
+    if _inside_blender():
+        raise AuthError("Проверка токена идёт отдельным процессом")
     ensure_vendor_path()
     try:
         import jwt
@@ -571,25 +652,98 @@ def _import_jwt():
 
 
 def ensure_token_checker() -> None:
-    """PyJWT нужен, чтобы принять ID token. Грузим его в главном потоке до входа."""
-    _import_jwt()
+    """Пакет лежит в vendor. В процесс Blender PyJWT не загружаем."""
+    if not (_vendor_dir() / "jwt").exists():
+        raise AuthError("Сначала нажмите «Установить библиотеки»")
+
+
+def _python_for_token_check() -> Path:
+    from .install_support import is_python_binary, python_search_folders
+
+    binary = None
+    if _inside_blender():
+        import bpy
+
+        raw = str(getattr(bpy.app, "binary_path", "") or "")
+        binary = Path(raw) if raw else None
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for folder in python_search_folders(Path(sys.prefix), binary):
+        if not folder.is_dir():
+            continue
+        for candidate in folder.iterdir():
+            resolved = candidate.resolve()
+            if resolved in seen or not is_python_binary(candidate):
+                continue
+            seen.add(resolved)
+            found.append(candidate)
+    found.sort(key=lambda path: (not path.name.lower().startswith("python3."), path.name.lower()))
+    if not found:
+        raise AuthError("Не найден Python рядом с Blender")
+    return found[0]
+
+
+def _verify_id_token_here(token: str, audience: str, jwks_uri: str) -> dict:
+    jwt, PyJWKClient = _import_jwt()
+    key = PyJWKClient(jwks_uri).get_signing_key_from_jwt(token)
+    return jwt.decode(
+        token,
+        key.key,
+        algorithms=["RS256"],
+        audience=audience,
+        issuer=ISSUER,
+        options={"require": ["exp", "iat", "sub"]},
+    )
+
+
+def _verify_id_token_child(token: str, audience: str, jwks_uri: str) -> dict:
+    python = _python_for_token_check()
+    env = os.environ.copy()
+    env.pop("PYTHONHOME", None)
+    env["PYTHONPATH"] = str(_vendor_dir())
+    env["PYTHONWARNINGS"] = "ignore"
+    kwargs = {
+        "input": json.dumps({
+            "token": token,
+            "audience": audience,
+            "jwks_uri": jwks_uri,
+            "issuer": ISSUER,
+            "vendor": str(_vendor_dir()),
+        }),
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 30,
+        "env": env,
+        "check": False,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run([str(python), "-c", _VERIFY_SCRIPT], **kwargs)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AuthError("ID token не прошёл проверку") from error
+    if completed.returncode != 0:
+        raise AuthError("ID token не прошёл проверку")
+    try:
+        claims = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise AuthError("ID token не прошёл проверку") from error
+    if not isinstance(claims, dict):
+        raise AuthError("ID token не прошёл проверку")
+    return claims
 
 
 def verify_id_token(token: str, audience: str, nonce: str) -> dict:
-    jwt, PyJWKClient = _import_jwt()
     jwks_uri = str(_discovery().get("jwks_uri") or "")
     if not jwks_uri:
         raise AuthError("Не найден ключ проверки OpenAI")
     try:
-        key = PyJWKClient(jwks_uri).get_signing_key_from_jwt(token)
-        claims = jwt.decode(
-            token,
-            key.key,
-            algorithms=["RS256"],
-            audience=audience,
-            issuer=ISSUER,
-            options={"require": ["exp", "iat", "sub"]},
-        )
+        if _inside_blender():
+            claims = _verify_id_token_child(token, audience, jwks_uri)
+        else:
+            claims = _verify_id_token_here(token, audience, jwks_uri)
     except AuthError:
         raise
     except Exception as error:
@@ -871,17 +1025,38 @@ _KEYCHAIN_SERVICE = b"dwgreader.chatgpt"
 _KEYCHAIN_ACCOUNT = b"session"
 
 
+def _windows_browser_command(url: str) -> str:
+    """Командная строка cmd. Кавычки держат «&», удвоенный «%» не раскрывается как переменная."""
+    safe = str(url).replace('"', "").replace("%", "%%")
+    return f'cmd /d /c start "" "{safe}"'
+
+
+def _open_windows_browser(url: str) -> bool:
+    """Дочерний cmd. ShellExecute внутри blender.exe на части машин гасит весь процесс."""
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0)
+    flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen(
+            _windows_browser_command(url),
+            close_fds=True,
+            creationflags=flags,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return True
+
+
 def _open_browser(url: str) -> bool:
-    """Системный браузер. В Blender на macOS webbrowser часто не находит браузер."""
+    """Системный браузер отдельным процессом. В Blender на macOS webbrowser часто не находит браузер."""
     if sys.platform == "darwin":
         if subprocess.run(["/usr/bin/open", url], check=False).returncode == 0:
             return True
     if sys.platform == "win32":
-        try:
-            os.startfile(url)  # type: ignore[attr-defined]
-            return True
-        except OSError:
-            pass
+        return _open_windows_browser(url)
     if sys.platform.startswith("linux"):
         if subprocess.run(["xdg-open", url], check=False).returncode == 0:
             return True
@@ -1019,10 +1194,23 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
+    blob_ptr = ctypes.POINTER(DATA_BLOB)
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    crypt32.CryptProtectData.argtypes = [
+        blob_ptr, wintypes.LPCWSTR, blob_ptr, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, blob_ptr,
+    ]
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    crypt32.CryptUnprotectData.argtypes = [
+        blob_ptr, ctypes.c_void_p, blob_ptr, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, blob_ptr,
+    ]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
     buffer = ctypes.create_string_buffer(data)
     incoming = DATA_BLOB(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
     outgoing = DATA_BLOB()
-    crypt32 = ctypes.windll.crypt32
     if protect:
         ok = crypt32.CryptProtectData(
             ctypes.byref(incoming), "DWGREADER", None, None, None, 0x01, ctypes.byref(outgoing),
@@ -1036,7 +1224,7 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
     try:
         return ctypes.string_at(outgoing.pbData, outgoing.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(outgoing.pbData)
+        kernel32.LocalFree(ctypes.cast(outgoing.pbData, ctypes.c_void_p))
 
 
 def _write_secret(path: Path, payload: bytes) -> None:

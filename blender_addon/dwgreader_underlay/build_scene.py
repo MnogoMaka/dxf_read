@@ -8,7 +8,7 @@ from pathlib import Path
 import bpy
 from mathutils import Quaternion, Vector
 
-from .placement_math import cluster_boxes, split_far_parts, split_polygons
+from .placement_math import cluster_boxes, tagged_mesh_parts
 
 
 ROOT_NAME = "SITE_UNDERLAY"
@@ -255,7 +255,7 @@ def apply_plan_viewport() -> None:
                 space.shading.type = "SOLID"
                 space.shading.light = "FLAT"
                 space.shading.color_type = "TEXTURE"
-                space.shading.show_object_outline = False
+                space.shading.show_object_outline = True
                 space.shading.background_type = "THEME"
                 if space.region_3d is not None:
                     space.region_3d.view_perspective = "ORTHO"
@@ -470,11 +470,10 @@ SPLIT_MODES = ("layer", "polygon", "gap")
 
 
 def layer_parts(layer: dict, vertices, faces, split_mode: str, part_gap_m: float):
-    if split_mode == "layer":
-        return [(vertices, faces)]
-    if split_mode == "polygon":
-        return split_polygons(vertices, faces, layer.get("polygon_faces"))
-    return split_far_parts(vertices, faces, float(part_gap_m))
+    """Части слоя и пятна каждой части: число треугольников и площадь в м² сцены."""
+    counts = [int(item) for item in (layer.get("polygon_faces") or [])]
+    areas = [float(item) for item in (layer.get("polygon_areas") or [])]
+    return tagged_mesh_parts(vertices, faces, split_mode, float(part_gap_m), counts, areas)
 
 
 def build(
@@ -524,7 +523,7 @@ def build(
         tile_m = SURFACE_TEXTURES[texture_key][1] if textured else None
         rgb = (list(color) + [0.55, 0.55, 0.55])[:3]
         color_rgba = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
-        for part_index, (part_vertices, part_faces) in enumerate(parts, start=1):
+        for part_index, (part_vertices, part_faces, part_counts, part_areas) in enumerate(parts, start=1):
             object_name = part_object_name(collection_name, part_index, len(parts))
             mesh = bpy.data.meshes.new(f"HATCH_{object_name}")
             mesh.from_pydata(part_vertices, [], part_faces)
@@ -540,6 +539,9 @@ def build(
             if texture_key:
                 obj["texture"] = texture_key
             obj["part"] = part_index
+            if part_counts and len(part_counts) == len(part_areas) and sum(part_counts) == len(part_faces):
+                obj["polygon_face_counts"] = [int(item) for item in part_counts]
+                obj["polygon_areas"] = [float(item) for item in part_areas]
             obj["geometry"] = str(layer.get("geometry") or "")
             obj.lock_location = (True, True, True)
             obj.lock_rotation = (True, True, True)

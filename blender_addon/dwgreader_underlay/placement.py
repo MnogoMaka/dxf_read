@@ -2379,7 +2379,7 @@ def register() -> None:
     bpy.types.Scene.dwgreader_tree_share = FloatProperty(
         name="Доля деревьев, %",
         description="Остальное — кусты. Меняет посадки на полигоне, выбранном в 3D-виде",
-        default=30.0,
+        default=10.0,
         min=0.0,
         max=100.0,
         subtype="PERCENTAGE",
@@ -2405,7 +2405,7 @@ def register() -> None:
     )
     bpy.types.Scene.dwgreader_density = FloatProperty(
         name="Плотность, шт/100 м²",
-        default=6.0,
+        default=3.0,
         min=0.1,
         soft_max=40.0,
         update=_on_plant_update,

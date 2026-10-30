@@ -81,7 +81,7 @@ from .install_support import (
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 5, 4),
+    "version": (1, 5, 7),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF, жилой дом и расстановка благоустройства в сцене",
@@ -282,14 +282,40 @@ def _documents_converter() -> Path:
             ctypes.POINTER(ctypes.c_wchar_p),
         ]
         shell32.SHGetKnownFolderPath.restype = ctypes.HRESULT
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        ole32.CoTaskMemFree.restype = None
         pointer = ctypes.c_wchar_p()
         if shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(pointer)) == 0:
-            documents = Path(pointer.value)
-            ole32.CoTaskMemFree(pointer)
-            return documents / "converter"
+            allocated = ctypes.cast(pointer, ctypes.c_void_p).value
+            text = pointer.value or ""
+            if allocated:
+                ole32.CoTaskMemFree(allocated)
+            if text:
+                return Path(text) / "converter"
     return Path.home() / "Documents" / "converter"
 
 
+_FAULT_LOG = None
+
+
+def _arm_fault_log() -> None:
+    """Следующий нативный сбой оставляет стек Python в профиле, а не только в temp."""
+    global _FAULT_LOG
+    if _FAULT_LOG is not None:
+        return
+    import faulthandler
+
+    try:
+        folder = chatgpt_auth.storage_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        handle = open(folder / "fault.log", "ab", buffering=0)
+        faulthandler.enable(file=handle, all_threads=True)
+    except Exception:
+        return
+    _FAULT_LOG = handle
+
+
+_arm_fault_log()
 DEFAULT_OUTPUT = str(_documents_converter())
 
 
@@ -389,7 +415,7 @@ def _chatgpt_model_items(self, context):
         for item in models
         if item.get("slug")
     ]
-    current = getattr(self, "chatgpt_model", "") or chatgpt_auth.saved_model()
+    current = chatgpt_auth.saved_model()
     if current and current != "none" and current not in {item[0] for item in items}:
         items.insert(0, (current, current, ""))
     if not items:
@@ -687,11 +713,6 @@ class DWGREADER_OT_chatgpt_login(Operator):
         if not _deps_ready():
             self.report({"ERROR"}, "Сначала нажмите «Установить библиотеки»")
             return {"CANCELLED"}
-        try:
-            chatgpt_auth.ensure_token_checker()
-        except chatgpt_auth.AuthError as error:
-            self.report({"ERROR"}, str(error))
-            return {"CANCELLED"}
         job = chatgpt_auth.LoginJob()
         job.another = bool(self.another)
         self._job = job
@@ -711,6 +732,10 @@ class DWGREADER_OT_chatgpt_login(Operator):
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
         job = self._job
+        if job is not None and job.url and not job.browser_started:
+            opened = chatgpt_auth.launch_pending_browser(job)
+            if opened is False:
+                context.scene.dwgreader_status = "Браузер не открылся. Скопируйте ссылку"
         if job is None or not job.done:
             _redraw(context)
             return {"RUNNING_MODAL"}
@@ -790,8 +815,9 @@ class DWGREADER_OT_chatgpt_usage(Operator):
     bl_options = {"INTERNAL"}
 
     def execute(self, context):
-        import webbrowser
-        webbrowser.open(chatgpt_auth.USAGE_URL)
+        if not chatgpt_auth._open_browser(chatgpt_auth.USAGE_URL):
+            self.report({"WARNING"}, "Не удалось открыть браузер")
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -953,15 +979,32 @@ def _objects_text(count: int) -> str:
     return _plural(count, ("объект", "объекта", "объектов"))
 
 
+def _load_previews():
+    """Иконки грузятся до отрисовки панели. load() из draw() на части видеокарт гасит Blender."""
+    if _PREVIEWS is None:
+        return None
+    folder = _addon_dir() / "icons"
+    if folder.is_dir():
+        for path in folder.glob("*.png"):
+            if _PREVIEWS.get(path.stem) is not None:
+                continue
+            try:
+                _PREVIEWS.load(path.stem, str(path), "IMAGE")
+            except Exception:
+                continue
+    try:
+        _redraw(bpy.context)
+    except Exception:
+        pass
+    return None
+
+
 def _preview(key: str) -> int:
     if _PREVIEWS is None:
         return 0
     item = _PREVIEWS.get(key)
     if item is None:
-        path = _addon_dir() / "icons" / f"{key}.png"
-        if not path.is_file():
-            return 0
-        item = _PREVIEWS.load(key, str(path), "IMAGE")
+        return 0
     return item.icon_id
 
 
@@ -1994,6 +2037,13 @@ def _draw_step_objects(layout, context, prefs) -> None:
     flags.prop(scene, "dwgreader_auto_trees", text="Расстановка деревьев")
     flags.prop(scene, "dwgreader_auto_maf", text="МАФ на площадках")
     flags.prop(scene, "dwgreader_auto_buildings", text="Расстановка зданий")
+    flags.prop(scene, "dwgreader_auto_prune_sheets", text="Убрать мелкие чертежи")
+    small = flags.column(align=True)
+    small.enabled = bool(scene.dwgreader_auto_buildings)
+    small.prop(scene, "dwgreader_skip_small_buildings", text="Не ставить на мелкие пятна")
+    area = small.row()
+    area.enabled = bool(scene.dwgreader_auto_buildings) and bool(scene.dwgreader_skip_small_buildings)
+    area.prop(scene, "dwgreader_min_building_area_m2", text="Минимальная площадь здания, м²")
 
     nav = layout.row(align=True)
     nav.scale_y = 1.3
@@ -2397,6 +2447,24 @@ class _SceneHolder:
         return getattr(self._base, name)
 
 
+def _fit_status(text: str, limit: int = 180) -> str:
+    """Оставляет хвост про здания, если строка статуса длиннее лимита."""
+    if len(text) <= limit:
+        return text
+    marker = "здания "
+    index = text.rfind(marker)
+    if index < 0:
+        return text[:limit]
+    tail = text[index:]
+    if len(tail) >= limit:
+        return tail[:limit]
+    head = text[:index].rstrip(". ")
+    room = limit - len(tail) - 1
+    if room < 8:
+        return tail
+    return head[:room].rstrip() + " " + tail
+
+
 def _schedule_underlay_replace(scene_name: str, json_path: str | None, empty_message: str | None = None) -> None:
     """Сборка после завершения оператора. Иначе Blender откатывает удаление старой подложки."""
 
@@ -2415,6 +2483,9 @@ def _schedule_underlay_replace(scene_name: str, json_path: str | None, empty_mes
                     scene.dwgreader_status = empty_message[:180]
                 return None
             count = build_underlay(Path(json_path), scene)
+            pruned = _prune_small_sheets(scene)
+            if pruned[1]:
+                count = max(count - pruned[1], 0)
             placed = ""
             base = bpy.context
             if base is not None:
@@ -2429,9 +2500,11 @@ def _schedule_underlay_replace(scene_name: str, json_path: str | None, empty_mes
         scene.dwgreader_build_seconds = max(clock.time() - _BUILD_STARTED, 0.0) if _BUILD_STARTED else 0.0
         scene.dwgreader_step = 3
         status = f"Готово: объектов в сцене {count}"
+        if pruned[0] or pruned[2] > 1:
+            status = f"{status}. Убрано мелких чертежей {pruned[0]}, крупных осталось {pruned[2]}"
         if placed:
             status = f"{status}. {placed}"
-        scene.dwgreader_status = status[:180]
+        scene.dwgreader_status = _fit_status(status)
         try:
             bpy.ops.ed.undo_push(message="Подложка DWG")
         except Exception:
@@ -2439,6 +2512,26 @@ def _schedule_underlay_replace(scene_name: str, json_path: str | None, empty_mes
         return None
 
     bpy.app.timers.register(run, first_interval=0.05)
+
+
+def _prune_small_sheets(scene) -> tuple[int, int, int]:
+    """Мелкие чертежи до расстановки. Возвращает (групп убрано, объектов убрано, групп осталось)."""
+    if not bool(getattr(scene, "dwgreader_auto_prune_sheets", False)):
+        return (0, 0, 0)
+    root = bpy.data.collections.get(UNDERLAY_ROOT)
+    if root is None:
+        return (0, 0, 0)
+    groups = sheet_groups(root, float(getattr(scene, "dwgreader_sheet_gap", SHEET_GAP_M)))
+    if len(groups) < 2:
+        return (0, 0, len(groups))
+    from .placement_math import small_sheet_indexes
+
+    drop_at = small_sheet_indexes([len(group) for group in groups])
+    kept = len(groups) - len(drop_at)
+    if not drop_at:
+        return (0, 0, kept)
+    removed = drop_objects([obj for index in drop_at for obj in groups[index]], root)
+    return (len(drop_at), removed, kept)
 
 
 def build_underlay(json_path: Path, scene: bpy.types.Scene | None = None) -> int:
@@ -2606,6 +2699,24 @@ def register() -> None:
         description="После построения поставить дом на каждый полигон зданий",
         default=True,
     )
+    bpy.types.Scene.dwgreader_auto_prune_sheets = BoolProperty(
+        name="Убрать мелкие чертежи",
+        description="До расстановки удалить чертежи, в которых объектов меньше 75% от самого большого. Близкие по числу объектов остаются на выбор",
+        default=True,
+    )
+    bpy.types.Scene.dwgreader_skip_small_buildings = BoolProperty(
+        name="Не ставить на мелкие пятна",
+        description="Не ставить геометрические ноды дома на полигоны зданий меньше заданной площади. Подложка, деревья и МАФ не затрагиваются",
+        default=True,
+    )
+    bpy.types.Scene.dwgreader_min_building_area_m2 = FloatProperty(
+        name="Минимальная площадь здания, м²",
+        description="Полигон здания меньше этой площади не получает ноду дома. Действует только при включённой галочке",
+        default=50.0,
+        min=0.0,
+        soft_max=500.0,
+        precision=1,
+    )
     bpy.types.Scene.dwgreader_layer_memory = StringProperty(default="{}", options={"HIDDEN"})
     bpy.types.Scene.dwgreader_build_seconds = FloatProperty(default=0.0, options={"HIDDEN"})
     bpy.types.Scene.dwgreader_chatgpt_block = StringProperty(default="", options={"HIDDEN"})
@@ -2621,6 +2732,8 @@ def register() -> None:
     bpy.types.WindowManager.dwgreader_busy = BoolProperty(name="Идёт импорт", default=False)
     global _PREVIEWS
     _PREVIEWS = previews.new()
+    if not bpy.app.timers.is_registered(_load_previews):
+        bpy.app.timers.register(_load_previews, first_interval=0.01)
     if not bpy.app.timers.is_registered(_ping_timer):
         bpy.app.timers.register(_ping_timer, first_interval=2.0, persistent=True)
     if not bpy.app.timers.is_registered(_restore_chatgpt_models):
@@ -2635,6 +2748,8 @@ def register() -> None:
 
 def unregister() -> None:
     global _PREVIEWS
+    if bpy.app.timers.is_registered(_load_previews):
+        bpy.app.timers.unregister(_load_previews)
     if bpy.app.timers.is_registered(_ping_timer):
         bpy.app.timers.unregister(_ping_timer)
     if bpy.app.timers.is_registered(_restore_chatgpt_models):
@@ -2654,7 +2769,10 @@ def unregister() -> None:
         "dwgreader_show_params",
         "dwgreader_show_layers",
         "dwgreader_plan_zoom",
+        "dwgreader_min_building_area_m2",
+        "dwgreader_skip_small_buildings",
         "dwgreader_auto_buildings",
+        "dwgreader_auto_prune_sheets",
         "dwgreader_auto_maf",
         "dwgreader_auto_trees",
         "dwgreader_show_unknown",

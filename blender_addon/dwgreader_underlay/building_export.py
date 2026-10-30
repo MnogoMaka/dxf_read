@@ -19,7 +19,7 @@ import bpy
 from bpy.props import EnumProperty, StringProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper
-from mathutils import Euler, Matrix, Vector
+from mathutils import Euler, Matrix
 
 
 # Recommended names first; the old names remain supported for compatibility.
@@ -577,7 +577,7 @@ BUILDING_COLLECTION = "SITE_BUILDING"
 BUILDING_BLEND = "Building 2.0.blend"
 BUILDING_GROUP = "1_Building"
 BUILDING_SOURCE = "Circle"
-DEFAULT_BUILDING_PRESET = "main001"
+DEFAULT_BUILDING_PRESET = "main002"
 _SETTING_LABELS = {"Колчисетво этажей": "Количество этажей", "Тип модуля": "Номер формы"}
 _SKIP_COLLECTIONS = ("SITE_BUILDING", "SITE_PLACEMENT", "SITE_LIBRARY")
 
@@ -1328,7 +1328,7 @@ def draw_controls(layout, context) -> None:
     box.operator_menu_enum("dwgreader.building_preset", "kind", text=preset_label(obj))
     hint = box.column(align=True)
     hint.scale_y = 0.75
-    hint.label(text="Список меняет форму целиком. Новый дом — «Дом 1».")
+    hint.label(text="Список меняет форму целиком. Новый дом — «Дом 2».")
     hint.label(text="Номер формы сам по себе тип не сменяет.")
     if len(found) > 1:
         note = box.column(align=True)
@@ -1494,7 +1494,17 @@ def _selected_islands(context):
 
 def _mark_building(obj):
     obj["dwgreader_building"] = True
+    _unlock_transform(obj)
     return obj
+
+
+def _unlock_transform(obj) -> None:
+    """Дом можно сдвигать, крутить и масштабировать. Резак контура больше не привязан."""
+    obj.hide_select = False
+    for index in range(3):
+        obj.lock_location[index] = False
+        obj.lock_rotation[index] = False
+        obj.lock_scale[index] = False
 
 
 def _spawn_building(context, template=None):
@@ -1621,6 +1631,139 @@ def _oriented_loops(vertices, faces, origin) -> list[list[tuple[float, float, fl
     return [outer, *holes]
 
 
+def _almost_same(a: tuple[float, float, float], b: tuple[float, float, float]) -> bool:
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 <= 1e-8
+
+
+def _on_straight_wall(a, b, c) -> bool:
+    """Точка лежит на отрезке между соседями. Угол дома, даже маленький, остаётся."""
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    cx, cy = float(c[0]), float(c[1])
+    acx, acy = cx - ax, cy - ay
+    length = (acx * acx + acy * acy) ** 0.5
+    if length <= 1e-4:
+        return True
+    cross = (bx - ax) * acy - (by - ay) * acx
+    if abs(cross) / length > 1e-3:
+        return False
+    dot = (bx - ax) * acx + (by - ay) * acy
+    return -1e-4 <= dot <= length * length + 1e-4
+
+
+def _clean_ring(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    """Повторы и точки на прямой стене. Скругление угла в дугу не делается."""
+    ring = [(float(point[0]), float(point[1]), 0.0) for point in points]
+    if len(ring) > 1 and _almost_same(ring[0], ring[-1]):
+        ring = ring[:-1]
+    unique: list[tuple[float, float, float]] = []
+    for point in ring:
+        if unique and _almost_same(unique[-1], point):
+            continue
+        unique.append(point)
+    if len(unique) > 1 and _almost_same(unique[0], unique[-1]):
+        unique.pop()
+    guard = 0
+    changed = True
+    while changed and len(unique) >= 3 and guard < len(points) + 4:
+        guard += 1
+        changed = False
+        count = len(unique)
+        kept: list[tuple[float, float, float]] = []
+        for index in range(count):
+            if _on_straight_wall(unique[(index - 1) % count], unique[index], unique[(index + 1) % count]):
+                changed = True
+                continue
+            kept.append(unique[index])
+        unique = kept
+    if len(unique) < 3 or abs(_ring_area(unique)) <= 1e-6:
+        return []
+    return unique
+
+
+def _largest_polygon(geometry):
+    kind = getattr(geometry, "geom_type", "")
+    if kind == "Polygon":
+        return geometry
+    parts = getattr(geometry, "geoms", None)
+    if not parts:
+        return None
+    found = []
+    for item in parts:
+        polygon = _largest_polygon(item)
+        if polygon is not None and not polygon.is_empty:
+            found.append(polygon)
+    if not found:
+        return None
+    return max(found, key=lambda item: item.area)
+
+
+def _rings_from_polygon(polygon) -> list[list[tuple[float, float, float]]]:
+    outer = _clean_ring([(float(x), float(y), 0.0) for x, y in list(polygon.exterior.coords)[:-1]])
+    if len(outer) < 3:
+        return []
+    if _ring_area(outer) < 0:
+        outer = list(reversed(outer))
+    holes = []
+    for interior in polygon.interiors:
+        hole = _clean_ring([(float(x), float(y), 0.0) for x, y in list(interior.coords)[:-1]])
+        if len(hole) < 3:
+            continue
+        if _ring_area(hole) > 0:
+            hole = list(reversed(hole))
+        holes.append(hole)
+    return [outer, *holes]
+
+
+def _repair_rings(loops: list[list[tuple[float, float, float]]]) -> list[list[tuple[float, float, float]]]:
+    """Самопересечения чинит shapely, если библиотека уже стоит. Иначе контур остаётся как есть."""
+    if not loops:
+        return []
+    try:
+        import sys
+
+        vendor = Path(__file__).resolve().parent / "vendor"
+        folder = str(vendor)
+        if vendor.is_dir() and folder not in sys.path:
+            sys.path.insert(0, folder)
+        from shapely.geometry import Polygon
+        from shapely.validation import make_valid
+    except Exception:
+        return loops
+    try:
+        outer = [(point[0], point[1]) for point in loops[0]]
+        holes = [[(point[0], point[1]) for point in hole] for hole in loops[1:]]
+        polygon = Polygon(outer, holes)
+        if polygon.is_empty or polygon.is_valid:
+            return loops
+        polygon = _largest_polygon(make_valid(polygon))
+        if polygon is None or polygon.is_empty:
+            return loops
+        return _rings_from_polygon(polygon) or loops
+    except Exception:
+        return loops
+
+
+def _clean_loops(loops: list[list[tuple[float, float, float]]]) -> list[list[tuple[float, float, float]]]:
+    """Внешний контур против часовой, дыры по часовой. Углы дома не скругляются."""
+    cleaned: list[list[tuple[float, float, float]]] = []
+    for ring in loops:
+        ring = _clean_ring(list(ring))
+        if len(ring) >= 3:
+            cleaned.append(ring)
+    if not cleaned:
+        return []
+    outer = cleaned[0]
+    if _ring_area(outer) < 0:
+        outer = list(reversed(outer))
+    holes = []
+    for hole in cleaned[1:]:
+        if _ring_area(hole) > 0:
+            hole = list(reversed(hole))
+        holes.append(hole)
+    return _repair_rings([outer, *holes])
+
+
 def _footprint_mesh(loops: list[list[tuple[float, float, float]]]):
     """Грань внешнего контура и рёбра дыр. Диагоналей нет, нода читает сам контур."""
     verts: list[tuple[float, float, float]] = [point for loop in loops for point in loop]
@@ -1637,60 +1780,6 @@ def _footprint_mesh(loops: list[list[tuple[float, float, float]]]):
     return mesh
 
 
-def _prism_mesh(loops: list[list[tuple[float, float, float]]]):
-    """Высокая призма контура с дырами. По ней дом обрезается в плане, не по высоте."""
-    from mathutils.geometry import tessellate_polygon
-
-    flat: list[Vector] = []
-    vectors: list[list[Vector]] = []
-    for loop in loops:
-        ring = [Vector((point[0], point[1], 0.0)) for point in loop]
-        vectors.append(ring)
-        flat.extend(ring)
-    triangles = tessellate_polygon(vectors)
-    if not triangles:
-        return None
-    count = len(flat)
-    verts = [(point.x, point.y, -50.0) for point in flat]
-    verts.extend((point.x, point.y, 500.0) for point in flat)
-    faces: list[tuple[int, ...]] = []
-    for tri in triangles:
-        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-        faces.append((a, c, b))
-        faces.append((a + count, b + count, c + count))
-    offset = 0
-    for index, loop in enumerate(loops):
-        size = len(loop)
-        for step in range(size):
-            nxt = (step + 1) % size
-            bottom0 = offset + step
-            bottom1 = offset + nxt
-            top0 = bottom0 + count
-            top1 = bottom1 + count
-            if index == 0:
-                faces.append((bottom0, bottom1, top1, top0))
-            else:
-                faces.append((bottom0, top0, top1, bottom1))
-        offset += size
-    mesh = bpy.data.meshes.new("Здание.призма")
-    mesh.from_pydata(verts, [], faces)
-    mesh.update()
-    _outward_normals(mesh)
-    return mesh
-
-
-def _outward_normals(mesh) -> None:
-    import bmesh
-
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    if bm.calc_volume(signed=True) < 0:
-        bmesh.ops.reverse_faces(bm, faces=bm.faces)
-    bm.to_mesh(mesh)
-    bm.free()
-
-
 def _drop_clip(obj) -> None:
     for modifier in list(obj.modifiers):
         if modifier.type == "BOOLEAN" and modifier.name == "Полигон":
@@ -1704,38 +1793,10 @@ def _drop_clip(obj) -> None:
             bpy.data.meshes.remove(mesh)
 
 
-def _clip_to_polygon(obj, loops: list[list[tuple[float, float, float]]]) -> None:
-    """Пересечение с призмой контура. Свес и двор срезаются, этажи остаются."""
-    _drop_clip(obj)
-    collection = next(iter(obj.users_collection), None)
-    if collection is None:
-        return
-    mesh = _prism_mesh(loops)
-    if mesh is None:
-        return
-    cutter = bpy.data.objects.new("Здание.контур", mesh)
-    collection.objects.link(cutter)
-    cutter.parent = obj
-    cutter.matrix_parent_inverse.identity()
-    cutter.location = (0.0, 0.0, 0.0)
-    cutter.rotation_euler = (0.0, 0.0, 0.0)
-    cutter.scale = (1.0, 1.0, 1.0)
-    cutter.hide_render = True
-    cutter.hide_select = True
-    try:
-        cutter.hide_set(True)
-    except Exception:
-        pass
-    modifier = obj.modifiers.new("Полигон", "BOOLEAN")
-    modifier.operation = "INTERSECT"
-    modifier.object = cutter
-    solvers = {item.identifier for item in modifier.bl_rna.properties["solver"].enum_items}
-    modifier.solver = "MANIFOLD" if "MANIFOLD" in solvers else "FLOAT"
-
-
 def _apply_polygon(obj, vertices, faces, origin, height: float) -> None:
-    """След дома — сам полигон в метрах. Масштаб X и Y равен 1, высота не меняется."""
-    loops = _oriented_loops(vertices, faces, origin)
+    """След дома — очищенный контур в метрах. Масштаб X и Y равен 1, высота не меняется."""
+    raw = _oriented_loops(vertices, faces, origin)
+    loops = _clean_loops(raw) or raw
     cx, cy = float(origin[0]), float(origin[1])
     if loops:
         mesh = _footprint_mesh(loops)
@@ -1747,8 +1808,8 @@ def _apply_polygon(obj, vertices, faces, origin, height: float) -> None:
     obj.location = (cx, cy, float(height))
     obj.rotation_euler = Euler((obj.rotation_euler.x, obj.rotation_euler.y, 0.0), "XYZ")
     obj.scale = (1.0, 1.0, kept_z)
-    if loops:
-        _clip_to_polygon(obj, loops)
+    _unlock_transform(obj)
+    _drop_clip(obj)
 
 
 def place_building(context):
@@ -1806,8 +1867,46 @@ def clear_auto_buildings() -> None:
             bpy.data.meshes.remove(mesh)
 
 
+def _id_numbers(source, name: str) -> list[float]:
+    try:
+        raw = source.get(name)
+    except ReferenceError:
+        return []
+    if raw is None:
+        return []
+    try:
+        return [float(item) for item in list(raw)]
+    except (TypeError, ValueError):
+        return []
+
+
+def _footprint_area(vertices, faces) -> float:
+    """Площадь контура ноды: внешнее кольцо минус дыры, в единицах сетки."""
+    loops = _oriented_loops(vertices, faces, (0.0, 0.0))
+    if not loops:
+        return 0.0
+    area = abs(_ring_area(loops[0]))
+    for hole in loops[1:]:
+        area -= abs(_ring_area(hole))
+    return max(area, 0.0)
+
+
+def _building_spots(source, vertices, faces):
+    """Пятна, на которые садится нода: треугольники одного полигона."""
+    counts = _id_numbers(source, "polygon_face_counts") or _id_numbers(source, "polygon_faces")
+    whole = [int(count) for count in counts if int(count) > 0]
+    if whole and sum(whole) == len(faces):
+        start = 0
+        spots = []
+        for count in whole:
+            spots.append((vertices, faces[start:start + count]))
+            start += count
+        return spots
+    return list(_islands(vertices, faces))
+
+
 def place_auto_buildings(context) -> str:
-    """Дом на каждый полигон зданий подложки. Сбой одного полигона не останавливает остальные."""
+    """Дом на каждый полигон зданий подложки. Мелкие пятна пропускаются, если фильтр включён."""
     scene = getattr(context, "scene", None)
     if scene is None or not bool(getattr(scene, "dwgreader_auto_buildings", False)):
         return ""
@@ -1816,25 +1915,47 @@ def place_auto_buildings(context) -> str:
     root = bpy.data.collections.get(ROOT_NAME)
     if root is None:
         return ""
-    made = 0
-    template = None
+
+    from .placement_math import areas_to_square_meters, footprint_longer_side
+
+    skip_small = bool(getattr(scene, "dwgreader_skip_small_buildings", False))
+    min_area = float(getattr(scene, "dwgreader_min_building_area_m2", 0.0) or 0.0)
+    pending = []
     for source in list(root.all_objects):
         if source.type != "MESH" or str(source.get("category") or "") != "building":
             continue
         if getattr(source, "data", None) is None or not source.data.polygons:
             continue
         vertices, faces = _mesh_faces(source, False)
-        for island in _islands(vertices, faces):
-            try:
-                built = _place_islands(context, [island], template, auto=True)
-            except Exception:
-                logging.warning("Не удалось построить здание из %s", source.name, exc_info=True)
-                continue
-            if not built:
-                continue
-            template = built[-1]
-            made += len(built)
-    if made <= 0:
+        for spot_vertices, spot_faces in _building_spots(source, vertices, faces):
+            pending.append((
+                source.name,
+                spot_vertices,
+                spot_faces,
+                _footprint_area(spot_vertices, spot_faces),
+                footprint_longer_side(spot_vertices, spot_faces),
+            ))
+    areas_m2 = areas_to_square_meters(
+        [item[3] for item in pending],
+        [item[4] for item in pending],
+    )
+    made = 0
+    skipped = 0
+    template = None
+    for (source_name, spot_vertices, spot_faces, _area, _side), area_m2 in zip(pending, areas_m2):
+        if skip_small and area_m2 < min_area:
+            skipped += 1
+            continue
+        try:
+            built = _place_islands(context, [(spot_vertices, spot_faces)], template, auto=True)
+        except Exception:
+            logging.warning("Не удалось построить здание из %s", source_name, exc_info=True)
+            continue
+        if not built:
+            continue
+        template = built[-1]
+        made += len(built)
+    if made <= 0 and skipped <= 0:
         return ""
     view_layer = getattr(context, "view_layer", None)
     if template is not None and view_layer is not None:
@@ -1845,7 +1966,10 @@ def place_auto_buildings(context) -> str:
             view_layer.objects.active = template
         except (AttributeError, ReferenceError):
             logging.warning("Не удалось выделить поставленный дом", exc_info=True)
-    return f"здания {made}"
+    note = f"здания {made}"
+    if skipped:
+        note += f", мельче порога {skipped}"
+    return note
 
 
 class DWGREADER_OT_building_preset(Operator):

@@ -2431,12 +2431,17 @@ def _layer_mesh(
     geometry: BaseGeometry,
     origin: tuple[float, float],
     scale: float = 1.0,
-) -> tuple[list[list[float]], list[list[int]], list[int]]:
-    """Треугольники слоя и число треугольников каждого полигона по порядку."""
+) -> tuple[list[list[float]], list[list[int]], list[int], list[float]]:
+    """Треугольники слоя, число треугольников и площадь каждого полигона по порядку.
+
+    Площадь — в м² сцены: дыры уже вычтены, масштаб сцены возведён в квадрат.
+    """
     ox, oy = origin
+    area_scale = float(scale) * float(scale)
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
     polygon_faces: list[int] = []
+    polygon_areas: list[float] = []
     for polygon in _iter_shapely_polygons(geometry):
         if polygon.area < config.settings().min_arrangement_area_m2:
             continue
@@ -2457,7 +2462,8 @@ def _layer_mesh(
         for a, b, c in tri:
             faces.append([int(a) + offset, int(b) + offset, int(c) + offset])
         polygon_faces.append(len(tri))
-    return vertices, faces, polygon_faces
+        polygon_areas.append(round(float(polygon.area) * area_scale, 4))
+    return vertices, faces, polygon_faces, polygon_areas
 
 
 def _bbox_origin(geometries: Sequence[BaseGeometry]) -> tuple[float, float]:
@@ -3388,7 +3394,7 @@ def export_blender_underlay(
     }
     layers_payload: list[dict[str, Any]] = []
     for geometry, category, layer in sorted(faces, key=lambda item: item[2]):
-        vertices, triangles, polygon_faces = _layer_mesh(geometry, origin, scale)
+        vertices, triangles, polygon_faces, polygon_areas = _layer_mesh(geometry, origin, scale)
         if not triangles:
             continue
         color = HATCH_DRAW_COLORS.get(category, (0.55, 0.55, 0.55))
@@ -3400,6 +3406,7 @@ def export_blender_underlay(
             "vertices": vertices,
             "faces": triangles,
             "polygon_faces": polygon_faces,
+            "polygon_areas": polygon_areas,
         }
         texture = texture_by_name.get(normalize_name(layer))
         if texture:

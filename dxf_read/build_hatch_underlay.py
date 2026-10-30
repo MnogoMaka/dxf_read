@@ -104,7 +104,7 @@ def apply_plan_viewport() -> None:
                 space.shading.type = "SOLID"
                 space.shading.light = "FLAT"
                 space.shading.color_type = "MATERIAL"
-                space.shading.show_object_outline = False
+                space.shading.show_object_outline = True
                 space.shading.background_type = "THEME"
                 space.region_3d.view_perspective = "ORTHO"
 

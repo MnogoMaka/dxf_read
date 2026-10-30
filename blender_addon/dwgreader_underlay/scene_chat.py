@@ -27,6 +27,7 @@ from .mcp_bridge import BridgeError, port_open, send_command
 RESPONSES_URL = "https://api.openai.com/v1/responses"
 MAX_ROUNDS = 12
 MAX_MESSAGES = 30
+MAX_CHATS = 40
 _JOB: dict = {"done": False, "error": "", "text": "", "image": "", "tools": [], "entries": []}
 _OUTGOING: list[str] = []
 _LIVE: dict = {"text": "", "tool": "", "tools": [], "summary": ""}
@@ -1408,8 +1409,166 @@ def load_log(scene) -> list:
     return payload if isinstance(payload, list) else []
 
 
-def save_log(scene, items: list) -> None:
+def chats_path() -> Path:
+    return chatgpt_auth.storage_dir() / "chats.json"
+
+
+def chat_title(items: list) -> str:
+    """Первая реплика пользователя. Снимок без текста называется отдельно."""
+    for item in items:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        line = " ".join(str(item.get("text") or "").split())
+        if line:
+            if len(line) > 42:
+                return line[:41].rstrip() + "…"
+            return line
+        pictures = item.get("images") or []
+        if isinstance(pictures, str):
+            pictures = [pictures]
+        if any(pictures):
+            return "Снимок"
+    return ""
+
+
+def _read_chats() -> list[dict]:
+    try:
+        payload = json.loads(chats_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    chats = payload.get("chats") if isinstance(payload, dict) else None
+    if not isinstance(chats, list):
+        return []
+    return [chat for chat in chats if isinstance(chat, dict) and str(chat.get("id") or "")]
+
+
+def _write_chats(chats: list[dict]) -> None:
+    path = chats_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fresh = sorted(chats, key=lambda chat: float(chat.get("updated") or 0), reverse=True)[:MAX_CHATS]
+    payload = json.dumps({"chats": fresh}, ensure_ascii=False)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    try:
+        temporary.replace(path)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def list_chats() -> list[dict]:
+    rows = []
+    for chat in _read_chats():
+        try:
+            updated = float(chat.get("updated") or 0)
+        except (TypeError, ValueError):
+            updated = 0.0
+        rows.append({
+            "id": str(chat.get("id") or ""),
+            "title": str(chat.get("title") or "Чат"),
+            "updated": updated,
+        })
+    rows.sort(key=lambda row: row["updated"], reverse=True)
+    return rows[:MAX_CHATS]
+
+
+def load_chat(chat_id: str) -> list | None:
+    for chat in _read_chats():
+        if str(chat.get("id") or "") != chat_id:
+            continue
+        items = chat.get("items")
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+    return None
+
+
+def store_chat(chat_id: str, items: list) -> None:
+    title = chat_title(items)
+    if not chat_id or not title:
+        return
+    kept = [chat for chat in _read_chats() if str(chat.get("id") or "") != chat_id]
+    kept.append({
+        "id": chat_id,
+        "title": title,
+        "updated": time.time(),
+        "items": items[-MAX_MESSAGES:],
+    })
+    _write_chats(kept)
+
+
+def delete_chat(chat_id: str) -> None:
+    _write_chats([chat for chat in _read_chats() if str(chat.get("id") or "") != chat_id])
+
+
+def _scene_chat_id(scene) -> str:
+    return str(getattr(scene, "dwgreader_chat_id", "") or "")
+
+
+def _remember_current(scene) -> None:
+    items = load_log(scene)
+    if not chat_title(items):
+        return
+    chat_id = _scene_chat_id(scene)
+    if not chat_id:
+        chat_id = uuid.uuid4().hex
+        scene.dwgreader_chat_id = chat_id
+    try:
+        store_chat(chat_id, items)
+    except OSError:
+        pass
+
+
+def begin_chat(scene) -> None:
+    """Закрепляет текущий чат и открывает пустой. Пустая запись в файл не попадает."""
+    if getattr(scene, "dwgreader_chat_busy", False):
+        return
+    _remember_current(scene)
+    scene.dwgreader_chat_log = "[]"
+    scene.dwgreader_chat_id = uuid.uuid4().hex
+
+
+def use_chat(scene, chat_id: str) -> bool:
+    """Подставляет сохранённый чат в буфер сцены. Текущий перед этим записывается."""
+    if not chat_id or getattr(scene, "dwgreader_chat_busy", False):
+        return False
+    if chat_id == _scene_chat_id(scene):
+        return True
+    items = load_chat(chat_id)
+    if items is None:
+        return False
+    _remember_current(scene)
     scene.dwgreader_chat_log = json.dumps(items[-MAX_MESSAGES:], ensure_ascii=False)
+    scene.dwgreader_chat_id = chat_id
+    return True
+
+
+def forget_chat(scene, chat_id: str) -> None:
+    if not chat_id or getattr(scene, "dwgreader_chat_busy", False):
+        return
+    try:
+        delete_chat(chat_id)
+    except OSError:
+        return
+    if _scene_chat_id(scene) != chat_id:
+        return
+    scene.dwgreader_chat_log = "[]"
+    scene.dwgreader_chat_id = uuid.uuid4().hex
+
+
+def save_log(scene, items: list) -> None:
+    trimmed = items[-MAX_MESSAGES:]
+    scene.dwgreader_chat_log = json.dumps(trimmed, ensure_ascii=False)
+    if not chat_title(trimmed):
+        return
+    chat_id = _scene_chat_id(scene)
+    if not chat_id:
+        chat_id = uuid.uuid4().hex
+        scene.dwgreader_chat_id = chat_id
+    try:
+        store_chat(chat_id, trimmed)
+    except OSError:
+        pass
 
 
 def _wrap(text: str, width: int = 48, limit: int = 80) -> list[str]:
@@ -1525,6 +1684,42 @@ def _prefs(context):
     return addon.preferences if addon is not None else None
 
 
+def _restore_work_view() -> None:
+    """После ответа чата на рабочем виде снова видны обводка и гизмо. Окно чата не трогаем."""
+    try:
+        from . import chat_view
+
+        chat_pointer = int(chat_view._UI.get("window") or 0)
+        windows = list(bpy.context.window_manager.windows)
+    except Exception:
+        return
+    for window in windows:
+        try:
+            if chat_pointer and window.as_pointer() == chat_pointer:
+                continue
+            screen = window.screen
+        except ReferenceError:
+            continue
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if getattr(space, "type", None) != "VIEW_3D":
+                    continue
+                overlay = getattr(space, "overlay", None)
+                if overlay is not None:
+                    overlay.show_overlays = True
+                    if hasattr(overlay, "show_outline_selected"):
+                        overlay.show_outline_selected = True
+                shading = getattr(space, "shading", None)
+                if shading is not None and hasattr(shading, "show_object_outline"):
+                    shading.show_object_outline = True
+                if hasattr(space, "show_gizmo"):
+                    space.show_gizmo = True
+
+
 def _redraw_view() -> None:
     try:
         for window in bpy.context.window_manager.windows:
@@ -1568,6 +1763,7 @@ def _finish_timer():
     _LIVE["text"] = ""
     _LIVE["tool"] = ""
     _LIVE["summary"] = ""
+    _restore_work_view()
     _redraw_view()
     return None
 
@@ -1803,6 +1999,7 @@ def register() -> None:
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.dwgreader_chat_log = StringProperty(default="[]", options={"HIDDEN"})
+    bpy.types.Scene.dwgreader_chat_id = StringProperty(default="", options={"HIDDEN"})
     bpy.types.Scene.dwgreader_chat_draft = StringProperty(name="Сообщение", default="")
     bpy.types.Scene.dwgreader_chat_busy = BoolProperty(default=False, options={"HIDDEN"})
 
@@ -1813,7 +2010,7 @@ def unregister() -> None:
     chat_view.unregister()
     if bpy.app.timers.is_registered(_finish_timer):
         bpy.app.timers.unregister(_finish_timer)
-    for name in ("dwgreader_chat_busy", "dwgreader_chat_draft", "dwgreader_chat_log"):
+    for name in ("dwgreader_chat_busy", "dwgreader_chat_draft", "dwgreader_chat_id", "dwgreader_chat_log"):
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
     for cls in reversed(CLASSES):

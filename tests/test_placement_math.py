@@ -11,9 +11,11 @@ import json
 
 from placement_math import (
     bench_path,
+    tagged_mesh_parts,
     bench_positions,
     blocks_playground,
     cluster_boxes,
+    small_sheet_indexes,
     equipment_quads,
     forward_angle,
     impact_margin,
@@ -24,6 +26,8 @@ from placement_math import (
     playground_capacity,
     polygon_area_xy,
     polygon_centroid_xy,
+    areas_to_square_meters,
+    footprint_longer_side,
     quads_overlap,
     safety_inside,
     scatter_points,
@@ -129,6 +133,13 @@ class SheetClusterTests(unittest.TestCase):
         boxes = [(500.0, 0.0, 510.0, 10.0), (0.0, 0.0, 10.0, 10.0)]
         groups = cluster_boxes(boxes, 10.0)
         self.assertEqual(groups, [[1], [0]])
+
+    def test_sheets_below_three_quarters_of_the_largest_are_dropped(self) -> None:
+        self.assertEqual(small_sheet_indexes([100, 80, 40]), [2])
+        self.assertEqual(small_sheet_indexes([100, 75]), [])
+        self.assertEqual(small_sheet_indexes([100, 74]), [1])
+        self.assertEqual(small_sheet_indexes([12]), [])
+        self.assertEqual(small_sheet_indexes([40, 40]), [])
 
 
 def _square(width: float, depth: float) -> tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]:
@@ -360,6 +371,74 @@ class PlaygroundLayerTests(unittest.TestCase):
         self.assertTrue(is_playground_surface("Детская площадка", ""))
         self.assertFalse(is_playground_surface("Тротуар", "tile"))
         self.assertFalse(is_playground_surface("Площадка ТБО", "rubber"))
+
+
+class BuildingFootprintTagTests(unittest.TestCase):
+    def _two_footprints(self):
+        vertices = [
+            (0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (4.0, 5.0, 0.0), (0.0, 5.0, 0.0),
+            (4.0, 0.0, 0.0), (14.0, 0.0, 0.0), (14.0, 20.0, 0.0), (4.0, 20.0, 0.0),
+        ]
+        faces = [(0, 1, 2), (0, 2, 3), (4, 5, 6), (4, 6, 7)]
+        return vertices, faces, [2, 2], [20.0, 200.0]
+
+    def test_one_layer_object_keeps_each_footprint_area(self) -> None:
+        vertices, faces, counts, areas = self._two_footprints()
+        parts = tagged_mesh_parts(vertices, faces, "layer", 10.0, counts, areas)
+        self.assertEqual(len(parts), 1)
+        _part_vertices, part_faces, part_counts, part_areas = parts[0]
+        self.assertEqual(len(part_faces), 4)
+        self.assertEqual(part_counts, [2, 2])
+        self.assertEqual(part_areas, [20.0, 200.0])
+        self.assertEqual([area for area in part_areas if area >= 100.0], [200.0])
+
+    def test_gap_and_polygon_modes_keep_the_same_areas(self) -> None:
+        vertices, faces, counts, areas = self._two_footprints()
+        gap = tagged_mesh_parts(vertices, faces, "gap", 10.0, counts, areas)
+        polygons = tagged_mesh_parts(vertices, faces, "polygon", 10.0, counts, areas)
+        self.assertEqual(len(gap), 1)
+        self.assertEqual(gap[0][2:], ([2, 2], [20.0, 200.0]))
+        self.assertEqual(len(polygons), 2)
+        self.assertEqual(sorted(part[3][0] for part in polygons), [20.0, 200.0])
+        self.assertTrue(all(part[2] == [2] for part in polygons))
+
+    def test_missing_areas_leave_the_mesh_untagged(self) -> None:
+        vertices, faces, counts, _areas = self._two_footprints()
+        parts = tagged_mesh_parts(vertices, faces, "layer", 10.0, counts, [])
+        self.assertEqual(parts[0][2:], ([], []))
+
+
+class BuildingAreaUnitTests(unittest.TestCase):
+    def test_millimeter_rectangle_is_216_square_meters(self) -> None:
+        areas = areas_to_square_meters([18000 * 12000], [18000])
+        self.assertAlmostEqual(areas[0], 216.0)
+        self.assertLess(areas[0], 10000)
+
+    def test_meter_rectangle_stays_below_10000(self) -> None:
+        areas = areas_to_square_meters([40 * 25], [40])
+        self.assertAlmostEqual(areas[0], 1000.0)
+        self.assertLess(areas[0], 10000)
+
+    def test_large_meter_rectangle_stays_above_10000(self) -> None:
+        areas = areas_to_square_meters([200 * 80], [200])
+        self.assertAlmostEqual(areas[0], 16000.0)
+        self.assertGreaterEqual(areas[0], 10000)
+
+    def test_annex_uses_the_same_multiplier_as_the_tower(self) -> None:
+        areas = areas_to_square_meters(
+            [18000 * 12000, 1500 * 1000],
+            [18000, 1500],
+        )
+        self.assertAlmostEqual(areas[0], 216.0)
+        self.assertAlmostEqual(areas[1], 1.5)
+        self.assertTrue(all(area < 10000 for area in areas))
+
+    def test_longer_side_uses_only_the_spot_faces(self) -> None:
+        vertices = [
+            (0.0, 0.0, 0.0), (18000.0, 0.0, 0.0), (18000.0, 12000.0, 0.0), (0.0, 12000.0, 0.0),
+            (20000.0, 0.0, 0.0), (40000.0, 0.0, 0.0), (40000.0, 10000.0, 0.0),
+        ]
+        self.assertEqual(footprint_longer_side(vertices, [(0, 1, 2), (0, 2, 3)]), 18000.0)
 
 
 class AddonLoadTests(unittest.TestCase):

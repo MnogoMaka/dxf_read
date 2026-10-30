@@ -48,12 +48,59 @@ class FootprintLoopTests(unittest.TestCase):
         self.assertLess(ns["_ring_area"](oriented[1]), 0.0)
         self.assertAlmostEqual(abs(ns["_ring_area"](oriented[0])), 100.0, places=3)
 
-    def test_place_path_does_not_scale_the_footprint_to_the_node_box(self) -> None:
+    def test_place_path_follows_the_contour_without_a_boolean_cut(self) -> None:
         text = SOURCE.read_text(encoding="utf-8")
         self.assertNotIn("def _seat_on_polygon", text)
         self.assertNotIn("def _footprint_span", text)
-        self.assertIn('modifier.operation = "INTERSECT"', text)
+        self.assertNotIn("def _clip_to_polygon", text)
+        self.assertNotIn('modifier.operation = "INTERSECT"', text)
         self.assertIn('modifier.name == "Полигон"', text)
+        self.assertIn("_clean_loops(raw) or raw", text)
+        self.assertIn("_drop_clip(obj)", text)
+        self.assertIn("obj.hide_select = False", text)
+
+    def test_clean_ring_drops_a_point_on_a_straight_wall_and_keeps_the_corner(self) -> None:
+        ns = _functions(
+            "_ring_area",
+            "_almost_same",
+            "_on_straight_wall",
+            "_clean_ring",
+            "_largest_polygon",
+            "_rings_from_polygon",
+            "_repair_rings",
+            "_clean_loops",
+        )
+        square = [
+            (0.0, 0.0, 0.0),
+            (5.0, 0.0, 0.0),
+            (10.0, 0.0, 0.0),
+            (10.0, 10.0, 0.0),
+            (0.0, 10.0, 0.0),
+            (0.0, 0.0, 0.0),
+        ]
+        cleaned = ns["_clean_ring"](square)
+        self.assertEqual(len(cleaned), 4)
+        self.assertAlmostEqual(abs(ns["_ring_area"](cleaned)), 100.0, places=3)
+
+        kink = [
+            (0.0, 0.0, 0.0),
+            (5.0, 0.05, 0.0),
+            (10.0, 0.0, 0.0),
+            (10.0, 10.0, 0.0),
+            (0.0, 10.0, 0.0),
+        ]
+        self.assertEqual(len(ns["_clean_ring"](kink)), 5)
+
+        hole = [
+            (4.0, 4.0, 0.0),
+            (6.0, 4.0, 0.0),
+            (6.0, 6.0, 0.0),
+            (4.0, 6.0, 0.0),
+        ]
+        loops = ns["_clean_loops"]([cleaned, hole])
+        self.assertEqual(len(loops), 2)
+        self.assertGreater(ns["_ring_area"](loops[0]), 0.0)
+        self.assertLess(ns["_ring_area"](loops[1]), 0.0)
 
     def test_reloaded_node_group_still_counts_as_the_house(self) -> None:
         text = SOURCE.read_text(encoding="utf-8")
@@ -70,4 +117,5 @@ class FootprintLoopTests(unittest.TestCase):
     def test_auto_houses_get_the_house_preset_not_only_an_exact_tower(self) -> None:
         text = SOURCE.read_text(encoding="utf-8")
         self.assertIn("apply_preset(obj, DEFAULT_BUILDING_PRESET)", text)
+        self.assertIn('DEFAULT_BUILDING_PRESET = "main002"', text)
         self.assertIn("return found[-1]", text)

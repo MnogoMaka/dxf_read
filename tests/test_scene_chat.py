@@ -4,11 +4,13 @@ import importlib.util
 import json
 import base64
 import sys
+import tempfile
 import threading
 import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 
 ADDON = Path(__file__).resolve().parents[1] / "blender_addon" / "dwgreader_underlay"
@@ -329,6 +331,17 @@ class LoopTests(unittest.TestCase):
         body = source.split("def _schedule_underlay_replace", 1)[1].split("def build_underlay", 1)[0]
         self.assertLess(body.find("placement.clear_placement()"), body.find("build_underlay("))
         self.assertLess(body.find("placement.clear_placement()"), body.find("furnish_underlay("))
+
+    def test_status_keeps_the_building_skip_count(self) -> None:
+        source = (ADDON / "__init__.py").read_text(encoding="utf-8")
+        start = source.index("def _fit_status")
+        end = source.index("\ndef _schedule_underlay_replace", start)
+        namespace: dict = {}
+        exec(source[start:end], namespace)
+        text = "Готово: объектов в сцене 40. " + ("деревья 12, " * 30) + "здания 3, мельче порога 12"
+        fitted = namespace["_fit_status"](text)
+        self.assertLessEqual(len(fitted), 180)
+        self.assertIn("здания 3, мельче порога 12", fitted)
 
     def test_tool_row_is_sent_as_a_tool_result(self) -> None:
         scene_chat._REPLAY.put("сделал", ["call_1"], [
@@ -738,6 +751,123 @@ class McpReadyTests(unittest.TestCase):
         send = source.split("class DWGREADER_OT_chat_send", 1)[1].split("class DWGREADER_OT_chat_stop", 1)[0]
         self.assertLess(send.find("scene_changes.arm(scene)"), send.find("dwgreader_chat_busy = True"))
         self.assertIn("def release_turn", source)
+
+    def test_chat_turn_restores_the_selection_outline(self) -> None:
+        source = Path(scene_chat.__file__).read_text(encoding="utf-8")
+        chat = (ADDON / "chat_view.py").read_text(encoding="utf-8")
+        viewport = (ADDON / "build_scene.py").read_text(encoding="utf-8")
+        self.assertIn("def _restore_work_view", source)
+        self.assertIn("_restore_work_view()", source)
+        self.assertIn("overlay.show_outline_selected = True", source)
+        self.assertIn("shading.show_object_outline = True", source)
+        self.assertNotIn("def _quiet_space", chat)
+        self.assertNotIn("overlay.show_overlays = False", chat)
+        self.assertIn("space.shading.show_object_outline = True", viewport)
+        self.assertNotIn("space.shading.show_object_outline = False", viewport)
+
+
+class _Scene:
+    def __init__(self) -> None:
+        self.dwgreader_chat_log = "[]"
+        self.dwgreader_chat_id = ""
+        self.dwgreader_chat_busy = False
+
+
+class ChatHistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patcher = patch.object(scene_chat.chatgpt_auth, "storage_dir", return_value=Path(self.tmp.name))
+        self.patcher.start()
+        self.clock = 1_000.0
+        self.time_patch = patch.object(scene_chat.time, "time", self._now)
+        self.time_patch.start()
+
+    def tearDown(self) -> None:
+        self.time_patch.stop()
+        self.patcher.stop()
+        self.tmp.cleanup()
+
+    def _now(self) -> float:
+        self.clock += 1.0
+        return self.clock
+
+    def test_saved_chat_keeps_the_first_user_line_as_its_title(self) -> None:
+        scene = _Scene()
+        scene_chat.save_log(scene, [
+            {"role": "assistant", "text": "Сначала ответ"},
+            {"role": "user", "text": "Поставь лавки вдоль дорожки и добавь деревья у площадки"},
+            {"role": "user", "text": "Второе сообщение"},
+        ])
+        loaded = scene_chat.load_chat(scene.dwgreader_chat_id)
+        assert loaded is not None
+        self.assertEqual(loaded[1]["text"], "Поставь лавки вдоль дорожки и добавь деревья у площадки")
+        title = scene_chat.list_chats()[0]["title"]
+        self.assertTrue(title.startswith("Поставь лавки вдоль дорожки"))
+        self.assertNotIn("Второе", title)
+        self.assertLessEqual(len(title), 42)
+        self.assertTrue(title.endswith("…"))
+
+    def test_picture_without_text_is_titled_snapshot(self) -> None:
+        scene = _Scene()
+        scene_chat.save_log(scene, [{"role": "user", "text": "", "images": ["shot.png"]}])
+        self.assertEqual(scene_chat.list_chats()[0]["title"], "Снимок")
+
+    def test_empty_log_does_not_erase_the_saved_chat(self) -> None:
+        scene = _Scene()
+        scene_chat.save_log(scene, [{"role": "user", "text": "Первый"}])
+        saved_id = scene.dwgreader_chat_id
+        scene_chat.save_log(scene, [])
+        self.assertEqual(scene.dwgreader_chat_log, "[]")
+        self.assertEqual(scene.dwgreader_chat_id, saved_id)
+        loaded = scene_chat.load_chat(saved_id)
+        assert loaded is not None
+        self.assertEqual(loaded[0]["text"], "Первый")
+
+    def test_new_chat_keeps_the_previous_one(self) -> None:
+        scene = _Scene()
+        scene_chat.save_log(scene, [{"role": "user", "text": "Первый"}])
+        previous = scene.dwgreader_chat_id
+        scene_chat.begin_chat(scene)
+        self.assertNotEqual(scene.dwgreader_chat_id, previous)
+        self.assertEqual(json.loads(scene.dwgreader_chat_log), [])
+        scene_chat.save_log(scene, [{"role": "user", "text": "Второй"}])
+        self.assertEqual(scene_chat.load_chat(previous)[0]["text"], "Первый")
+        self.assertEqual(scene_chat.load_chat(scene.dwgreader_chat_id)[0]["text"], "Второй")
+        self.assertEqual([row["title"] for row in scene_chat.list_chats()], ["Второй", "Первый"])
+
+    def test_opening_a_saved_chat_replaces_the_scene_buffer(self) -> None:
+        scene = _Scene()
+        scene_chat.save_log(scene, [{"role": "user", "text": "Первый"}])
+        first = scene.dwgreader_chat_id
+        scene_chat.begin_chat(scene)
+        scene_chat.save_log(scene, [{"role": "user", "text": "Второй"}])
+        self.assertTrue(scene_chat.use_chat(scene, first))
+        self.assertEqual(scene.dwgreader_chat_id, first)
+        self.assertEqual(json.loads(scene.dwgreader_chat_log)[0]["text"], "Первый")
+        second = next(row for row in scene_chat.list_chats() if row["id"] != first)
+        self.assertEqual(scene_chat.load_chat(second["id"])[0]["text"], "Второй")
+
+    def test_history_keeps_the_forty_newest_chats(self) -> None:
+        scene = _Scene()
+        for index in range(45):
+            scene.dwgreader_chat_id = f"id-{index}"
+            scene_chat.save_log(scene, [{"role": "user", "text": f"Чат {index}"}])
+        rows = scene_chat.list_chats()
+        self.assertEqual(len(rows), 40)
+        ids = {row["id"] for row in rows}
+        self.assertNotIn("id-0", ids)
+        self.assertIn("id-44", ids)
+        self.assertEqual(rows[0]["id"], "id-44")
+
+    def test_delete_removes_the_chat(self) -> None:
+        scene = _Scene()
+        scene_chat.save_log(scene, [{"role": "user", "text": "Удалить"}])
+        chat_id = scene.dwgreader_chat_id
+        scene_chat.forget_chat(scene, chat_id)
+        self.assertIsNone(scene_chat.load_chat(chat_id))
+        self.assertEqual(scene_chat.list_chats(), [])
+        self.assertEqual(scene.dwgreader_chat_log, "[]")
+        self.assertNotEqual(scene.dwgreader_chat_id, chat_id)
 
 
 if __name__ == "__main__":
