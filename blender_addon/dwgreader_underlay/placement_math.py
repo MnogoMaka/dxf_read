@@ -72,6 +72,15 @@ def footprint_longer_side(vertices, faces) -> float:
     return max(max(xs) - min(xs), max(ys) - min(ys))
 
 
+def mesh_plan_side(vertices: list[tuple[float, float, float]]) -> float:
+    """Сторона квадрата плана: большая сторона рамки XY уже поставленной на землю сетки."""
+    if not vertices:
+        return 0.0
+    xs = [float(vertex[0]) for vertex in vertices]
+    ys = [float(vertex[1]) for vertex in vertices]
+    return max(max(xs) - min(xs), max(ys) - min(ys))
+
+
 def areas_to_square_meters(areas: list[float], longer_sides: list[float]) -> list[float]:
     """Площади контуров в м². Один множитель на все пятна плана.
 
@@ -865,6 +874,194 @@ def quads_overlap(left: list[tuple[float, float]], right: list[tuple[float, floa
     return True
 
 
+# Ниже этой площади пересечение — общая кромка или численный шум, не наложение карты.
+FOOTPRINT_SLIVER_M2 = 1e-6
+# Два растения можно поставить, пока пересечение не больше этой доли меньшего следа.
+PLANT_OVERLAP_LIMIT = 0.30
+# Стартовые значения и для кнопки, и для авторасстановки: оба читают одни свойства сцены.
+DEFAULT_PLANT_DENSITY = 1.0  # шт/100 м²
+DEFAULT_TREE_SHARE = 30.0  # проценты
+# Прошлые стартовые значения. Сцена, которая их ещё хранит, переходит на новые при включении аддона.
+_PREVIOUS_PLANT_DENSITY = 3.0
+_PREVIOUS_TREE_SHARE = 10.0
+
+
+def adopt_plant_defaults(density: float, share: float) -> tuple[float, float]:
+    """Старые стартовые 3 шт/100 м² и 10% деревьев заменяются на текущие.
+
+    Любое другое число остаётся: его выставил пользователь.
+    """
+    if abs(float(density) - _PREVIOUS_PLANT_DENSITY) < 1e-6:
+        density = DEFAULT_PLANT_DENSITY
+    if abs(float(share) - _PREVIOUS_TREE_SHARE) < 1e-6:
+        share = DEFAULT_TREE_SHARE
+    return float(density), float(share)
+
+
+def plant_slot_count(area_m2: float, per_square_meter: float) -> int:
+    """Сколько слотов просит плотность. Половина округляется вверх.
+
+    Ноль остаётся нулём: мелкий газон при редкой плотности остаётся пустым.
+    Минимума в одно растение нет.
+    """
+    if area_m2 <= 0.0 or per_square_meter <= 0.0:
+        return 0
+    return int(float(area_m2) * float(per_square_meter) + 0.5)
+
+
+def slot_attempt_families(choose, attempts: int) -> list:
+    """Семейство слота выбирается один раз. Каждая попытка несёт тот же выбор.
+
+    choose() вызывается ровно один раз. Повтор двигает точку, а не подменяет дерево кустом.
+    """
+    if attempts <= 0:
+        return []
+    family = choose()
+    return [family for _ in range(int(attempts))]
+
+
+def oriented_square(
+    center: tuple[float, float],
+    side: float,
+    yaw: float,
+) -> list[tuple[float, float]]:
+    """Квадрат плана с центром в точке, стороной side и рысканьем вокруг Z."""
+    half = float(side) * 0.5
+    origin = (float(center[0]), float(center[1]))
+    angle = float(yaw)
+    return [
+        _rotate(-half, -half, angle, origin),
+        _rotate(half, -half, angle, origin),
+        _rotate(half, half, angle, origin),
+        _rotate(-half, half, angle, origin),
+    ]
+
+
+def plant_footprint(
+    center: tuple[float, float],
+    plan_side: float,
+    yaw: float,
+    plant_scale: float,
+) -> list[tuple[float, float]]:
+    """След модели: сторона сетки после импорта, умноженная на размер посадки."""
+    return oriented_square(center, float(plan_side) * float(plant_scale), yaw)
+
+
+def _as_polygon(shape):
+    if hasattr(shape, "geom_type") and hasattr(shape, "area"):
+        return shape
+    _point, polygon, _union, _prep = _shapely()
+    geometry = polygon(list(shape))
+    if not geometry.is_valid:
+        geometry = geometry.buffer(0)
+    return geometry
+
+
+def polygon_overlap_area(left, right) -> float:
+    """Площадь пересечения двух контуров.
+
+    Меньше FOOTPRINT_SLIVER_M2 (1e-6 м²) считается нулём: общая кромка и
+    щепка от округления не должны мигать. Касание ребра с нулевой площадью
+    тоже нуль. Наложение карты от порога и выше возвращается как есть.
+    """
+    left_polygon = _as_polygon(left)
+    right_polygon = _as_polygon(right)
+    if left_polygon.is_empty or right_polygon.is_empty:
+        return 0.0
+    if not left_polygon.intersects(right_polygon):
+        return 0.0
+    shared = float(left_polygon.intersection(right_polygon).area)
+    if shared < FOOTPRINT_SLIVER_M2:
+        return 0.0
+    return shared
+
+
+def footprint_overlap_fraction(left, right) -> float:
+    """Площадь пересечения, делённая на площадь меньшего контура."""
+    left_polygon = _as_polygon(left)
+    right_polygon = _as_polygon(right)
+    smaller = min(float(left_polygon.area), float(right_polygon.area))
+    if smaller <= 0.0:
+        return 0.0
+    return polygon_overlap_area(left_polygon, right_polygon) / smaller
+
+
+def footprints_overlap_too_much(left, right, limit: float = PLANT_OVERLAP_LIMIT) -> bool:
+    """True, если пересечение строго больше limit от меньшего следа."""
+    return footprint_overlap_fraction(left, right) > float(limit)
+
+
+def _unite_rings(rings: list[list[tuple[float, float]]]):
+    _point, _polygon, unary_union, _prep = _shapely()
+    polygons = []
+    for ring in rings:
+        if ring is None or len(ring) < 3:
+            continue
+        geometry = _as_polygon(ring)
+        if geometry.is_empty or float(geometry.area) <= 0.0:
+            continue
+        polygons.append(geometry)
+    if not polygons:
+        return None
+    return unary_union(polygons)
+
+
+class PlantObstacles:
+    """Здания и покрытия, собранные один раз на проход расстановки.
+
+    Здание закрывает и дерево, и куст. Покрытие закрывает только куст.
+    Порог площади — FOOTPRINT_SLIVER_M2, см. polygon_overlap_area.
+    """
+
+    def __init__(
+        self,
+        buildings: list[list[tuple[float, float]]] | None = None,
+        pavements: list[list[tuple[float, float]]] | None = None,
+    ) -> None:
+        _point, _polygon, _union, prep = _shapely()
+        self.buildings = _unite_rings(list(buildings or []))
+        self.pavements = _unite_rings(list(pavements or []))
+        self._buildings = prep(self.buildings) if self.buildings is not None else None
+        self._pavements = prep(self.pavements) if self.pavements is not None else None
+
+    def _hits(self, geometry, prepared, quad: list[tuple[float, float]]) -> bool:
+        if geometry is None or prepared is None:
+            return False
+        _point, polygon, _union, _prep = _shapely()
+        footprint = polygon(quad)
+        if not prepared.intersects(footprint):
+            return False
+        return polygon_overlap_area(geometry, footprint) > 0.0
+
+    def blocks(self, quad: list[tuple[float, float]], family: str) -> bool:
+        if self._hits(self.buildings, self._buildings, quad):
+            return True
+        return family == "bush" and self._hits(self.pavements, self._pavements, quad)
+
+
+class OccupiedFootprints:
+    """Следы уже принятых растений. Один набор на все газоны прохода."""
+
+    def __init__(self) -> None:
+        self._items: list[tuple[tuple[float, float, float, float], object]] = []
+
+    def blocks(self, quad: list[tuple[float, float]]) -> bool:
+        polygon = _as_polygon(quad)
+        if polygon.is_empty or float(polygon.area) <= 0.0:
+            return True
+        box = polygon.bounds
+        for other_box, other in self._items:
+            if other_box[2] < box[0] or box[2] < other_box[0] or other_box[3] < box[1] or box[3] < other_box[1]:
+                continue
+            if footprints_overlap_too_much(polygon, other):
+                return True
+        return False
+
+    def add(self, quad: list[tuple[float, float]]) -> None:
+        polygon = _as_polygon(quad)
+        self._items.append((polygon.bounds, polygon))
+
+
 def _quad_inside(quad: list[tuple[float, float]], ground: _Triangles, blocked: _Triangles | None) -> bool:
     if not ground.covers(quad):
         return False
@@ -1048,3 +1245,161 @@ def plan_image(segments: list[tuple[float, float, float, float]], size: int = 16
         + _png_chunk(b"IDAT", zlib.compress(raw, 6))
         + _png_chunk(b"IEND", b"")
     )
+
+
+def _glb_parts(path: Path) -> tuple[dict, bytes]:
+    """JSON и двоичный буфер GLB. Сетка читается без Blender."""
+    import json
+
+    data = Path(path).read_bytes()
+    magic, _version, _length = struct.unpack_from("<III", data, 0)
+    if magic != 0x46546C67:
+        raise ValueError(f"Не GLB: {path}")
+    offset = 12
+    payload = None
+    blob = b""
+    while offset + 8 <= len(data):
+        chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+        chunk = data[offset + 8:offset + 8 + chunk_length]
+        offset += 8 + chunk_length
+        if chunk_type == 0x4E4F534A:
+            payload = json.loads(chunk)
+        elif chunk_type == 0x004E4942:
+            blob = chunk
+    if payload is None:
+        raise ValueError(f"В {path} нет JSON")
+    return payload, blob
+
+
+def _quat_matrix(qx: float, qy: float, qz: float, qw: float) -> tuple[tuple[float, float, float], ...]:
+    xx, yy, zz = qx * qx, qy * qy, qz * qz
+    xy, xz, yz = qx * qy, qx * qz, qy * qz
+    wx, wy, wz = qw * qx, qw * qy, qw * qz
+    return (
+        (1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)),
+        (2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)),
+        (2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)),
+    )
+
+
+def _trs_matrix(node: dict) -> tuple[tuple[float, float, float, float], ...]:
+    if "matrix" in node:
+        values = node["matrix"]
+        return tuple(tuple(float(values[row + 4 * column]) for column in range(4)) for row in range(4))
+    translation = node.get("translation") or [0.0, 0.0, 0.0]
+    rotation = node.get("rotation") or [0.0, 0.0, 0.0, 1.0]
+    scale = node.get("scale") or [1.0, 1.0, 1.0]
+    rows = _quat_matrix(float(rotation[0]), float(rotation[1]), float(rotation[2]), float(rotation[3]))
+    sx, sy, sz = float(scale[0]), float(scale[1]), float(scale[2])
+    tx, ty, tz = float(translation[0]), float(translation[1]), float(translation[2])
+    return (
+        (rows[0][0] * sx, rows[0][1] * sy, rows[0][2] * sz, tx),
+        (rows[1][0] * sx, rows[1][1] * sy, rows[1][2] * sz, ty),
+        (rows[2][0] * sx, rows[2][1] * sy, rows[2][2] * sz, tz),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+
+
+def _mul_matrix(left, right):
+    return tuple(
+        tuple(sum(left[row][index] * right[index][column] for index in range(4)) for column in range(4))
+        for row in range(4)
+    )
+
+
+def _apply_matrix(matrix, point: tuple[float, float, float]) -> tuple[float, float, float]:
+    x, y, z = point
+    return (
+        matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3],
+        matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3],
+        matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3],
+    )
+
+
+def _yup_to_zup(point: tuple[float, float, float]) -> tuple[float, float, float]:
+    """glTF смотрит Y вверх, Blender — Z. План после импорта — XY Blender."""
+    x, y, z = point
+    return (x, -z, y)
+
+
+def _mesh_positions(gltf: dict, blob: bytes) -> list[list[tuple[float, float, float]]]:
+    found: list[list[tuple[float, float, float]]] = []
+    for mesh in gltf.get("meshes") or []:
+        points: list[tuple[float, float, float]] = []
+        for primitive in mesh.get("primitives") or []:
+            index = (primitive.get("attributes") or {}).get("POSITION")
+            if index is None:
+                continue
+            accessor = gltf["accessors"][index]
+            if int(accessor.get("componentType", 0)) != 5126 or accessor.get("type") != "VEC3":
+                raise ValueError("Позиции сетки ожидаются как float VEC3")
+            view = gltf["bufferViews"][accessor["bufferView"]]
+            start = int(view.get("byteOffset", 0)) + int(accessor.get("byteOffset", 0))
+            stride = int(view.get("byteStride", 12))
+            for item in range(int(accessor["count"])):
+                points.append(struct.unpack_from("<fff", blob, start + item * stride))
+        found.append(points)
+    return found
+
+
+def _gltf_plan_points(path: Path) -> list[tuple[float, float, float]]:
+    """Вершины в системе Blender после узлового TRS. Сдвиг на землю размер не меняет."""
+    gltf, blob = _glb_parts(path)
+    positions = _mesh_positions(gltf, blob)
+    nodes = gltf.get("nodes") or []
+    identity = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    points: list[tuple[float, float, float]] = []
+
+    def walk(index: int, parent) -> None:
+        node = nodes[index]
+        world = _mul_matrix(parent, _trs_matrix(node))
+        mesh_index = node.get("mesh")
+        if mesh_index is not None:
+            for point in positions[int(mesh_index)]:
+                points.append(_yup_to_zup(_apply_matrix(world, point)))
+        for child in node.get("children") or []:
+            walk(int(child), world)
+
+    scene_index = int(gltf.get("scene") or 0)
+    roots = (gltf.get("scenes") or [{}])[scene_index].get("nodes") or []
+    for root in roots:
+        walk(int(root), identity)
+    return points
+
+
+def glb_planted_points(path: Path) -> list[tuple[float, float, float]]:
+    """Вершины как после импорта: TRS узла запечён, Z вверх, центр плана и низ в нуле.
+
+    Так же сдвигает `_ground_center` после `transform_apply`. Сдвиг размер рамки не меняет.
+    """
+    points = _gltf_plan_points(path)
+    if not points:
+        return []
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    zs = [point[2] for point in points]
+    shift = ((min(xs) + max(xs)) * 0.5, (min(ys) + max(ys)) * 0.5, min(zs))
+    return [(point[0] - shift[0], point[1] - shift[1], point[2] - shift[2]) for point in points]
+
+
+def glb_plan_side(path: Path) -> float:
+    """Сторона квадрата плана после запекания поворота узла.
+
+    Это локальная рамка XY сетки, которую потом крутит рысканье посадки.
+    У «Дерева» рамка до запекания рысканья узла около 21.93 м, после — 17.33 м:
+    вершины лежат в этой меньшей рамке, длинная хорда карты остаётся внутри неё.
+    """
+    return mesh_plan_side(glb_planted_points(path))
+
+
+def glb_node_scale(path: Path) -> float:
+    """Масштаб узла с сеткой. У «Дерева» он не единица, у ели и куста — единица."""
+    gltf, _blob = _glb_parts(path)
+    for node in gltf.get("nodes") or []:
+        if "mesh" not in node:
+            continue
+        scale = node.get("scale")
+        if not scale:
+            return 1.0
+        return float(scale[0])
+    return 1.0

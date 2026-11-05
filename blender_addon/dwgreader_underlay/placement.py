@@ -20,7 +20,10 @@ from bpy_extras import view3d_utils
 from mathutils import Vector
 
 from .placement_math import (
+    adopt_plant_defaults,
     bench_path,
+    DEFAULT_PLANT_DENSITY,
+    DEFAULT_TREE_SHARE,
     face_groups,
     impact_margin,
     blocks_playground,
@@ -30,6 +33,12 @@ from .placement_math import (
     mirrored_keep_from,
     orientation_angle,
     pack_playground,
+    mesh_plan_side,
+    OccupiedFootprints,
+    plant_footprint,
+    plant_slot_count,
+    PlantObstacles,
+    slot_attempt_families,
     polygon_area_xy,
     polygon_centroid_xy,
     safety_inside,
@@ -44,6 +53,7 @@ GROUP_VERSION = 3
 MIN_ZONE_AREA_M2 = 1.0
 MIN_BENCH_STEP_M = 0.5
 MAX_PLANTS = 2500
+PLANT_ATTEMPTS = 24
 
 _CATALOG: list[dict] | None = None
 _CATALOG_STAMP: tuple[str, int] | None = None
@@ -717,8 +727,121 @@ def _pick_plant(rng: random.Random, trees: list[dict], bushes: list[dict], share
     return pool[rng.randrange(len(pool))]
 
 
-def _run_plantings(context, only: bpy.types.Object | None = None, allow_layer_fallback: bool = True) -> tuple[int, str]:
-    """Копии моделей, как у лавок. Геоноды в окне Blender оставляли слой пустым."""
+def _asset_plan_side(asset: dict, mesh_object) -> float:
+    """Сторона карты по сетке после импорта, не по числу из catalog.json."""
+    stored = asset.get("plan_side")
+    if stored is not None and float(stored) > 0.0:
+        return float(stored)
+    vertices = [
+        (float(vertex.co.x), float(vertex.co.y), float(vertex.co.z))
+        for vertex in mesh_object.data.vertices
+    ]
+    side = mesh_plan_side(vertices)
+    asset["plan_side"] = side
+    return side
+
+
+def _category_rings(category: str) -> list[list[tuple[float, float]]]:
+    root = bpy.data.collections.get(UNDERLAY_NAME)
+    if root is None:
+        return []
+    rings: list[list[tuple[float, float]]] = []
+    for obj in list(root.all_objects):
+        try:
+            if obj.type != "MESH" or obj.data is None or not obj.data.polygons:
+                continue
+            if str(obj.get("category") or "") != category:
+                continue
+            world = obj.matrix_world
+            vertices = obj.data.vertices
+            for polygon in obj.data.polygons:
+                ring = []
+                for index in polygon.vertices:
+                    co = world @ vertices[index].co
+                    ring.append((float(co.x), float(co.y)))
+                if len(ring) >= 3:
+                    rings.append(ring)
+        except ReferenceError:
+            continue
+    return rings
+
+
+def _plant_obstacles() -> PlantObstacles:
+    """Здания и покрытия подложки. Забор, мебель и символы растений не мешают."""
+    return PlantObstacles(_category_rings("building"), _category_rings("pavement"))
+
+
+def _plant_zone_key(obj) -> str:
+    stored = str(obj.get("zone_key") or "")
+    if stored:
+        return stored
+    parent = getattr(obj, "parent", None)
+    if parent is None:
+        return ""
+    return str(parent.get("zone_key") or "")
+
+
+def _is_plant_instance(obj) -> bool:
+    if str(obj.get("family") or "") in {"tree", "bush"}:
+        return True
+    parent = getattr(obj, "parent", None)
+    return parent is not None and str(parent.get("placement") or "") == "scatter"
+
+
+def _stored_plan_side(obj) -> float:
+    stored = obj.get("plan_side")
+    if stored is not None and float(stored) > 0.0:
+        return float(stored)
+    data = getattr(obj, "data", None)
+    vertices = getattr(data, "vertices", None)
+    if not vertices:
+        return 0.0
+    return mesh_plan_side([
+        (float(vertex.co.x), float(vertex.co.y), float(vertex.co.z))
+        for vertex in vertices
+    ])
+
+
+def _existing_footprints(context, skip_keys: set[str]) -> OccupiedFootprints:
+    """Следы растений, которые этот проход не снимает."""
+    occupied = OccupiedFootprints()
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is not None and hasattr(view_layer, "update"):
+        view_layer.update()
+    root = bpy.data.collections.get(ROOT_NAME)
+    if root is None:
+        return occupied
+    for obj in list(root.all_objects):
+        try:
+            if obj.type != "MESH" or not _is_plant_instance(obj):
+                continue
+            if _plant_zone_key(obj) in skip_keys:
+                continue
+            plan_side = _stored_plan_side(obj)
+            if plan_side <= 0.0:
+                continue
+            world = obj.matrix_world
+            center = (float(world.translation.x), float(world.translation.y))
+            yaw = float(world.to_euler("XYZ").z)
+            plant_scale = abs(float(world.to_scale().x))
+        except ReferenceError:
+            continue
+        occupied.add(plant_footprint(center, plan_side, yaw, plant_scale))
+    return occupied
+
+
+def _run_plantings(
+    context,
+    only: bpy.types.Object | None = None,
+    allow_layer_fallback: bool = True,
+    occupied: OccupiedFootprints | None = None,
+    obstacles: PlantObstacles | None = None,
+) -> tuple[int, str]:
+    """Копии моделей, как у лавок. Геоноды в окне Blender оставляли слой пустым.
+
+    Встаёт не точка, а квадрат карты. occupied общий на проход: None — собрать
+    растения чужих зон здесь. Препятствия тоже можно принести снаружи, один раз.
+    """
     zones = _selected_zones(context, only=only, allow_layer_fallback=allow_layer_fallback)
     density = float(context.scene.dwgreader_density) / 100.0
     share = float(context.scene.dwgreader_tree_share) / 100.0
@@ -743,51 +866,86 @@ def _run_plantings(context, only: bpy.types.Object | None = None, allow_layer_fa
             sources[asset["id"]] = cached
         return cached
 
+    if obstacles is None:
+        obstacles = _plant_obstacles()
+    if occupied is None:
+        occupied = _existing_footprints(context, {key for _vertices, _faces, key, _height in zones})
     collection = _placement_collection("plantings")
     total = 0
     clamped = False
     for vertices, faces, key, _height in zones:
         area = polygon_area_xy(vertices, faces)
-        expected = int(area * density + 0.5)
-        count = max(expected, 1)
+        count = plant_slot_count(area, density)
         if count > MAX_PLANTS:
             clamped = True
             count = MAX_PLANTS
-        points = scatter_points(vertices, faces, count, seed)
+        _replace_owned(collection, key)
+        if count <= 0:
+            continue
+        # Запас точек на отказы. Первые count совпадают с прежней выборкой того же сида.
+        points = scatter_points(vertices, faces, count * PLANT_ATTEMPTS, seed)
         if not points:
             raise PlacementError("На полигоне нет места для посадок")
         center = polygon_centroid_xy(vertices, faces) or points[0]
-        _replace_owned(collection, key)
-        parent = bpy.data.objects.new(f"PLANT_{key[:24]}", None)
-        parent.empty_display_type = "PLAIN_AXES"
-        parent.empty_display_size = 0.5
-        parent.location = center
-        parent["placement"] = "scatter"
-        parent["zone_key"] = key
-        parent["seed"] = seed
-        parent["density"] = float(context.scene.dwgreader_density)
-        parent["tree_share"] = float(context.scene.dwgreader_tree_share)
-        collection.objects.link(parent)
+        parent = None
         rng = random.Random(seed + 1)
-        for index, point in enumerate(points):
-            asset = _pick_plant(rng, tree_assets, bush_assets, share)
+        cursor = 0
+        placed = 0
+        for _slot in range(count):
+            if cursor >= len(points):
+                break
+            families = slot_attempt_families(
+                lambda: _pick_plant(rng, tree_assets, bush_assets, share),
+                PLANT_ATTEMPTS,
+            )
+            asset = families[0]
             source = source_for(asset)
-            inst = source.copy()
-            inst.data = source.data
-            inst.name = f"PLANT_{asset['id']}_{index}"
-            inst.parent = parent
-            inst.location = (point[0] - center[0], point[1] - center[1], point[2] - center[2])
-            inst.rotation_euler = (0.0, 0.0, rng.random() * tau)
-            inst.scale = (scale, scale, scale)
-            inst.hide_viewport = False
-            inst.hide_render = False
-            inst.hide_select = False
-            inst["asset_id"] = asset["id"]
-            collection.objects.link(inst)
-            inst.hide_set(False)
-            total += 1
+            plan_side = _asset_plan_side(asset, source)
+            for asset in families:
+                if cursor >= len(points):
+                    break
+                point = points[cursor]
+                cursor += 1
+                yaw = rng.random() * tau
+                quad = plant_footprint((point[0], point[1]), plan_side, yaw, scale)
+                if obstacles.blocks(quad, str(asset.get("family") or "")):
+                    continue
+                if occupied.blocks(quad):
+                    continue
+                if parent is None:
+                    parent = bpy.data.objects.new(f"PLANT_{key[:24]}", None)
+                    parent.empty_display_type = "PLAIN_AXES"
+                    parent.empty_display_size = 0.5
+                    parent.location = center
+                    parent["placement"] = "scatter"
+                    parent["zone_key"] = key
+                    parent["seed"] = seed
+                    parent["density"] = float(context.scene.dwgreader_density)
+                    parent["tree_share"] = float(context.scene.dwgreader_tree_share)
+                    collection.objects.link(parent)
+                inst = source.copy()
+                inst.data = source.data
+                inst.name = f"PLANT_{asset['id']}_{placed}"
+                inst.parent = parent
+                inst.rotation_mode = "XYZ"
+                inst.location = (point[0] - center[0], point[1] - center[1], point[2] - center[2])
+                inst.rotation_euler = (0.0, 0.0, yaw)
+                inst.scale = (scale, scale, scale)
+                inst.hide_viewport = False
+                inst.hide_render = False
+                inst.hide_select = False
+                inst["asset_id"] = asset["id"]
+                inst["family"] = asset["family"]
+                inst["plan_side"] = plan_side
+                inst["zone_key"] = key
+                collection.objects.link(inst)
+                inst.hide_set(False)
+                occupied.add(quad)
+                placed += 1
+                total += 1
+                break
     if total <= 0:
-        raise PlacementError("Посадки не встали. Выберите слой подложки и нажмите «Расставить»")
+        return 0, "Посадки: 0 шт."
     if clamped:
         return total, f"Посадки: {total} шт. На слой больше {MAX_PLANTS} не ставим — снизьте плотность, чтобы разредить"
     return total, f"Посадки: {total} шт."
@@ -881,30 +1039,68 @@ def _on_play_seed(self, context):
     _schedule_play_refill(context)
 
 
+def _zone_key_for(context, obj) -> str | None:
+    edit = getattr(context, "mode", "OBJECT") == "EDIT_MESH"
+    active = _context_active_object(context)
+    try:
+        _vertices, _faces, key = _zone_from_object(obj, bool(edit and obj == active))
+    except PlacementError:
+        return None
+    return key
+
+
+def _plant_objects(context, objects) -> tuple[int, int, bool]:
+    """Сажает полигоны одним проходом: общий след и одни препятствия на всех.
+
+    В след заранее попадают только растения чужих зон — те, что проход не снимает.
+    """
+    if getattr(context, "mode", "OBJECT") == "EDIT_MESH":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    ready = []
+    skip: set[str] = set()
+    for obj in objects:
+        key = _zone_key_for(context, obj)
+        if key is None:
+            continue
+        ready.append(obj)
+        skip.add(key)
+    occupied = _existing_footprints(context, skip)
+    obstacles = _plant_obstacles()
+    total = 0
+    used = 0
+    clamped = False
+    for obj in ready:
+        try:
+            count, note = _run_plantings(
+                context,
+                only=obj,
+                allow_layer_fallback=False,
+                occupied=occupied,
+                obstacles=obstacles,
+            )
+        except PlacementError:
+            continue
+        total += int(count)
+        used += 1
+        if "не ставим" in note:
+            clamped = True
+    return total, used, clamped
+
+
 def _replant_lawns(context) -> str:
     """Заново ставит деревья и кусты на каждый газон подложки."""
     root = bpy.data.collections.get(UNDERLAY_NAME)
     if root is None:
         raise PlacementError("Подложки в сцене нет")
-    total = 0
-    lawns = 0
-    clamped = False
-    for obj in list(root.all_objects):
-        if obj.type != "MESH" or str(obj.get("category") or "") != "green":
-            continue
-        if getattr(obj, "data", None) is None or not obj.data.polygons:
-            continue
-        try:
-            count, note = _run_plantings(context, only=obj, allow_layer_fallback=False)
-        except PlacementError:
-            continue
-        total += int(count)
-        lawns += 1
-        if "не ставим" in note:
-            clamped = True
-    if lawns <= 0:
+    lawns = [
+        obj for obj in list(root.all_objects)
+        if obj.type == "MESH" and str(obj.get("category") or "") == "green"
+        and getattr(obj, "data", None) is not None and obj.data.polygons
+    ]
+    total, used, clamped = _plant_objects(context, lawns)
+    if used <= 0:
         raise PlacementError("В подложке нет газонов")
-    text = f"Посадки: {total} шт. на газонах {lawns}"
+    text = f"Посадки: {total} шт. на газонах {used}"
     if clamped:
         text += ". На слой больше лимита не ставим"
     return text
@@ -1383,18 +1579,9 @@ def furnish_underlay(context) -> str:
             if obj.type == "MESH" and getattr(obj, "data", None) is not None and obj.data.polygons
         ]
     if trees_on:
-        plants = 0
-        lawns = 0
-        for obj in meshes:
-            if str(obj.get("category") or "") != "green":
-                continue
-            try:
-                count, _note = _run_plantings(context, only=obj, allow_layer_fallback=False)
-            except PlacementError:
-                continue
-            plants += int(count)
-            lawns += 1
-        notes.append(f"деревья {plants} на газонах {lawns}")
+        lawns = [obj for obj in meshes if str(obj.get("category") or "") == "green"]
+        plants, used, _clamped = _plant_objects(context, lawns)
+        notes.append(f"деревья {plants} на газонах {used}")
     if maf_on:
         zones = [obj for obj in meshes if _playground_mesh(obj)]
         islands = []
@@ -2379,7 +2566,7 @@ def register() -> None:
     bpy.types.Scene.dwgreader_tree_share = FloatProperty(
         name="Доля деревьев, %",
         description="Остальное — кусты. Меняет посадки на полигоне, выбранном в 3D-виде",
-        default=10.0,
+        default=DEFAULT_TREE_SHARE,
         min=0.0,
         max=100.0,
         subtype="PERCENTAGE",
@@ -2405,7 +2592,7 @@ def register() -> None:
     )
     bpy.types.Scene.dwgreader_density = FloatProperty(
         name="Плотность, шт/100 м²",
-        default=3.0,
+        default=DEFAULT_PLANT_DENSITY,
         min=0.1,
         soft_max=40.0,
         update=_on_plant_update,
@@ -2490,6 +2677,12 @@ def register() -> None:
         soft_max=4.0,
         update=_on_play_scale,
     )
+    for scene in bpy.data.scenes:
+        density, share = adopt_plant_defaults(scene.dwgreader_density, scene.dwgreader_tree_share)
+        if density != scene.dwgreader_density:
+            scene.dwgreader_density = density
+        if share != scene.dwgreader_tree_share:
+            scene.dwgreader_tree_share = share
 
 
 def unregister() -> None:
