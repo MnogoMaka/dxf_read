@@ -81,7 +81,7 @@ from .install_support import (
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 5, 7),
+    "version": (1, 5, 18),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF, жилой дом и расстановка благоустройства в сцене",
@@ -96,8 +96,8 @@ LAYER_CATEGORIES = (
     ("site_boundary", "Граница", "Граница участка"),
     ("building", "Здания", "Здания и пристройки"),
     ("pavement", "Покрытия", "Проезды, тротуары, площадки"),
-    ("green", "Газоны", "Газоны и цветники"),
-    ("vegetation", "Посадки", "Деревья и кустарники"),
+    ("green", "Газоны", "Газоны и озеленение"),
+    ("vegetation", "Посадки", "Деревья, кусты, цветники и клумбы"),
     ("furniture", "МАФ", "Скамьи, урны, оборудование"),
     ("fence", "Ограждения", "Заборы и ограды"),
 )
@@ -344,6 +344,7 @@ def _settings_payload(prefs, source: Path) -> dict:
         "contour_from_fills": bool(prefs.contour_from_fills),
         "cut_vegetation": bool(prefs.cut_vegetation),
         "omit_symbols": bool(prefs.omit_symbols),
+        "omit_fences": bool(prefs.omit_fences),
         "scene_scale": float(prefs.scene_scale),
         "origin_mode": str(prefs.origin_mode),
         "batch_size": int(prefs.batch_size),
@@ -431,13 +432,16 @@ def _draw_chatgpt(layout, prefs) -> None:
     waiting = chatgpt_auth.active_login()
     if waiting is not None:
         box = layout.box()
-        box.label(text="Завершите вход в браузере", icon="URL")
+        box.label(text=(waiting.notice or "Завершите вход в браузере"), icon="URL")
         actions = box.row(align=True)
         actions.operator("dwgreader.chatgpt_copy_link", text="Скопировать ссылку")
         actions.operator("dwgreader.chatgpt_cancel", text="Отмена")
         return
     profile = chatgpt_auth.public_profile()
     if profile is None:
+        failure = chatgpt_auth.login_failure()
+        if failure:
+            layout.label(text=failure)
         layout.operator("dwgreader.chatgpt_login", text="Продолжить с ChatGPT")
         return
     box = layout.box()
@@ -553,7 +557,12 @@ class DWGREADER_AddonPreferences(AddonPreferences):
     )
     omit_symbols: BoolProperty(
         name="Убрать отметки МАФ и посадок",
-        description="Контуры кустов, деревьев и лавочек с чертежа не попадают в сцену. Газоны, покрытия и здания остаются, файл чертежа не меняется",
+        description="Контуры кустов, деревьев, цветников и лавочек с чертежа не попадают в сцену. Газоны, покрытия и здания остаются, файл чертежа не меняется",
+        default=True,
+    )
+    omit_fences: BoolProperty(
+        name="Убрать ограды",
+        description="Слои оград, заборов и ограждений не попадают в подложку и не режут газон и покрытия",
         default=True,
     )
     cut_vegetation: BoolProperty(
@@ -736,6 +745,10 @@ class DWGREADER_OT_chatgpt_login(Operator):
             opened = chatgpt_auth.launch_pending_browser(job)
             if opened is False:
                 context.scene.dwgreader_status = "Браузер не открылся. Скопируйте ссылку"
+            elif job.notice:
+                context.scene.dwgreader_status = job.notice[:180]
+        elif job is not None and job.notice and not job.done:
+            context.scene.dwgreader_status = job.notice[:180]
         if job is None or not job.done:
             _redraw(context)
             return {"RUNNING_MODAL"}
@@ -2027,6 +2040,7 @@ def _draw_step_objects(layout, context, prefs) -> None:
         col.prop(prefs, "scene_scale")
         col.prop(prefs, "origin_mode")
         col.prop(prefs, "omit_symbols")
+        col.prop(prefs, "omit_fences")
         cut = col.row()
         cut.enabled = not prefs.omit_symbols
         cut.prop(prefs, "cut_vegetation")
@@ -2036,6 +2050,10 @@ def _draw_step_objects(layout, context, prefs) -> None:
     flags = layout.column(align=True)
     flags.prop(scene, "dwgreader_auto_trees", text="Расстановка деревьев")
     flags.prop(scene, "dwgreader_auto_maf", text="МАФ на площадках")
+    maf = flags.column(align=True)
+    maf.enabled = bool(scene.dwgreader_auto_maf)
+    maf.prop(scene, "dwgreader_auto_play_kind", text="Тип площадок")
+    maf.prop(scene, "dwgreader_safety_scale", text="Зона безопасности", slider=True)
     flags.prop(scene, "dwgreader_auto_buildings", text="Расстановка зданий")
     flags.prop(scene, "dwgreader_auto_prune_sheets", text="Убрать мелкие чертежи")
     small = flags.column(align=True)
@@ -2153,7 +2171,7 @@ def _draw_step_result(layout, context) -> None:
         empty = grounds.column(align=True)
         empty.scale_y = 0.75
         empty.label(text="Пока площадок нет: имя «площад», «игров», «спорт»")
-        empty.label(text="или резиновое покрытие. ТБО не берём.")
+        empty.label(text="или «резин». ТБО не берём.")
 
     tree = layout.box()
     top = tree.row()

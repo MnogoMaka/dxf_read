@@ -19,7 +19,7 @@ import bpy
 from bpy.props import EnumProperty, StringProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper
-from mathutils import Euler, Matrix
+from mathutils import Euler, Matrix, Vector
 
 
 # Recommended names first; the old names remain supported for compatibility.
@@ -1780,6 +1780,60 @@ def _footprint_mesh(loops: list[list[tuple[float, float, float]]]):
     return mesh
 
 
+def _prism_mesh(loops: list[list[tuple[float, float, float]]]):
+    """Высокая призма контура с дырами. По ней дом обрезается в плане, не по высоте."""
+    from mathutils.geometry import tessellate_polygon
+
+    flat: list[Vector] = []
+    vectors: list[list[Vector]] = []
+    for loop in loops:
+        ring = [Vector((point[0], point[1], 0.0)) for point in loop]
+        vectors.append(ring)
+        flat.extend(ring)
+    triangles = tessellate_polygon(vectors)
+    if not triangles:
+        return None
+    count = len(flat)
+    verts = [(point.x, point.y, -50.0) for point in flat]
+    verts.extend((point.x, point.y, 500.0) for point in flat)
+    faces: list[tuple[int, ...]] = []
+    for tri in triangles:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        faces.append((a, c, b))
+        faces.append((a + count, b + count, c + count))
+    offset = 0
+    for index, loop in enumerate(loops):
+        size = len(loop)
+        for step in range(size):
+            nxt = (step + 1) % size
+            bottom0 = offset + step
+            bottom1 = offset + nxt
+            top0 = bottom0 + count
+            top1 = bottom1 + count
+            if index == 0:
+                faces.append((bottom0, bottom1, top1, top0))
+            else:
+                faces.append((bottom0, top0, top1, bottom1))
+        offset += size
+    mesh = bpy.data.meshes.new("Здание.призма")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    _outward_normals(mesh)
+    return mesh
+
+
+def _outward_normals(mesh) -> None:
+    import bmesh
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    if bm.calc_volume(signed=True) < 0:
+        bmesh.ops.reverse_faces(bm, faces=bm.faces)
+    bm.to_mesh(mesh)
+    bm.free()
+
+
 def _drop_clip(obj) -> None:
     for modifier in list(obj.modifiers):
         if modifier.type == "BOOLEAN" and modifier.name == "Полигон":
@@ -1791,6 +1845,35 @@ def _drop_clip(obj) -> None:
         bpy.data.objects.remove(child, do_unlink=True)
         if mesh is not None and getattr(mesh, "users", 1) == 0 and isinstance(mesh, bpy.types.Mesh):
             bpy.data.meshes.remove(mesh)
+
+
+def _clip_to_polygon(obj, loops: list[list[tuple[float, float, float]]]) -> None:
+    """Пересечение с призмой контура. Нода строит круглую башню, призма оставляет только пятно."""
+    _drop_clip(obj)
+    collection = next(iter(obj.users_collection), None)
+    if collection is None:
+        return
+    mesh = _prism_mesh(loops)
+    if mesh is None:
+        return
+    cutter = bpy.data.objects.new("Здание.контур", mesh)
+    collection.objects.link(cutter)
+    cutter.parent = obj
+    cutter.matrix_parent_inverse.identity()
+    cutter.location = (0.0, 0.0, 0.0)
+    cutter.rotation_euler = (0.0, 0.0, 0.0)
+    cutter.scale = (1.0, 1.0, 1.0)
+    cutter.hide_render = True
+    cutter.hide_select = True
+    try:
+        cutter.hide_set(True)
+    except Exception:
+        pass
+    modifier = obj.modifiers.new("Полигон", "BOOLEAN")
+    modifier.operation = "INTERSECT"
+    modifier.object = cutter
+    solvers = {item.identifier for item in modifier.bl_rna.properties["solver"].enum_items}
+    modifier.solver = "MANIFOLD" if "MANIFOLD" in solvers else "FLOAT"
 
 
 def _apply_polygon(obj, vertices, faces, origin, height: float) -> None:
@@ -1809,7 +1892,10 @@ def _apply_polygon(obj, vertices, faces, origin, height: float) -> None:
     obj.rotation_euler = Euler((obj.rotation_euler.x, obj.rotation_euler.y, 0.0), "XYZ")
     obj.scale = (1.0, 1.0, kept_z)
     _unlock_transform(obj)
-    _drop_clip(obj)
+    if loops:
+        _clip_to_polygon(obj, loops)
+    else:
+        _drop_clip(obj)
 
 
 def place_building(context):

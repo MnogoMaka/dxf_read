@@ -53,6 +53,7 @@ _LOCK = threading.Lock()
 _DISCOVERY: dict | None = None
 _MODELS: list[dict[str, str]] = []
 _NOTICE = ""
+_LOGIN_FAILURE = ""
 
 
 class AuthError(Exception):
@@ -164,6 +165,16 @@ def last_notice() -> str:
     text = _NOTICE
     _NOTICE = ""
     return text
+
+
+def login_failure() -> str:
+    """Последняя ошибка входа. Панель читает её при каждой отрисовке, поэтому текст не стирается."""
+    return _LOGIN_FAILURE
+
+
+def _set_login_failure(text: str) -> None:
+    global _LOGIN_FAILURE
+    _LOGIN_FAILURE = text
 
 
 def _set_notice(text: str) -> None:
@@ -360,6 +371,8 @@ class LoginJob:
         self.cancelled = False
         self.another = False
         self.url = ""
+        self.redirect_uri = ""
+        self.notice = ""
         self.browser_started = False
         self._server: http.server.HTTPServer | None = None
         self._socket: socket.socket | None = None
@@ -367,6 +380,7 @@ class LoginJob:
     def run(self) -> None:
         try:
             session = _login(self)
+            _set_login_failure("")
             self.email = str(session.get("email") or "")
             self.sharing = has_direct_scope(session.get("scopes"))
             if self.sharing and session.get("access_token"):
@@ -376,8 +390,10 @@ class LoginJob:
                     self.error = str(error)
         except AuthError as error:
             self.error = str(error)
+            _set_login_failure(self.error)
         except Exception:
             self.error = "Не удалось войти в ChatGPT"
+            _set_login_failure(self.error)
         finally:
             self.done = True
 
@@ -464,32 +480,102 @@ def refresh_models() -> None:
         return
 
 
+def _redirect_port(value: str) -> int:
+    """Порт уже зарегистрированного loopback. Чужой хост или путь сюда не проходит."""
+    text = str(value or "")
+    prefix = "http://127.0.0.1:"
+    if not text.startswith(prefix) or not text.endswith(CALLBACK_PATH):
+        return 0
+    number = text[len(prefix):-len(CALLBACK_PATH)]
+    if not number.isdigit():
+        return 0
+    port = int(number)
+    if port < 1 or port > 65535:
+        return 0
+    return port
+
+
+def _login_client(saved: dict) -> tuple[str, int]:
+    """Какой client_id открывать в браузере и какой порт под него занять.
+
+    Выданный oaiapp_ OpenAI принимает только с тем адресом, на котором клиент
+    зарегистрировали. После выхода refresh отозван, и повтор с новым портом
+    отвечает invalid redirect_uri. Тогда вход начинается заново через
+    dynamic_agent_client. Повтор того же кода (invalid_grant) обязан остаться
+    на выданном клиенте и на том же порту.
+    """
+    issued = str(saved.get("client_id") or "")
+    port = _redirect_port(str(saved.get("redirect_uri") or ""))
+    if not issued.startswith("oaiapp_") or not port:
+        return DYNAMIC_CLIENT, 0
+    if saved.get("reuse_client") or saved.get("refresh_token"):
+        return issued, port
+    return DYNAMIC_CLIENT, 0
+
+
+class _LoopbackServer(http.server.HTTPServer):
+    """HTTPServer включает SO_REUSEADDR, и на Windows тот же порт занимается молча."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def _bind_callback(preferred: int) -> tuple[http.server.HTTPServer, str, bool]:
+    """Слушает preferred, если он свободен. Иначе берёт свободный порт."""
+    if preferred:
+        try:
+            server = _LoopbackServer(("127.0.0.1", preferred), _Callback)
+        except OSError:
+            server = _LoopbackServer(("127.0.0.1", 0), _Callback)
+        else:
+            return server, f"http://127.0.0.1:{preferred}{CALLBACK_PATH}", True
+    else:
+        server = _LoopbackServer(("127.0.0.1", 0), _Callback)
+    port = int(server.server_address[1])
+    return server, f"http://127.0.0.1:{port}{CALLBACK_PATH}", False
+
+
 def _login(job: LoginJob) -> dict:
     saved = load_session() or {}
     try:
         return _authorize(job, saved)
     except AuthError as error:
         issued = str((load_session() or {}).get("client_id") or "")
-        # Код регистрации одноразовый. Повтор идёт уже с выданным oaiapp_, не с dynamic_agent_client.
-        if getattr(error, "code", "") != "invalid_grant" or not issued.startswith("oaiapp_") or job.cancelled:
+        redirect = str(getattr(job, "redirect_uri", "") or "")
+        # Код регистрации одноразовый. Повтор идёт уже с выданным oaiapp_ и тем же портом.
+        if (
+            getattr(error, "code", "") != "invalid_grant"
+            or not issued.startswith("oaiapp_")
+            or not _redirect_port(redirect)
+            or job.cancelled
+        ):
             raise
-        return _authorize(job, {**saved, "client_id": issued})
+        return _authorize(job, {
+            **saved,
+            "client_id": issued,
+            "redirect_uri": redirect,
+            "reuse_client": True,
+        })
 
 
 def _authorize(job: LoginJob, saved: dict) -> dict:
-    issued = str(saved.get("client_id") or "")
-    client_id = issued if issued.startswith("oaiapp_") else DYNAMIC_CLIENT
+    client_id, preferred = _login_client(saved)
     verifier = new_verifier()
     state = new_secret()
     nonce = new_secret()
     challenge = pkce_challenge(verifier)
-    server = http.server.HTTPServer(("127.0.0.1", 0), _Callback)
+    server, redirect, kept_port = _bind_callback(preferred)
+    if client_id != DYNAMIC_CLIENT and not kept_port:
+        client_id = DYNAMIC_CLIENT
     server.timeout = LOGIN_TIMEOUT_S
     server.expected_state = state
     server.captured_ready = False
     job._server = server
-    port = server.server_address[1]
-    redirect = f"http://127.0.0.1:{port}{CALLBACK_PATH}"
+    job.redirect_uri = redirect
     params = {
         "response_type": "code",
         "client_id": client_id,
@@ -510,11 +596,13 @@ def _authorize(job: LoginJob, saved: dict) -> dict:
         params["prompt"] = "login"
     url = AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
     job.url = url
+    job.notice = "Подтвердите вход в браузере"
     server.timeout = 0.5
     deadline = time.monotonic() + LOGIN_TIMEOUT_S
     while time.monotonic() < deadline and not job.cancelled:
         server.handle_request()
         if getattr(server, "captured_ready", False):
+            job.notice = "Браузер подтвердил вход, сохраняем сессию…"
             break
     server.server_close()
     if job.cancelled:
@@ -560,7 +648,14 @@ def _finish_authorization(
     _raise_if_cancelled(job)
     token = _form(TOKEN_URL, fields, job=job)
     _raise_if_cancelled(job)
-    return _store_token_response(token, client_id, nonce, previous=previous, job=job)
+    return _store_token_response(
+        token,
+        client_id,
+        nonce,
+        previous=previous,
+        job=job,
+        redirect_uri=str(fields.get("redirect_uri") or ""),
+    )
 
 
 def _store_token_response(
@@ -569,6 +664,7 @@ def _store_token_response(
     nonce: str,
     previous: dict | None = None,
     job: LoginJob | None = None,
+    redirect_uri: str = "",
 ) -> dict:
     _raise_if_cancelled(job)
     access = str(token.get("access_token") or "")
@@ -593,6 +689,9 @@ def _store_token_response(
         "email": email,
         "subject": str(claims.get("sub") or (previous or {}).get("subject") or ""),
     }
+    callback = redirect_uri or str((previous or {}).get("redirect_uri") or "")
+    if _redirect_port(callback):
+        session["redirect_uri"] = callback
     _raise_if_cancelled(job)
     save_session(session)
     return session
@@ -883,7 +982,11 @@ def _form(url: str, fields: dict[str, str], *, job: LoginJob | None = None) -> d
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "DWGREADER",
+        },
         method="POST",
     )
     try:
@@ -892,7 +995,12 @@ def _form(url: str, fields: dict[str, str], *, job: LoginJob | None = None) -> d
     except urllib.error.HTTPError as error:
         if job is not None and job.cancelled:
             raise AuthError("Вход отменён") from None
-        detail = _error_payload(error.read().decode("utf-8", "replace"))
+        raw_error = error.read().decode("utf-8", "replace")
+        if raw_error.lstrip().startswith("<"):
+            failure = AuthError("OpenAI вернул страницу вместо ответа входа. Повторите попытку")
+            failure.code = ""
+            raise failure from None
+        detail = _error_payload(raw_error)
         code = str(detail.get("code") or "")
         failure = AuthError(auth_error_text(code, str(detail.get("message") or "")))
         failure.code = code
@@ -910,14 +1018,14 @@ def _form(url: str, fields: dict[str, str], *, job: LoginJob | None = None) -> d
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as error:
-        raise AuthError("OpenAI вернул не JSON") from error
+        raise AuthError("OpenAI вернул страницу вместо ответа входа. Повторите попытку") from error
     if not isinstance(payload, dict):
         raise AuthError("OpenAI вернул неожиданный ответ")
     return payload
 
 
 def _get_json(url: str, bearer: str = "") -> dict:
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": "DWGREADER"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
     request = urllib.request.Request(url, headers=headers, method="GET")
@@ -1008,7 +1116,11 @@ class _Callback(http.server.BaseHTTPRequestHandler):
             self.server.captured_path = parsed.path
             self.server.captured = query
             self.server.captured_ready = True
-        body = "<!doctype html><meta charset=utf-8><p>Можно вернуться в Blender.</p>".encode("utf-8")
+        if query.get("error"):
+            message = "Вход не подтверждён. Вернитесь в Blender."
+        else:
+            message = "Вход подтверждён. Вернитесь в Blender, сессия ещё сохраняется."
+        body = f"<!doctype html><meta charset=utf-8><p>{message}</p>".encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -1025,20 +1137,36 @@ _KEYCHAIN_SERVICE = b"dwgreader.chatgpt"
 _KEYCHAIN_ACCOUNT = b"session"
 
 
-def _windows_browser_command(url: str) -> str:
-    """Командная строка cmd. Кавычки держат «&», удвоенный «%» не раскрывается как переменная."""
-    safe = str(url).replace('"', "").replace("%", "%%")
-    return f'cmd /d /c start "" "{safe}"'
+def _windows_browser_launch(url: str) -> tuple[list[str], dict[str, str]]:
+    """Ссылка уходит в переменную окружения, не в командную строку cmd.
+
+    cmd раскрывает %3A% и %2F% как переменные и режет строку по &. В буфере
+    обмена ссылка целая, поэтому вставка открывала вход, а кнопка браузера нет.
+    """
+    env = os.environ.copy()
+    env["DWGREADER_LOGIN_URL"] = str(url)
+    argv = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        'Start-Process "$env:DWGREADER_LOGIN_URL"',
+    ]
+    return argv, env
 
 
 def _open_windows_browser(url: str) -> bool:
-    """Дочерний cmd. ShellExecute внутри blender.exe на части машин гасит весь процесс."""
+    """Отдельный процесс. ShellExecute внутри blender.exe на части машин гасит весь процесс."""
     flags = getattr(subprocess, "DETACHED_PROCESS", 0)
     flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    argv, env = _windows_browser_launch(url)
     try:
         subprocess.Popen(
-            _windows_browser_command(url),
+            argv,
+            env=env,
             close_fds=True,
             creationflags=flags,
             stdin=subprocess.DEVNULL,

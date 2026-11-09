@@ -16,11 +16,10 @@ ROOT_NAME = "SITE_UNDERLAY"
 LAYER_PART_GAP_M = 10.0
 # Имя файла в комплекте и размер одной клетки текстуры в метрах плана.
 SURFACE_TEXTURES = {
-    "grass": ("grass.jpg", 16.0),
-    "tile": ("pavers.jpg", 8.0),
-    "sidewalk": ("sidewalk.jpg", 8.0),
-    "asphalt": ("asphalt.png", 8.0),
-    "rubber": ("rubber.jpg", 8.0),
+    "grass": ("grass.jpg", 32.0),
+    "tile": ("pavers.jpg", 16.0),
+    "sidewalk": ("sidewalk.jpg", 16.0),
+    "asphalt": ("asphalt.png", 16.0),
 }
 
 

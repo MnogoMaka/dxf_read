@@ -117,6 +117,26 @@ class SheetCopyTests(unittest.TestCase):
         groups = refine_layer_groups({}, names, {"Газон_Ном._пера__2": 10, "Газон_Ном._пера__6": 40})
         self.assertEqual(groups["green"], ["Газон_Ном._пера__6"])
 
+    def test_flower_beds_become_plantings_and_red_lines_drop(self) -> None:
+        groups = refine_layer_groups(
+            {
+                "green": ["Б_цветники_1", "Леса и газоны", "3 Озел_цветники"],
+                "site_boundary": ["Красные линии_4", "Граница участка", "ГПЗУ", "Красные линии ГПЗУ"],
+            },
+            [
+                "Б_цветники_1", "Леса и газоны", "3 Озел_цветники",
+                "Красные линии_4", "Граница участка", "ГПЗУ", "Красные линии ГПЗУ",
+            ],
+        )
+        self.assertEqual(groups["green"], ["Леса и газоны"])
+        self.assertEqual(groups["vegetation"], ["3 Озел_цветники", "Б_цветники_1"])
+        self.assertEqual(
+            groups["site_boundary"],
+            ["ГПЗУ", "Граница участка", "Красные линии ГПЗУ"],
+        )
+        self.assertTrue(is_junk_layer("Красные линии_4"))
+        self.assertFalse(is_junk_layer("Граница участка"))
+
     def test_interior_copy_stays_out_of_automatic_groups(self) -> None:
         name = "Интерьер - Перегородка_Ном._пера__150"
         self.assertTrue(is_junk_layer(name))

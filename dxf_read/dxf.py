@@ -48,6 +48,7 @@ from .config import (
     EXCLUDE_HINT,
     FILL_TYPES,
     GENERIC_BLOCK_LAYERS,
+    GREEN_ISLAND_KEEP_RATIO,
     HATCH_DRAW_COLORS,
     HATCH_DRAW_ORDER,
     HINT_SUFFIX_RE,
@@ -171,14 +172,53 @@ def hidden_sheet_copies(
     return hidden
 
 
+def is_red_line_layer(name: str) -> bool:
+    """Красные линии не граница участка. Имя с ГПЗУ или границей участка остаётся."""
+    text = layer_leaf(name)
+    if "КРАСНЫЕ ЛИНИ" not in text:
+        return False
+    return "ГРАНИЦА УЧАСТ" not in text and "ГПЗУ" not in text
+
+
+def is_flower_bed_layer(name: str) -> bool:
+    """Цветник и клумба — отметка посадки, не газон."""
+    text = layer_leaf(name)
+    return "ЦВЕТНИК" in text or "КЛУМБ" in text
+
+
+def is_fence_layer(name: str) -> bool:
+    text = layer_leaf(name)
+    return any(token in text for token in ("ОГРАД", "ОГРАЖД", "ЗАБОР"))
+
+
 def is_junk_layer(name: str) -> bool:
     """Подписи, Civil 3D, интерьер — не площадка.
 
     Токены смотрим только в хвосте: префикс xref («…трасса|Газон») сам по себе
     не должен выкидывать нормальный слой. Копии листа отбирает hidden_sheet_copies.
     """
+    if is_red_line_layer(name):
+        return True
     probe = layer_leaf(name)
     return any(token in probe for token in config.settings().junk_layer_tokens)
+
+
+def resolve_ground_category(name: str, category: str | None) -> str | None:
+    """Имя слоя важнее сохранённого типа: цветник, ограда и красные линии.
+
+    Список слоёв в файле может хранить старый тип. Сборка смотрит имя заново.
+    """
+    if is_junk_layer(name):
+        return None
+    if is_flower_bed_layer(name):
+        return "vegetation"
+    if bool(getattr(config.settings(), "omit_fences", False)) and (
+        category == "fence" or is_fence_layer(name)
+    ):
+        return None
+    if category in TARGET_OBJECT_TYPES:
+        return category
+    return None
 
 
 def is_generic_block_layer(name: str) -> bool:
@@ -1504,14 +1544,14 @@ def refine_layer_groups(
             if name in seen or name in hidden or is_junk_layer(name):
                 continue
             seen.add(name)
-            guessed = mapped or infer_layer_category(name)
-            if guessed in TARGET_OBJECT_TYPES:
+            guessed = resolve_ground_category(name, mapped or infer_layer_category(name))
+            if guessed:
                 refined.setdefault(guessed, []).append(name)
     for name in all_layers or ():
         if name in seen or name in hidden or is_junk_layer(name):
             continue
-        guessed = infer_layer_category(name)
-        if guessed in TARGET_OBJECT_TYPES:
+        guessed = resolve_ground_category(name, infer_layer_category(name))
+        if guessed:
             seen.add(name)
             refined.setdefault(guessed, []).append(name)
     return {key: sorted(value) for key, value in refined.items() if value}
@@ -1519,12 +1559,10 @@ def refine_layer_groups(
 
 def _category_for_layer(layer: str, layer_to_category: Mapping[str, str]) -> str | None:
     key = normalize_name(layer)
-    if key in layer_to_category:
-        return layer_to_category[key]
-    guessed = infer_layer_category(layer)
-    if guessed:
-        return guessed
-    return layer_to_category.get(layer_leaf(layer))
+    stored = layer_to_category.get(key)
+    if stored is None:
+        stored = infer_layer_category(layer) or layer_to_category.get(layer_leaf(layer))
+    return resolve_ground_category(layer, stored)
 
 
 @dataclass
@@ -1569,7 +1607,7 @@ def extract_classified_hatches(
         }
 
         def category_of(layer: str) -> str | None:
-            return layer_to_category.get(normalize_name(layer))
+            return resolve_ground_category(layer, layer_to_category.get(normalize_name(layer)))
     else:
         all_names = [str(layer.dxf.name) for layer in document.layers]
         groups = refine_layer_groups(by_category, all_names)
@@ -1675,11 +1713,9 @@ def _category_lookup(
 
         def category_of(layer: str) -> str | None:
             found = exact.get(normalize_name(layer))
-            if found:
-                return found
-            if not match_leaf:
-                return None
-            return leaves.get(layer_leaf(layer))
+            if found is None and match_leaf:
+                found = leaves.get(layer_leaf(layer))
+            return resolve_ground_category(layer, found)
 
         layer_to_category = dict(exact)
         if match_leaf:
@@ -1762,7 +1798,7 @@ def _curve_pieces_from_segments(
     # Ограждение обычно является открытой линией и не создаёт bounded face.
     # Сохраняем его узкой полосой, чтобы оно не исчезало и блокировало зоны безопасности.
     fence_width = max(float(getattr(cfg, "fence_width_m", 0.20)), 0.0)
-    if fence_width > 0.0:
+    if fence_width > 0.0 and not bool(getattr(cfg, "omit_fences", False)):
         for start, end, layer in segments:
             if category_of(layer) != "fence" or start == end:
                 continue
@@ -2301,6 +2337,52 @@ def _without_symbol_holes(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
     return cleaned
 
 
+def _prepare_ground_pieces(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
+    """Цветник становится посадкой, красные линии и выключенные ограды выпадают."""
+    prepared: list[HatchPiece] = []
+    for piece in pieces:
+        category = resolve_ground_category(piece.layer, piece.category)
+        if not category:
+            continue
+        if category == piece.category:
+            prepared.append(piece)
+            continue
+        prepared.append(HatchPiece(
+            category, piece.layer, piece.vertices, piece.holes, piece.handle, piece.block_path,
+        ))
+    return prepared
+
+
+def keep_large_islands(geometry: BaseGeometry, keep_ratio: float = GREEN_ISLAND_KEEP_RATIO) -> BaseGeometry:
+    """Оставляет куски не меньше доли самого большого. Самый большой остаётся всегда."""
+    polygons = [polygon for polygon in _iter_shapely_polygons(geometry) if polygon.area > 0.0]
+    if len(polygons) < 2:
+        return geometry
+    largest = max(polygon.area for polygon in polygons)
+    if largest <= 0.0:
+        return geometry
+    limit = largest * float(keep_ratio)
+    kept = [polygon for polygon in polygons if polygon.area + 1e-9 >= limit]
+    if len(kept) == len(polygons):
+        return geometry
+    if not kept:
+        kept = [max(polygons, key=lambda polygon: polygon.area)]
+    return unary_union(kept)
+
+
+def _drop_small_green_islands(
+    items: Sequence[tuple[BaseGeometry, str, str]],
+) -> list[tuple[BaseGeometry, str, str]]:
+    kept: list[tuple[BaseGeometry, str, str]] = []
+    for geometry, category, layer in items:
+        if category == "green":
+            geometry = keep_large_islands(geometry)
+        if geometry is None or geometry.is_empty:
+            continue
+        kept.append((geometry, category, layer))
+    return kept
+
+
 def arrange_hatch_faces_by_layer(
     pieces: Sequence[HatchPiece],
 ) -> list[tuple[BaseGeometry, str, str]]:
@@ -2309,11 +2391,13 @@ def arrange_hatch_faces_by_layer(
     По умолчанию слои типов «МАФ» и «Посадки» не режут газоны и покрытия:
     они добавляются своим слоем поверх целой площадки.
     Если отметки убраны, эти слои дырки закрывают и в сцену не попадают.
+    Цветники идут как посадки. Мелкие острова газона отбрасываются.
     """
+    pieces = _prepare_ground_pieces(pieces)
     pieces = _without_symbol_holes(pieces)
     symbols = [piece for piece in pieces if _is_overlay(piece.category, piece.layer)]
     if not symbols:
-        return _arrange_piece_polygons(pieces)
+        return _drop_small_green_islands(_arrange_piece_polygons(pieces))
     base = [piece for piece in pieces if not _is_overlay(piece.category, piece.layer)]
     arranged = _arrange_piece_polygons(base)
     if config.settings().omit_symbols:
@@ -2327,15 +2411,15 @@ def arrange_hatch_faces_by_layer(
             for polygon in _piece_polygons(piece)
         ]
         if not extra:
-            return arranged
-        return _merge_arranged([*arranged, *extra])
+            return _drop_small_green_islands(arranged)
+        return _drop_small_green_islands(_merge_arranged([*arranged, *extra]))
     extra: list[tuple[BaseGeometry, str, str]] = []
     for piece in symbols:
         for polygon in _piece_polygons(piece):
             extra.append((polygon, piece.category, piece.layer))
     if not extra:
-        return arranged
-    return _merge_arranged([*arranged, *extra])
+        return _drop_small_green_islands(arranged)
+    return _drop_small_green_islands(_merge_arranged([*arranged, *extra]))
 
 
 def _merge_arranged(

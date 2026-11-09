@@ -22,13 +22,6 @@ def _functions(*names: str, globals_: dict | None = None) -> dict:
     return namespace
 
 
-def _impact_margin(height: float) -> float:
-    fall = min(max(float(height), 0.0), 3.0)
-    if fall <= 1.5:
-        return 1.5
-    return min(1.5 + (2.0 / 3.0) * (fall - 1.5), 2.5)
-
-
 class _Props:
     def __init__(self, **values) -> None:
         self._props = dict(values)
@@ -50,7 +43,14 @@ class _Props:
 
 class PlaygroundOrientationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.module = _functions("_play_spec", "_playground_orientation", globals_={"impact_margin": _impact_margin})
+        self.module = _functions(
+            "_play_spec",
+            "_playground_orientation",
+            globals_={
+                "playground_clearance": lambda asset: tuple(asset["clearance"][:4]),
+                "play_group": lambda _asset: "complex",
+            },
+        )
         self.asset = {
             "id": "test",
             "footprint": [2.0, 4.0, 1.0],
@@ -74,7 +74,11 @@ class PlaygroundTypeTests(unittest.TestCase):
         ]
         self.module = _functions(
             "_play_assets", "_play_items", "_on_playground_type",
-            globals_={"_assets": lambda _context, _family: self.assets, "PlacementError": RuntimeError},
+            globals_={
+                "_assets": lambda _context, _family: self.assets,
+                "PlacementError": RuntimeError,
+                "_schedule_play_refill": lambda _context: None,
+            },
         )
 
     def test_only_the_selected_type_is_available(self) -> None:
@@ -91,17 +95,24 @@ class PlaygroundTypeTests(unittest.TestCase):
 
 
 class PlaygroundSeedTests(unittest.TestCase):
-    def test_fill_passes_the_scene_seed_to_the_packer(self) -> None:
+    def test_fill_passes_the_scene_seed_to_the_layout(self) -> None:
         calls = []
         asset = {"id": "child", "footprint": [1.0, 1.0, 1.0]}
         module = _functions(
             "_fill_playground_on",
             globals_={
-                "_play_assets": lambda _context: [asset],
+                "_play_assets": lambda *_args, **_kwargs: [asset],
                 "PlacementError": RuntimeError,
                 "_play_spec": lambda current: current,
-                "pack_playground": lambda *args, **kwargs: calls.append(kwargs) or [],
+                "compose_playground": lambda *_args, **kwargs: calls.append(kwargs) or {
+                    "items": [],
+                    "benches": [],
+                    "hero_missing": False,
+                },
                 "polygon_centroid_xy": lambda _vertices, _faces: (0.0, 0.0, 0.0),
+                "_placement_collection": lambda _kind: None,
+                "_replace_owned": lambda *_args, **_kwargs: None,
+                "_layout_bench": lambda _context: (None, None),
             },
         )
         context = SimpleNamespace(scene=SimpleNamespace(dwgreader_play_seed=73))

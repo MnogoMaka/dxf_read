@@ -25,14 +25,17 @@ from .placement_math import (
     DEFAULT_PLANT_DENSITY,
     DEFAULT_TREE_SHARE,
     face_groups,
-    impact_margin,
+    bench_island_keys,
     blocks_playground,
+    cluster_nearby_islands,
+    compose_playground,
     is_playground_surface,
     minimum_rectangle,
-    playground_capacity,
+    playground_clearance,
+    auto_playground_kinds,
+    play_group,
     mirrored_keep_from,
     orientation_angle,
-    pack_playground,
     mesh_plan_side,
     OccupiedFootprints,
     plant_footprint,
@@ -43,6 +46,7 @@ from .placement_math import (
     polygon_centroid_xy,
     safety_inside,
     scatter_points,
+    choose_plant_names,
 )
 
 ROOT_NAME = "SITE_PLACEMENT"
@@ -118,6 +122,14 @@ def load_catalog(context) -> list[dict]:
         motion = str(item.get("motion") or "")
         if motion:
             asset["motion"] = motion
+        if item.get("fall_height") is not None:
+            asset["fall_height"] = float(item["fall_height"])
+        if item.get("role"):
+            asset["role"] = str(item["role"])
+        if item.get("runout") is not None:
+            asset["runout"] = float(item["runout"])
+        if item.get("runout_side"):
+            asset["runout_side"] = str(item["runout_side"])
         assets.append(asset)
     _CATALOG = assets
     _CATALOG_STAMP = stamp
@@ -140,7 +152,6 @@ def _on_playground_type(_scene, context) -> None:
     selected = str(getattr(context.scene, "dwgreader_play_asset", "") or "")
     if assets and selected not in {asset["id"] for asset in assets}:
         context.scene.dwgreader_play_asset = assets[0]["id"]
-    _schedule_play_refill(context)
 
 
 def _asset(context, asset_id: str) -> dict:
@@ -561,7 +572,6 @@ def _track_clicked_zone() -> None:
     context = bpy.context
     if context is None:
         return
-    _remember_zone(_context_active_object(context))
     _sync_bench_roundness(context)
 
 
@@ -680,7 +690,7 @@ def _replace_owned(collection: bpy.types.Collection, zone_key: str, prefix: bool
 _PLANT_LOCK = False
 _PLANT_PENDING = False
 _PLANT_UI_SEEN = False
-_PLANT_TARGET = ""
+_PLANT_TARGETS: list[str] = []
 _PLANT_SCOPE = "zone"
 _PLAY_LOCK = False
 _PLAY_PENDING = False
@@ -688,8 +698,58 @@ _PLAY_UI_SEEN = False
 _PLAY_SCOPE = "all"
 
 
+def _is_plant_zone(obj) -> bool:
+    """Полигон подложки. Дома и уже стоящие посадки зоной не являются."""
+    if obj is None or getattr(obj, "type", None) != "MESH" or _placement_source(obj):
+        return False
+    return _under_collection(obj, UNDERLAY_NAME)
+
+
+def _selected_underlay_meshes(context) -> list:
+    return [obj for obj in _underlay_selection(context) if _is_plant_zone(obj)]
+
+
+def _remember_plant_targets(names: list[str]) -> None:
+    global _PLANT_TARGETS
+    _PLANT_TARGETS = list(names)
+
+
+def _plant_target_objects(context, *, remember: bool = False) -> list:
+    """Выделенные полигоны подложки. Пустое выделение оставляет прошлый набор."""
+    selected = _selected_underlay_meshes(context)
+    names = choose_plant_names([obj.name for obj in selected], _PLANT_TARGETS)
+    if selected:
+        if remember:
+            _remember_plant_targets(names)
+        by_name = {obj.name: obj for obj in selected}
+        return [by_name[name] for name in names if name in by_name]
+    found = []
+    for name in names:
+        obj = bpy.data.objects.get(name)
+        if _is_plant_zone(obj):
+            found.append(obj)
+    return found
+
+
+def _zones_of(context, objects) -> list:
+    edit = getattr(context, "mode", "OBJECT") == "EDIT_MESH"
+    active = _context_active_object(context)
+    zones = []
+    for obj in objects:
+        if not _is_plant_zone(obj):
+            continue
+        vertices, faces, key = _zone_from_object(obj, bool(edit and obj == active))
+        height = sum(vertex[2] for vertex in vertices) / len(vertices)
+        zones.append((vertices, faces, key, height))
+    if not zones:
+        raise PlacementError("Выделите полигоны подложки")
+    if edit:
+        bpy.ops.object.mode_set(mode="OBJECT")
+    return zones
+
+
 def _plant_target_ready(context) -> bool:
-    return _slider_zone_mesh(context) is not None
+    return bool(_plant_target_objects(context))
 
 
 def _model_scale(context, prop: str) -> float:
@@ -836,13 +896,18 @@ def _run_plantings(
     allow_layer_fallback: bool = True,
     occupied: OccupiedFootprints | None = None,
     obstacles: PlantObstacles | None = None,
+    targets: list | None = None,
 ) -> tuple[int, str]:
     """Копии моделей, как у лавок. Геоноды в окне Blender оставляли слой пустым.
 
     Встаёт не точка, а квадрат карты. occupied общий на проход: None — собрать
     растения чужих зон здесь. Препятствия тоже можно принести снаружи, один раз.
+    targets — явный набор полигонов: активный объект и слой списка не подмешиваются.
     """
-    zones = _selected_zones(context, only=only, allow_layer_fallback=allow_layer_fallback)
+    if targets is not None:
+        zones = _zones_of(context, targets)
+    else:
+        zones = _selected_zones(context, only=only, allow_layer_fallback=allow_layer_fallback)
     density = float(context.scene.dwgreader_density) / 100.0
     share = float(context.scene.dwgreader_tree_share) / 100.0
     seed = int(context.scene.dwgreader_seed)
@@ -952,27 +1017,27 @@ def _run_plantings(
 
 
 def _on_plant_update(self, context):
-    global _PLANT_PENDING, _PLANT_TARGET
+    global _PLANT_PENDING
     if _PLANT_LOCK or not _PLANT_UI_SEEN or context is None or _busy(context):
         return
     scene = getattr(context, "scene", None)
     if scene is None:
         return
     all_lawns = _PLANT_SCOPE == "lawns"
+    pending_names: list[str] | None = None
     if not all_lawns:
         if getattr(scene, "dwgreader_place_mode", "plantings") != "plantings":
             return
-        zone = _slider_zone_mesh(context)
-        if zone is None:
-            _status(context, "Выберите полигон в 3D-виде")
+        targets = _plant_target_objects(context, remember=True)
+        if not targets:
+            _status(context, "Выделите полигоны подложки")
             return
-        _remember_zone(zone)
-        _PLANT_TARGET = zone.name
+        pending_names = [obj.name for obj in targets]
     if _PLANT_PENDING:
         return
     _PLANT_PENDING = True
 
-    def _later():
+    def _later(names=pending_names, lawns=all_lawns):
         global _PLANT_LOCK, _PLANT_PENDING
         _PLANT_PENDING = False
         current = bpy.context
@@ -980,13 +1045,18 @@ def _on_plant_update(self, context):
             return None
         _PLANT_LOCK = True
         try:
-            if _PLANT_SCOPE == "lawns":
+            if lawns:
                 note = _replant_lawns(current)
             else:
-                zone_now = bpy.data.objects.get(_PLANT_TARGET) if _PLANT_TARGET else None
-                if zone_now is None or zone_now.type != "MESH" or _placement_source(zone_now):
+                objects = []
+                for name in names or []:
+                    obj = bpy.data.objects.get(name)
+                    if _is_plant_zone(obj):
+                        objects.append(obj)
+                if not objects:
+                    _status(current, "Выделите полигоны подложки")
                     return None
-                _count, note = _run_plantings(current, only=zone_now, allow_layer_fallback=False)
+                _count, note = _run_plantings(current, targets=objects)
             _status(current, note)
         except PlacementError as exc:
             _status(current, str(exc))
@@ -1036,6 +1106,16 @@ def _schedule_play_refill(context) -> None:
 
 
 def _on_play_seed(self, context):
+    _schedule_play_refill(context)
+
+
+def _safety_scale(context) -> float:
+    scene = getattr(context, "scene", None)
+    raw = float(getattr(scene, "dwgreader_safety_scale", 1.0) or 1.0)
+    return min(max(raw, 0.25), 1.0)
+
+
+def _on_safety_scale(self, context):
     _schedule_play_refill(context)
 
 
@@ -1153,7 +1233,7 @@ def _new_mesh_object(name: str, vertices, faces, collection: bpy.types.Collectio
 class DWGREADER_OT_place_plantings(Operator):
     bl_idname = "dwgreader.place_plantings"
     bl_label = "Расставить посадки"
-    bl_description = "Случайные деревья и кусты по выбранному полигону подложки"
+    bl_description = "Случайные деревья и кусты по выделенным полигонам подложки"
     bl_options = {"UNDO"}
 
     @classmethod
@@ -1162,7 +1242,10 @@ class DWGREADER_OT_place_plantings(Operator):
 
     def execute(self, context):
         try:
-            _count, note = _run_plantings(context)
+            targets = _plant_target_objects(context, remember=True)
+            if not targets:
+                raise PlacementError("Выделите полигоны подложки")
+            _count, note = _run_plantings(context, targets=targets)
         except PlacementError as exc:
             _status(context, str(exc))
             self.report({"ERROR"}, str(exc))
@@ -1283,16 +1366,18 @@ def _world_mesh(obj: bpy.types.Object) -> tuple[list[tuple[float, float, float]]
 
 def _play_spec(asset: dict) -> dict:
     footprint = asset["footprint"]
-    clearance = asset.get("clearance")
-    if not clearance:
-        margin = impact_margin(float(footprint[2]))
-        clearance = (margin, margin, margin, margin)
+    fall = asset.get("fall_height")
     return {
         "id": asset["id"],
         "width": float(footprint[0]),
         "depth": float(footprint[1]),
-        "clearance": tuple(float(value) for value in clearance[:4]),
+        "clearance": playground_clearance(asset),
         "motion": str(asset.get("motion") or "static"),
+        "role": str(asset.get("role") or "activity"),
+        "fall_height": float(fall) if fall is not None else min(float(footprint[2]), 3.0),
+        "group": str(asset.get("group") or play_group(asset)),
+        "runout": asset.get("runout"),
+        "runout_side": asset.get("runout_side"),
     }
 
 
@@ -1430,53 +1515,165 @@ def _mesh_islands(obj, edit: bool):
     return islands
 
 
+def _pad_material(kind: str):
+    name = "MAT_play_rubber" if kind == "rubber" else "MAT_play_sand"
+    color = (0.23, 0.52, 0.72, 1.0) if kind == "rubber" else (0.78, 0.68, 0.46, 1.0)
+    material = bpy.data.materials.get(name)
+    if material is None:
+        material = bpy.data.materials.new(name)
+        material.diffuse_color = color
+        if hasattr(material, "use_nodes"):
+            material.use_nodes = True
+        tree = getattr(material, "node_tree", None)
+        node = tree.nodes.get("Principled BSDF") if tree is not None else None
+        if node is not None and "Base Color" in node.inputs:
+            node.inputs["Base Color"].default_value = color
+    return material
+
+
+def _spawn_pad(ring: list[tuple[float, float]], key: str, kind: str, height: float):
+    mesh = bpy.data.meshes.new("PLAY_PAD")
+    mesh.from_pydata([(float(x), float(y), height + 0.02) for x, y in ring], [], [tuple(range(len(ring)))])
+    mesh.update()
+    mesh.materials.append(_pad_material(kind))
+    obj = bpy.data.objects.new("PLAY_PAD", mesh)
+    obj["placement"] = "pad"
+    obj["family"] = "pad"
+    obj["zone_key"] = key
+    obj["pad_kind"] = kind
+    _placement_collection("playgrounds").objects.link(obj)
+    obj.hide_set(False)
+    return obj
+
+
+def _layout_bench(context) -> tuple[dict | None, dict | None]:
+    try:
+        catalog = load_catalog(context)
+    except PlacementError:
+        return None, None
+    asset = next((item for item in catalog if item.get("id") == "bench_01"), None)
+    if asset is None:
+        return None, None
+    urn = next((item for item in catalog if item.get("id") == "urn_01"), None)
+    spec = {
+        "width": float(asset["footprint"][0]),
+        "depth": float(asset["footprint"][1]),
+        "urn_width": float(urn["footprint"][0]) if urn is not None else 0.0,
+        "urn_depth": float(urn["footprint"][1]) if urn is not None else 0.0,
+    }
+    return asset, spec
+
+
+def _spawn_layout_bench(context, asset: dict, point: dict, key: str, height: float):
+    source = _import_mesh(context, asset)
+    obj = source.copy()
+    obj.data = source.data
+    obj.hide_viewport = False
+    obj.hide_render = False
+    obj.hide_select = False
+    obj.name = f"BENCH_{asset['id']}"
+    obj.location = (float(point["x"]), float(point["y"]), height)
+    obj.rotation_euler = (0.0, 0.0, float(point["angle"]))
+    obj["placement"] = "linear"
+    obj["family"] = "bench"
+    obj["asset_id"] = asset["id"]
+    obj["zone_key"] = key
+    _placement_collection("benches").objects.link(obj)
+    obj.hide_set(False)
+    return obj
+
+
+def _spawn_layout_urn(context, asset: dict, point: dict, key: str, height: float):
+    source = _import_mesh(context, asset)
+    obj = source.copy()
+    obj.data = source.data
+    obj.hide_viewport = False
+    obj.hide_render = False
+    obj.hide_select = False
+    obj.name = f"URN_{asset['id']}"
+    obj.location = (float(point["x"]), float(point["y"]), height)
+    obj.rotation_euler = (0.0, 0.0, float(point["angle"]))
+    obj["placement"] = "point"
+    obj["family"] = "urn"
+    obj["asset_id"] = asset["id"]
+    obj["zone_key"] = key
+    _placement_collection("benches").objects.link(obj)
+    obj.hide_set(False)
+    return obj
+
+
 def _fill_playground_on(
     context, vertices, faces, key: str, blocked=None, replace: bool = True,
-    kind: str | None = None, seed: int | None = None,
-) -> int:
+    kind: str | None = None, seed: int | None = None, with_benches: bool = True,
+) -> tuple[int, bool]:
     catalog = _play_assets(context, kind)
     if not catalog:
         raise PlacementError("В каталоге нет моделей выбранного типа площадки")
     collection = _placement_collection("playgrounds")
+    benches = _placement_collection("benches")
     if replace:
         _replace_owned(collection, key, prefix=True)
+        _replace_owned(benches, key, prefix=True)
     if blocked is None:
         blocked = _playground_blocked()
     if seed is None:
         seed_value = int(getattr(context.scene, "dwgreader_play_seed", 1))
     else:
         seed_value = int(seed)
-    packed = pack_playground(
+    bench_asset, bench_spec = _layout_bench(context) if with_benches else (None, None)
+    layout = compose_playground(
         vertices, faces, [_play_spec(asset) for asset in catalog], blocked=blocked,
-        seed=seed_value,
-        limit=playground_capacity(polygon_area_xy(vertices, faces)),
+        seed=seed_value, bench=bench_spec, clearance_scale=_safety_scale(context),
     )
     catalog_by_id = {asset["id"]: asset for asset in catalog}
     centroid = polygon_centroid_xy(vertices, faces)
     height = float(centroid[2]) if centroid is not None else 0.0
-    for item in packed:
+    for item in layout["items"]:
         asset = catalog_by_id[item["id"]]
         obj = _spawn_playground(
             context, asset, (float(item["x"]), float(item["y"]), height), float(item["angle"]), key, 1.0,
         )
         _remember_playground_zone(obj, vertices, faces)
         obj["safety_ok"] = True
-    return len(packed)
+        pad = item.get("pad")
+        if pad and item.get("pad_kind"):
+            _spawn_pad(pad, key, str(item["pad_kind"]), height)
+    if bench_asset is not None:
+        for point in layout["benches"]:
+            _spawn_layout_bench(context, bench_asset, point, key, height)
+    urn_asset = None
+    if layout.get("urns"):
+        try:
+            urn_asset = _asset(context, "urn_01")
+        except PlacementError:
+            urn_asset = None
+    if urn_asset is not None:
+        for point in layout["urns"]:
+            _spawn_layout_urn(context, urn_asset, point, key, height)
+    return len(layout["items"]), bool(layout["hero_missing"])
 
 
-def _fill_islands(context, islands, zones=None, kind: str | None = None, seed: int | None = None) -> int:
+def _fill_islands(context, islands, zones=None, kind: str | None = None, seed: int | None = None, merge_nearby: bool = False) -> tuple[int, bool]:
     if not _play_assets(context, kind):
         raise PlacementError("В каталоге нет моделей выбранного типа площадки")
     collection = _placement_collection("playgrounds")
+    benches = _placement_collection("benches")
     for _vertices, _faces, key in islands:
         _replace_owned(collection, key, prefix=True)
+        _replace_owned(benches, key, prefix=True)
+    work = cluster_nearby_islands(islands) if merge_nearby else islands
     blocked = _playground_blocked(exclude=zones)
     total = 0
-    for vertices, faces, key in islands:
-        total += _fill_playground_on(
+    missing = False
+    bench_keys = bench_island_keys(work)
+    for vertices, faces, key in work:
+        count, missed = _fill_playground_on(
             context, vertices, faces, key, blocked, replace=False, kind=kind, seed=seed,
+            with_benches=key in bench_keys,
         )
-    return total
+        total += count
+        missing = missing or missed
+    return total, missing
 
 
 def _all_playground_meshes() -> list:
@@ -1516,9 +1713,12 @@ def refill_playgrounds(context, prefer_selection: bool = False) -> str:
             continue
     if not islands:
         return "Выберите полигоны площадки"
-    total = _fill_islands(context, islands, targets)
+    total, hero_missing = _fill_islands(context, islands, targets, merge_nearby=prefer_selection)
     if total:
-        return f"На площадках {total} объектов, полигонов {len(islands)}"
+        note = f"На площадках {total} объектов, полигонов {len(islands)}"
+        if hero_missing:
+            note += ". Крупный объект не влез"
+        return note
     return "На полигон не встала ни одна модель: зона безопасности не помещается"
 
 
@@ -1551,8 +1751,9 @@ def _place_playground_on(
     obj["edge_angle"] = edge_angle
     _remember_playground_zone(obj, vertices, faces)
     spec = _play_spec(asset)
+    clearance = tuple(float(value) * _safety_scale(context) for value in spec["clearance"])
     inside = safety_inside(
-        vertices, faces, spec["width"], spec["depth"], spec["clearance"], rotation,
+        vertices, faces, spec["width"], spec["depth"], clearance, rotation,
         (float(center[0]), float(center[1])),
         blocked=_fence_blocked(_obstacle_meshes(exclude=obj), exclude=obj), scale=scale,
     )
@@ -1584,18 +1785,33 @@ def furnish_underlay(context) -> str:
         notes.append(f"деревья {plants} на газонах {used}")
     if maf_on:
         zones = [obj for obj in meshes if _playground_mesh(obj)]
-        islands = []
-        for obj in zones:
-            islands.extend(_mesh_islands(obj, False))
         if not zones:
-            notes.append("площадки не найдены: нужно имя с «площад», «игров» или «спорт», либо резиновое покрытие")
+            notes.append("площадки не найдены: нужно имя с «площад», «игров», «спорт» или «резин»")
         else:
-            try:
-                placed = _fill_islands(context, islands, zones, kind="children", seed=1)
-            except PlacementError as exc:
-                notes.append(str(exc))
+            placed = 0
+            hero_missing = False
+            failed = ""
+            seed_value = int(getattr(scene, "dwgreader_play_seed", 1))
+            for kind, group in _auto_playground_groups(zones, scene):
+                group_islands = []
+                for obj in group:
+                    group_islands.extend(_mesh_islands(obj, False))
+                try:
+                    count, missing = _fill_islands(context, group_islands, group, kind=kind, seed=seed_value)
+                except PlacementError as exc:
+                    failed = str(exc)
+                    continue
+                placed += count
+                hero_missing = hero_missing or missing
+            if failed and placed == 0:
+                notes.append(failed)
             else:
-                notes.append(f"площадки {placed}")
+                note = f"площадки {placed}"
+                if hero_missing:
+                    note += ", крупный объект не влез"
+                if failed:
+                    note += f", {failed}"
+                notes.append(note)
     try:
         from . import building_export
         buildings = building_export.place_auto_buildings(context)
@@ -1606,6 +1822,20 @@ def furnish_underlay(context) -> str:
     if not notes:
         return ""
     return "Расставлено: " + ", ".join(notes)
+
+
+def _auto_playground_groups(zones, scene) -> list[tuple[str, list]]:
+    """Случайно — свой тип на полигон. Детские и спортивные — один каталог на все."""
+    ordered = sorted(zones, key=lambda obj: str(obj.get("dxf_layer") or obj.name))
+    mode = str(getattr(scene, "dwgreader_auto_play_kind", "random") or "random")
+    seed_value = int(getattr(scene, "dwgreader_play_seed", 1))
+    kinds = auto_playground_kinds(
+        [str(obj.get("dxf_layer") or obj.name) for obj in ordered], mode, seed_value,
+    )
+    groups: dict[str, list] = {"sports": [], "children": []}
+    for obj, kind in zip(ordered, kinds):
+        groups[kind].append(obj)
+    return [(kind, group) for kind, group in groups.items() if group]
 
 
 def _playground_mesh(obj) -> bool:
@@ -2472,7 +2702,8 @@ def draw_panel(layout, context) -> None:
         tabs.prop(scene, "dwgreader_place_mode", expand=True)
         mode = scene.dwgreader_place_mode
         if mode == "plantings":
-            box.label(text="Посадки ставятся на активный полигон")
+            box.label(text="Посадки ставятся на выделенные полигоны")
+            box.label(text="Снятое выделение сохраняет прошлый набор")
             if len(scene.dwgreader_selected):
                 box.template_list(
                     "DWGREADER_UL_place_layers", "place",
@@ -2480,7 +2711,6 @@ def draw_panel(layout, context) -> None:
                     scene, "dwgreader_selected_index",
                     rows=5,
                 )
-            box.label(text="Можно выделить любой полигон в 3D-виде")
             draw_plant_controls(box, context, all_lawns=False)
             box.operator("dwgreader.place_plantings", text="Расставить", icon="OUTLINER_OB_CURVES")
         elif mode == "benches":
@@ -2497,9 +2727,10 @@ def draw_panel(layout, context) -> None:
             box.label(text="«Заполнить» ставит несколько моделей, зона остаётся внутри полигона")
             box.prop(scene, "dwgreader_playground_type", text="Тип площадки")
             box.prop(scene, "dwgreader_play_seed", text="Seed МАФ")
+            box.prop(scene, "dwgreader_safety_scale", text="Зона безопасности", slider=True)
             hint = box.column(align=True)
             hint.scale_y = 0.75
-            hint.label(text="Тип и сид меняют только выделенные полигоны.")
+            hint.label(text="Тип применяется кнопкой «Заполнить». Сид и зона меняют выделенные полигоны.")
             box.prop(scene, "dwgreader_play_asset", text="Модель")
             box.prop(scene, "dwgreader_play_scale", text="Размер площадки")
             box.operator("dwgreader.fill_playground", text="Заполнить", icon="MESH_GRID")
@@ -2545,6 +2776,24 @@ CLASSES = (
     DWGREADER_OT_fill_playground,
     DWGREADER_OT_replace_model,
 )
+
+
+def _adopt_saved_plant_defaults():
+    """Старые стартовые плотность и долю деревьев подменяет уже после включения.
+
+    Пока аддон ставится из настроек, у bpy.data нет сцен: обращение к ним
+    роняет включение с '_RestrictData' object has no attribute 'scenes'.
+    """
+    scenes = getattr(getattr(bpy, "data", None), "scenes", None)
+    if scenes is None:
+        return 0.2
+    for scene in scenes:
+        density, share = adopt_plant_defaults(scene.dwgreader_density, scene.dwgreader_tree_share)
+        if density != scene.dwgreader_density:
+            scene.dwgreader_density = density
+        if share != scene.dwgreader_tree_share:
+            scene.dwgreader_tree_share = share
+    return None
 
 
 def register() -> None:
@@ -2649,13 +2898,33 @@ def register() -> None:
     )
     bpy.types.Scene.dwgreader_playground_type = EnumProperty(
         name="Тип площадки",
-        description="Определяет набор моделей для автоматической и ручной расстановки",
+        description="Набор моделей для заполнения выделенных площадок и одиночной постановки",
         items=(
             ("children", "Детская", "Игровые комплексы, горки, качели, песочницы и домики"),
             ("sports", "Спортивная", "Спортивные комплексы"),
         ),
         default="children",
         update=_on_playground_type,
+    )
+    bpy.types.Scene.dwgreader_safety_scale = FloatProperty(
+        name="Зона безопасности",
+        description="1 — заложенная зона. Меньше сужает полосу, и встают модели, которые раньше не влезали",
+        default=1.0,
+        min=0.25,
+        max=1.0,
+        step=5,
+        precision=2,
+        update=_on_safety_scale,
+    )
+    bpy.types.Scene.dwgreader_auto_play_kind = EnumProperty(
+        name="Тип площадок",
+        description="Какой каталог ставить при автоматической расстановке. Случайно выбирает тип отдельно на каждом полигоне",
+        items=(
+            ("random", "Случайно", "На каждом полигоне отдельно детская или спортивная"),
+            ("children", "Детские", "Игровые комплексы, горки, качели, песочницы и домики"),
+            ("sports", "Спортивные", "Спортивные комплексы"),
+        ),
+        default="random",
     )
     bpy.types.Scene.dwgreader_play_seed = IntProperty(
         name="Seed МАФ",
@@ -2677,16 +2946,14 @@ def register() -> None:
         soft_max=4.0,
         update=_on_play_scale,
     )
-    for scene in bpy.data.scenes:
-        density, share = adopt_plant_defaults(scene.dwgreader_density, scene.dwgreader_tree_share)
-        if density != scene.dwgreader_density:
-            scene.dwgreader_density = density
-        if share != scene.dwgreader_tree_share:
-            scene.dwgreader_tree_share = share
+    if not bpy.app.timers.is_registered(_adopt_saved_plant_defaults):
+        bpy.app.timers.register(_adopt_saved_plant_defaults, first_interval=0.1)
 
 
 def unregister() -> None:
     global _MODEL_PREVIEWS
+    if bpy.app.timers.is_registered(_adopt_saved_plant_defaults):
+        bpy.app.timers.unregister(_adopt_saved_plant_defaults)
     if bpy.app.timers.is_registered(_preview_timer):
         bpy.app.timers.unregister(_preview_timer)
     if _MODEL_PREVIEWS is not None:
@@ -2697,6 +2964,8 @@ def unregister() -> None:
         "dwgreader_play_scale",
         "dwgreader_play_asset",
         "dwgreader_play_seed",
+        "dwgreader_safety_scale",
+        "dwgreader_auto_play_kind",
         "dwgreader_playground_type",
         "dwgreader_bench_scale",
         "dwgreader_bench_flip",

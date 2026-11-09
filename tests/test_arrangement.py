@@ -195,6 +195,14 @@ class FenceContourTests(unittest.TestCase):
         self.assertEqual(len(pieces), 4)
         self.assertTrue(all(piece.category == "fence" for piece in pieces))
 
+    def test_enabled_omit_does_not_build_a_fence_strip(self) -> None:
+        categories = {"Ограды": "fence"}
+        with use_settings(PipelineSettings(fence_width_m=0.2, omit_fences=True)):
+            pieces, _skipped = _curve_pieces_from_segments(
+                [((0.0, 0.0), (2.0, 0.0), "Ограды")], categories.get, categories,
+            )
+        self.assertEqual(pieces, [])
+
 
 class SpatialCopyTests(unittest.TestCase):
     def test_independent_distant_clusters_are_preserved(self) -> None:
@@ -386,6 +394,32 @@ class SymbolCutoutTests(unittest.TestCase):
         ]
         areas = _areas(pieces, cut=False)
         self.assertAlmostEqual(areas["Газон"], 84.0, places=3)
+
+    def test_flower_bed_recorded_as_lawn_does_not_cut_the_ground(self) -> None:
+        pieces = [
+            HatchPiece("green", "Газон", _ring(0, 0, 10)),
+            HatchPiece("green", "Б_цветники", _ring(4, 4, 2)),
+        ]
+        areas = _areas(pieces, cut=False)
+        self.assertAlmostEqual(areas["Газон"], 100.0, places=3)
+        self.assertAlmostEqual(areas["Б_цветники"], 4.0, places=3)
+
+    def test_small_green_islands_drop_and_a_fifth_stays(self) -> None:
+        pieces = [
+            HatchPiece("green", "Леса и газоны", _ring(0, 0, 10)),
+            HatchPiece("green", "Леса и газоны", _ring(20, 0, 2)),
+            HatchPiece("green", "Леса и газоны", _ring(40, 0, 20.0 ** 0.5)),
+        ]
+        areas = _areas(pieces, cut=False)
+        self.assertAlmostEqual(areas["Леса и газоны"], 120.0, places=3)
+
+    def test_equal_green_islands_all_stay(self) -> None:
+        pieces = [
+            HatchPiece("green", "Леса и газоны", _ring(0, 0, 10)),
+            HatchPiece("green", "Леса и газоны", _ring(20, 0, 10)),
+        ]
+        areas = _areas(pieces, cut=False)
+        self.assertAlmostEqual(areas["Леса и газоны"], 200.0, places=3)
 
     def test_building_hole_stays_when_symbol_cutout_is_off(self) -> None:
         pieces = [

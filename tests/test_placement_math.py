@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
-from math import pi
+from math import cos, hypot, pi, sin
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blender_addon" / "dwgreader_underlay"))
@@ -16,10 +16,18 @@ from placement_math import (
     blocks_playground,
     cluster_boxes,
     small_sheet_indexes,
+    choose_plant_names,
+    auto_playground_kinds,
+    bench_island_keys,
+    cluster_nearby_islands,
+    compose_playground,
     equipment_quads,
     forward_angle,
     impact_margin,
     is_playground_layer,
+    playground_fill_kind,
+    play_group,
+    playground_clearance,
     mirrored_keep_from,
     pack_playground,
     plan_image,
@@ -142,6 +150,19 @@ class SheetClusterTests(unittest.TestCase):
         self.assertEqual(small_sheet_indexes([40, 40]), [])
 
 
+class PlantTargetTests(unittest.TestCase):
+    def test_several_selected_names_are_kept(self) -> None:
+        self.assertEqual(choose_plant_names(["газон", "газон_2", "газон"], ["старый"]), ["газон", "газон_2"])
+
+    def test_empty_selection_keeps_the_remembered_set(self) -> None:
+        remembered = ["газон", "газон_2"]
+        self.assertEqual(choose_plant_names([], remembered), remembered)
+
+    def test_empty_memory_plants_nothing(self) -> None:
+        self.assertEqual(choose_plant_names([], []), [])
+        self.assertEqual(choose_plant_names(["", " "], ["", " "]), [])
+
+
 def _square(width: float, depth: float) -> tuple[list[tuple[float, float, float]], list[tuple[int, ...]]]:
     vertices = [(0.0, 0.0, 0.0), (width, 0.0, 0.0), (width, depth, 0.0), (0.0, depth, 0.0)]
     return vertices, [(0, 1, 2), (0, 2, 3)]
@@ -160,8 +181,12 @@ class PlaygroundPackTests(unittest.TestCase):
                 "id": item["id"],
                 "width": item["footprint"][0],
                 "depth": item["footprint"][1],
-                "clearance": tuple(item["clearance"]),
+                "clearance": playground_clearance(item),
                 "motion": item["motion"],
+                "role": item.get("role") or "activity",
+                "fall_height": item.get("fall_height"),
+                "group": play_group(item),
+                "playground_type": item.get("playground_type") or "children",
             })
         return found
 
@@ -176,29 +201,353 @@ class PlaygroundPackTests(unittest.TestCase):
         self.assertEqual(catalog["play_01"]["motion"], "slide")
         self.assertGreater(right, front)
         self.assertAlmostEqual(right - left, 2.0, places=2)
-        self.assertEqual(catalog["swing_01"]["motion"], "swing")
+        margin = impact_margin(float(catalog["sandbox_01"]["fall_height"]))
+        self.assertEqual(catalog["sandbox_01"]["clearance"], (margin, margin, margin, margin))
+        swing = catalog["swing_01"]["clearance"]
+        self.assertEqual(swing[:2], (2.0, 2.0))
+        self.assertEqual(swing[2:], (1.5, 1.5))
+        self.assertNotEqual(swing[0], impact_margin(float(catalog["swing_01"]["fall_height"])))
+
+    def test_seed_is_reproducible_and_changes_the_layout(self) -> None:
+        vertices, faces = _square(40.0, 30.0)
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        bench = {"width": 1.82, "depth": 0.68, "urn_width": 0.4, "urn_depth": 0.26}
+        first = compose_playground(vertices, faces, children, seed=41, bench=bench)
+        repeated = compose_playground(vertices, faces, children, seed=41, bench=bench)
+        self.assertFalse(first["hero_missing"])
+        self.assertEqual(first, repeated)
+        self.assertLessEqual(len(first["items"]), 16)
+        self.assertIn("play_08", {item["id"] for item in first["items"]})
+        assets = {item["id"]: item for item in children}
+        signatures = set()
+        bench_signatures = set()
+        for seed in range(8):
+            layout = compose_playground(vertices, faces, children, seed=seed, bench=bench)
+            signatures.add(tuple(
+                (item["id"], round(item["x"], 1), round(item["y"], 1), round(item["angle"], 2))
+                for item in layout["items"]
+            ))
+            bench_signatures.add(tuple(
+                (round(point["x"], 1), round(point["y"], 1)) for point in layout["benches"]
+            ))
+            quads = []
+            for item in layout["items"]:
+                asset = assets[item["id"]]
+                _gap, zone = equipment_quads(
+                    asset["width"], asset["depth"], asset["clearance"], item["angle"], (item["x"], item["y"]),
+                )
+                self.assertTrue(all(
+                    0.0 - 1e-6 <= x <= 40.0 + 1e-6 and 0.0 - 1e-6 <= y <= 30.0 + 1e-6 for x, y in zone
+                ))
+                quads.append(zone)
+                for other in quads[:-1]:
+                    self.assertFalse(quads_overlap(zone, other))
+        self.assertGreater(len(signatures), 1)
+        self.assertGreater(len(bench_signatures), 1)
+        for points in bench_signatures:
+            self.assertGreater(len(points), 2)
+
+    def test_lone_hero_stays_at_the_widest_point(self) -> None:
+        vertices, faces = _square(40.0, 40.0)
+        sports = [item for item in self._assets() if item["id"] == "play_big"]
+        first = compose_playground(vertices, faces, sports, seed=7)
+        repeated = compose_playground(vertices, faces, sports, seed=7)
+        self.assertEqual(first["items"], repeated["items"])
+        self.assertGreaterEqual(len(first["items"]), 1)
+        self.assertLessEqual(len(first["items"]), 16)
+        poses = set()
+        for seed in range(6):
+            layout = compose_playground(vertices, faces, sports, seed=seed)
+            hero = layout["items"][0]
+            if seed % 4 == 0:
+                self.assertAlmostEqual(hero["x"], 20.0, delta=8.0)
+                self.assertAlmostEqual(hero["y"], 20.0, delta=8.0)
+                poses.add(round(hero["angle"], 2))
+            turned = abs(float(hero["angle"])) % (pi / 2.0)
+            self.assertLess(min(turned, pi / 2.0 - turned), 0.05)
+        self.assertEqual(len(poses), 1)
+        turned = abs(float(first["items"][0]["angle"])) % (pi / 2.0)
+        self.assertLess(min(turned, pi / 2.0 - turned), 0.05)
+
+    def test_sports_layout_uses_the_new_models(self) -> None:
+        vertices, faces = _square(40.0, 30.0)
+        assets = {item["id"]: item for item in self._assets() if item["playground_type"] == "sports"}
+        layout = compose_playground(vertices, faces, list(assets.values()), seed=1)
+        ids = {item["id"] for item in layout["items"]}
+        self.assertIn("play_big", ids)
+        self.assertFalse(layout["hero_missing"])
+        self.assertTrue(ids - {"play_big"})
+        self.assertLessEqual(len(layout["items"]), 16)
+        quads = []
+        for item in layout["items"]:
+            asset = assets[item["id"]]
+            _gap, zone = equipment_quads(
+                asset["width"], asset["depth"], asset["clearance"], item["angle"], (item["x"], item["y"]),
+            )
+            self.assertTrue(all(0.0 - 1e-6 <= x <= 40.0 + 1e-6 and 0.0 - 1e-6 <= y <= 30.0 + 1e-6 for x, y in zone))
+            quads.append(zone)
+            for other in quads[:-1]:
+                self.assertFalse(quads_overlap(zone, other))
+
+    def test_composition_keeps_zones_inside_and_uncluttered(self) -> None:
+        vertices, faces = _square(40.0, 30.0)
+        assets = {item["id"]: item for item in self._assets() if item["playground_type"] == "children"}
+        placed = compose_playground(vertices, faces, list(assets.values()), seed=3)
+        self.assertGreater(len(placed["items"]), 1)
+        self.assertLessEqual(len(placed["items"]), 16)
+        quads = []
+        for item in placed["items"]:
+            asset = assets[item["id"]]
+            _gap, zone = equipment_quads(
+                asset["width"], asset["depth"], asset["clearance"], item["angle"], (item["x"], item["y"]),
+            )
+            self.assertTrue(all(0.0 - 1e-6 <= x <= 40.0 + 1e-6 and 0.0 - 1e-6 <= y <= 30.0 + 1e-6 for x, y in zone))
+            if item["pad"] is not None:
+                self.assertEqual(item["pad_kind"], "rubber" if asset["motion"] in {"swing", "slide"} or asset["role"] == "hero" else "sand")
+            quads.append(zone)
+            for other in quads[:-1]:
+                self.assertFalse(quads_overlap(zone, other))
+
+    def test_benches_sit_inside_along_the_edge(self) -> None:
+        vertices, faces = _square(40.0, 30.0)
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        bench = {"width": 1.82, "depth": 0.68, "urn_width": 0.4, "urn_depth": 0.26}
+        layout = compose_playground(vertices, faces, children, seed=1, bench=bench)
+        self.assertTrue(layout["benches"])
+        self.assertGreater(len(layout["benches"]), 2)
+        self.assertEqual(len(layout["urns"]), len(layout["benches"]))
+        assets = {item["id"]: item for item in children}
+        zones = []
+        for item in layout["items"]:
+            asset = assets[item["id"]]
+            _gap, zone = equipment_quads(
+                asset["width"], asset["depth"], asset["clearance"], item["angle"], (item["x"], item["y"]),
+            )
+            zones.append(zone)
+        center = (20.0, 15.0)
+        for point in layout["benches"]:
+            self.assertGreater(point["x"], 0.0)
+            self.assertLess(point["x"], 40.0)
+            self.assertGreater(point["y"], 0.0)
+            self.assertLess(point["y"], 30.0)
+            self.assertLess(min(point["x"], point["y"], 40.0 - point["x"], 30.0 - point["y"]), 1.5)
+            facing = (-sin(point["angle"]), cos(point["angle"]))
+            self.assertGreater(
+                facing[0] * (center[0] - point["x"]) + facing[1] * (center[1] - point["y"]),
+                0.0,
+            )
+            gap, _safety = equipment_quads(1.82, 0.68, (0.0, 0.0, 0.0, 0.0), point["angle"], (point["x"], point["y"]))
+            for zone in zones:
+                self.assertFalse(quads_overlap(gap, zone))
+        for urn in layout["urns"]:
+            self.assertGreater(urn["x"], 0.0)
+            self.assertLess(urn["x"], 40.0)
+            self.assertGreater(urn["y"], 0.0)
+            self.assertLess(urn["y"], 30.0)
+            nearest = min(hypot(urn["x"] - point["x"], urn["y"] - point["y"]) for point in layout["benches"])
+            self.assertGreater(nearest, 0.9)
+            self.assertLess(nearest, 1.4)
+            gap, _safety = equipment_quads(0.4, 0.26, (0.0, 0.0, 0.0, 0.0), urn["angle"], (urn["x"], urn["y"]))
+            for zone in zones:
+                self.assertFalse(quads_overlap(gap, zone))
+        for point in layout["items"]:
+            turned = abs(float(point["angle"])) % (pi / 2.0)
+            self.assertLess(min(turned, pi / 2.0 - turned), 0.05)
+        shifted = compose_playground(vertices, faces, children, seed=2, bench=bench)
+        here = [(round(point["x"], 1), round(point["y"], 1)) for point in layout["benches"]]
+        there = [(round(point["x"], 1), round(point["y"], 1)) for point in shifted["benches"]]
+        self.assertNotEqual(here, there)
+
+    def test_hole_keeps_two_pairs_on_the_long_edges(self) -> None:
+        vertices = [
+            (0.0, 0.0, 0.0), (20.0, 0.0, 0.0), (20.0, 4.0, 0.0), (0.0, 4.0, 0.0),
+            (0.0, 8.0, 0.0), (20.0, 8.0, 0.0), (20.0, 12.0, 0.0), (0.0, 12.0, 0.0),
+            (8.0, 4.0, 0.0), (12.0, 4.0, 0.0), (12.0, 8.0, 0.0), (8.0, 8.0, 0.0),
+        ]
+        faces = [
+            (0, 1, 2, 3), (3, 8, 11, 4), (9, 2, 5, 10), (4, 5, 6, 7),
+        ]
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        bench = {"width": 1.82, "depth": 0.68, "urn_width": 0.4, "urn_depth": 0.26}
+        first = compose_playground(vertices, faces, children, seed=3, bench=bench)
+        repeated = compose_playground(vertices, faces, children, seed=3, bench=bench)
+        self.assertEqual(first, repeated)
+        self.assertGreaterEqual(len(first["benches"]), 1)
+        self.assertEqual(len(first["urns"]), len(first["benches"]))
+        for point in first["benches"]:
+            self.assertLess(min(point["x"], point["y"], 20.0 - point["x"], 12.0 - point["y"]), 1.5)
+        for urn in first["urns"]:
+            nearest = min(hypot(urn["x"] - point["x"], urn["y"] - point["y"]) for point in first["benches"])
+            self.assertGreater(nearest, 0.9)
+            self.assertLess(nearest, 1.4)
+
+    def test_nearby_squares_share_one_layout(self) -> None:
+        def island(x: float, y: float, size: float, key: str):
+            vertices = [
+                (x, y, 0.0), (x + size, y, 0.0), (x + size, y + size, 0.0), (x, y + size, 0.0),
+            ]
+            return vertices, [(0, 1, 2, 3)], key
+
+        near = [island(0.0, 0.0, 16.0, "A:0"), island(18.0, 0.0, 16.0, "B:0")]
+        far = near + [island(60.0, 0.0, 16.0, "C:0")]
+        self.assertEqual(len(cluster_nearby_islands(far)), 2)
+        self.assertEqual(len(cluster_nearby_islands([near[0], island(40.0, 0.0, 16.0, "D:0")])), 2)
+        merged = cluster_nearby_islands(near)
+        self.assertEqual(len(merged), 1)
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        bench = {"width": 1.82, "depth": 0.68, "urn_width": 0.4, "urn_depth": 0.26}
+        layout = compose_playground(merged[0][0], merged[0][1], children, seed=0, bench=bench)
+        self.assertTrue(any(item["x"] < 16.0 for item in layout["items"]))
+        self.assertTrue(any(item["x"] > 18.0 for item in layout["items"]))
+        for point in layout["benches"]:
+            self.assertFalse(15.2 < point["x"] < 18.8)
+
+    def test_two_pieces_give_benches_to_the_largest(self) -> None:
+        large = ([(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (0.0, 10.0, 0.0)], [(0, 1, 2)], "Yard:0")
+        small = ([(20.0, 0.0, 0.0), (24.0, 0.0, 0.0), (20.0, 2.0, 0.0)], [(0, 1, 2)], "Yard:1")
+        other = ([(0.0, 30.0, 0.0), (6.0, 30.0, 0.0), (0.0, 36.0, 0.0)], [(0, 1, 2)], "Court:0")
+        self.assertEqual(bench_island_keys([large, small, other]), {"Yard:0", "Court:0"})
+
+    def test_compact_model_fills_a_polygon_the_hero_misses(self) -> None:
+        vertices, faces = _square(8.0, 8.0)
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        layout = compose_playground(vertices, faces, children, seed=0)
+        ids = {item["id"] for item in layout["items"]}
+        self.assertNotIn("play_08", ids)
+        self.assertTrue(layout["hero_missing"])
+        self.assertEqual(len(layout["items"]), 1)
+        placed = next(asset for asset in children if asset["id"] == layout["items"][0]["id"])
+        front, back, left, right = placed["clearance"]
+        placed_area = (placed["width"] + left + right) * (placed["depth"] + front + back)
+        for asset in children:
+            zone_front, zone_back, zone_left, zone_right = asset["clearance"]
+            area = (asset["width"] + zone_left + zone_right) * (asset["depth"] + zone_front + zone_back)
+            if area <= placed_area + 1e-6:
+                continue
+            alone = compose_playground(vertices, faces, [asset], seed=0)
+            self.assertEqual(alone["items"], [])
+        repeated = compose_playground(vertices, faces, children, seed=0)
+        self.assertEqual(layout, repeated)
+        self.assertEqual(len(layout["items"]), 1)
+
+    def test_large_rectangle_fills_past_the_old_budget(self) -> None:
+        vertices, faces = _square(40.0, 30.0)
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        layout = compose_playground(vertices, faces, children, seed=5)
+        self.assertGreater(len(layout["items"]), int(40.0 * 30.0 / 300.0))
+        self.assertLessEqual(len(layout["items"]), 16)
+        ids = [item["id"] for item in layout["items"]]
+        children_by_id = {item["id"]: item for item in children}
+        seen: list[str] = []
+        for item_id in ids:
+            if item_id in seen:
+                break
+            seen.append(item_id)
+        self.assertTrue(all(item_id in seen for item_id in ids))
+        by_x: dict[float, int] = {}
+        by_y: dict[float, int] = {}
+        areas = []
+        for item in layout["items"]:
+            asset = children_by_id[item["id"]]
+            front, back, left, right = asset["clearance"]
+            areas.append((asset["width"] + left + right) * (asset["depth"] + front + back))
+            by_x[round(item["x"], 1)] = by_x.get(round(item["x"], 1), 0) + 1
+            by_y[round(item["y"], 1)] = by_y.get(round(item["y"], 1), 0) + 1
+        self.assertEqual(areas[0], max(areas))
+        self.assertGreater(max(max(by_x.values()), max(by_y.values())), 1)
+        plain = compose_playground(vertices, faces, children, seed=0)
+        odd = compose_playground(vertices, faces, children, seed=1)
+        plain_items = tuple((item["id"], round(item["x"], 1), round(item["y"], 1)) for item in plain["items"])
+        odd_items = tuple((item["id"], round(item["x"], 1), round(item["y"], 1)) for item in odd["items"])
+        self.assertNotEqual(plain_items, odd_items)
+        varied = compose_playground(vertices, faces, children, seed=2)
+        varied_items = tuple((item["id"], round(item["x"], 1), round(item["y"], 1)) for item in varied["items"])
+        self.assertTrue(plain_items != varied_items or plain["items"][0]["id"] != varied["items"][0]["id"])
+        self.assertEqual(layout, compose_playground(vertices, faces, children, seed=5))
+        assets = {item["id"]: item for item in children}
+        quads = []
+        for item in layout["items"]:
+            asset = assets[item["id"]]
+            _gap, zone = equipment_quads(
+                asset["width"], asset["depth"], asset["clearance"], item["angle"], (item["x"], item["y"]),
+            )
+            self.assertTrue(all(
+                -1e-6 <= point[0] <= 40.0 + 1e-6 and -1e-6 <= point[1] <= 30.0 + 1e-6 for point in zone
+            ))
+            for other in quads:
+                self.assertFalse(quads_overlap(zone, other))
+            quads.append(zone)
+
+    def test_smaller_clearance_lets_a_larger_model_in(self) -> None:
+        vertices, faces = _square(14.0, 14.0)
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        full = compose_playground(vertices, faces, children, seed=0, clearance_scale=1.0)
+        self.assertEqual(full, compose_playground(vertices, faces, children, seed=0))
+        self.assertEqual(full, compose_playground(vertices, faces, children, seed=0, clearance_scale=2.0))
+        self.assertTrue(full["hero_missing"])
+        self.assertNotIn("play_08", {item["id"] for item in full["items"]})
+        tight = compose_playground(vertices, faces, children, seed=0, clearance_scale=0.5)
+        self.assertIn("play_08", {item["id"] for item in tight["items"]})
+        self.assertFalse(tight["hero_missing"])
+        self.assertEqual(tight, compose_playground(vertices, faces, children, seed=0, clearance_scale=0.5))
+
+    def test_slide_is_placed_when_the_hero_does_not_fit(self) -> None:
+        vertices, faces = _square(14.0, 14.0)
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        slides = {item["id"] for item in children if item["group"] == "slide"}
+        for seed in range(6):
+            layout = compose_playground(vertices, faces, children, seed=seed)
+            self.assertTrue(layout["hero_missing"])
+            self.assertTrue(layout["items"])
+            self.assertNotIn("play_08", {item["id"] for item in layout["items"]})
+            self.assertNotIn(layout["items"][0]["id"], slides)
+
+    def test_narrow_neck_stays_empty(self) -> None:
+        ring = [
+            (0.0, 0.0), (16.0, 0.0), (16.0, 7.5), (22.0, 7.5), (22.0, 0.0), (40.0, 0.0),
+            (40.0, 18.0), (22.0, 18.0), (22.0, 10.5), (16.0, 10.5), (16.0, 18.0), (0.0, 18.0),
+        ]
+        vertices = [(x, y, 0.0) for x, y in ring]
+        faces = [tuple(range(len(ring)))]
+        children = [item for item in self._assets() if item["playground_type"] == "children"]
+        layout = compose_playground(vertices, faces, children, seed=4)
+        self.assertFalse(layout["hero_missing"])
+        for item in layout["items"]:
+            self.assertFalse(16.0 < item["x"] < 22.0 and 7.5 <= item["y"] <= 10.5)
+        for point in layout["benches"]:
+            self.assertFalse(16.0 < point["x"] < 22.0 and 7.5 <= point["y"] <= 10.5)
+
+    def test_small_polygon_reports_the_missing_hero(self) -> None:
+        vertices, faces = _square(4.0, 4.0)
+        large = [item for item in self._assets() if item["id"] == "play_big"]
+        layout = compose_playground(vertices, faces, large)
+        self.assertEqual(layout["items"], [])
+        self.assertTrue(layout["hero_missing"])
+
+    def test_composition_does_not_tile_one_box(self) -> None:
+        vertices, faces = _square(50.0, 40.0)
+        asset = {
+            "id": "box",
+            "width": 1.2,
+            "depth": 1.2,
+            "clearance": (0.4, 0.4, 0.4, 0.4),
+            "motion": "static",
+            "role": "activity",
+            "fall_height": 0.4,
+        }
+        layout = compose_playground(vertices, faces, [asset], seed=3)
+        self.assertGreater(len(layout["items"]), 1)
+        self.assertLessEqual(len(layout["items"]), 16)
+        item = layout["items"][0]
+        self.assertTrue(safety_inside(
+            vertices, faces, 1.2, 1.2, (0.4, 0.4, 0.4, 0.4), item["angle"], (item["x"], item["y"]),
+        ))
+        self.assertIsNone(item["pad"])
 
     def test_small_polygon_stays_empty(self) -> None:
         vertices, faces = _square(4.0, 4.0)
         large = [item for item in self._assets() if item["id"] == "play_big"]
         self.assertEqual(pack_playground(vertices, faces, large), [])
-
-    def test_seed_is_reproducible_and_changes_the_layout(self) -> None:
-        vertices, faces = _square(40.0, 30.0)
-        first = pack_playground(vertices, faces, self._assets(), seed=41)
-        repeated = pack_playground(vertices, faces, self._assets(), seed=41)
-        changed = pack_playground(vertices, faces, self._assets(), seed=42)
-        self.assertTrue(first)
-        self.assertEqual(first, repeated)
-        self.assertNotEqual(first, changed)
-
-    def test_seed_changes_positions_for_a_single_model_type(self) -> None:
-        vertices, faces = _square(40.0, 40.0)
-        sports = [item for item in self._assets() if item["id"] == "play_big"]
-        first = pack_playground(vertices, faces, sports, seed=7)
-        changed = pack_playground(vertices, faces, sports, seed=8)
-        self.assertTrue(first)
-        self.assertNotEqual(first, changed)
 
     def test_large_polygon_fits_several_without_zone_conflicts(self) -> None:
         vertices, faces = _square(40.0, 30.0)
@@ -245,30 +594,12 @@ class PlaygroundPackTests(unittest.TestCase):
         self.assertTrue(blocks_playground("", "area", "", "playground", True))
         self.assertTrue(blocks_playground("", "", "linear", "bench", True))
 
-    def test_higher_limit_fits_more_models_inside_the_polygon(self) -> None:
-        vertices, faces = _square(50.0, 40.0)
-        asset = {
-            "id": "box",
-            "width": 1.2,
-            "depth": 1.2,
-            "clearance": (0.4, 0.4, 0.4, 0.4),
-            "motion": "static",
-        }
-        few = pack_playground(vertices, faces, [asset], limit=4, seed=3)
-        many = pack_playground(vertices, faces, [asset], limit=24, seed=3)
-        self.assertEqual(len(few), 4)
-        self.assertGreater(len(many), 12)
-        for item in many:
-            self.assertTrue(safety_inside(
-                vertices, faces, 1.2, 1.2, (0.4, 0.4, 0.4, 0.4), item["angle"], (item["x"], item["y"]),
-            ))
-
     def test_models_stay_out_of_the_hole(self) -> None:
         vertices = [
             (0.0, 0.0, 0.0), (20.0, 0.0, 0.0), (20.0, 20.0, 0.0), (0.0, 20.0, 0.0),
             (8.0, 8.0, 0.0), (12.0, 8.0, 0.0), (12.0, 12.0, 0.0), (8.0, 12.0, 0.0),
         ]
-        faces = [(0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+        faces = [(0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
         asset = {
             "id": "box",
             "width": 1.2,
@@ -363,11 +694,20 @@ class PlaygroundLayerTests(unittest.TestCase):
         self.assertTrue(is_playground_layer("Спортивная площадка"))
         self.assertFalse(is_playground_layer("Площадка ТБО"))
         self.assertFalse(is_playground_layer("Тротуар"))
+        self.assertEqual(playground_fill_kind("Спортивная площадка"), "sports")
+        self.assertEqual(playground_fill_kind("Детская площадка"), "children")
+        names = ["Детская", "Спортивная площадка", "Резина", "Игровая 2", "Спорт 2", "Площадка 3"]
+        self.assertEqual(auto_playground_kinds(names, "children", 3), ["children"] * len(names))
+        self.assertEqual(auto_playground_kinds(names, "sports", 3), ["sports"] * len(names))
+        mixed = auto_playground_kinds(names, "random", 1)
+        self.assertEqual(mixed, auto_playground_kinds(names, "random", 1))
+        self.assertEqual(set(mixed), {"children", "sports"})
+        self.assertIn("children", auto_playground_kinds(["Спортивная площадка"] * len(names), "random", 1))
 
     def test_rubber_counts_as_a_playground_and_waste_does_not(self) -> None:
         from placement_math import is_playground_surface
 
-        self.assertTrue(is_playground_surface("Резиновая крошка", "rubber"))
+        self.assertTrue(is_playground_surface("Резиновая крошка", ""))
         self.assertTrue(is_playground_surface("Детская площадка", ""))
         self.assertFalse(is_playground_surface("Тротуар", "tile"))
         self.assertFalse(is_playground_surface("Площадка ТБО", "rubber"))

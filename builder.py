@@ -17,7 +17,6 @@ SURFACE = {
     "плитка 1.jpg": "pavers.jpg",
     "тротуар1.jpg": "sidewalk.jpg",
     "асфальт.png": "asphalt.png",
-    "резиновая крошка.jpg": "rubber.jpg",
 }
 
 SourceMap = dict[str, Path]

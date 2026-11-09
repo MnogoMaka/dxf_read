@@ -426,11 +426,34 @@ def minimum_rectangle(points: list[tuple[float, float]]) -> tuple[float, float, 
 
 
 def is_playground_layer(name: str) -> bool:
-    """Покрытие площадки: в имени есть площадка, игровая или спорт, и нет ТБО."""
+    """Покрытие площадки: в имени есть площадка, игровая, спорт или резина, и нет ТБО."""
     text = str(name or "").casefold()
     if "тбо" in text:
         return False
-    return "площад" in text or "игров" in text or "спорт" in text
+    return "площад" in text or "игров" in text or "спорт" in text or "резин" in text
+
+
+def playground_fill_kind(name: str) -> str:
+    """Слой со «спорт» в имени заполняется спортивными моделями."""
+    return "sports" if "спорт" in str(name or "").casefold() else "children"
+
+
+def scale_clearance(clearance, factor: float) -> tuple[float, float, float, float]:
+    """1 оставляет заложенную полосу. Меньше единицы сужает все четыре стороны."""
+    value = min(max(float(factor), 0.0), 1.0)
+    front, back, left, right = clearance
+    return (float(front) * value, float(back) * value, float(left) * value, float(right) * value)
+
+
+def auto_playground_kinds(names: list[str], mode: str, seed: int) -> list[str]:
+    """Тип каждого полигона. Случайный выбор повторяется при том же сиде и не смотрит на имя."""
+    choice = str(mode or "random")
+    if choice == "children":
+        return ["children"] * len(names)
+    if choice == "sports":
+        return ["sports"] * len(names)
+    rng = random.Random(int(seed))
+    return ["sports" if rng.random() < 0.5 else "children" for _name in names]
 
 
 def is_playground_surface(name: str, texture: str = "") -> bool:
@@ -760,6 +783,29 @@ def small_sheet_indexes(counts: list[int], keep_ratio: float = 0.75) -> list[int
         return []
     limit = largest * float(keep_ratio)
     return [index for index, count in enumerate(counts) if int(count) < limit]
+
+
+def choose_plant_names(selected: list[str], remembered: list[str]) -> list[str]:
+    """Полигоны для посадок: непустое выделение, иначе прошлый набор.
+
+    Активный объект и слой из списка сюда не передаются, поэтому пустое
+    выделение не подменяет запомненные полигоны.
+    """
+    def unique(names: list[str]) -> list[str]:
+        chosen: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            text = str(name or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            chosen.append(text)
+        return chosen
+
+    picked = unique(selected)
+    if picked:
+        return picked
+    return unique(remembered)
 
 
 def impact_margin(height: float) -> float:
@@ -1169,6 +1215,854 @@ def pack_playground(
         {"id": item["id"], "x": item["x"], "y": item["y"], "angle": item["angle"], "orientation": item["orientation"]}
         for item in placed
     ]
+
+
+def play_group(asset: dict) -> str:
+    """Вид оборудования для одного кармана: качели отдельно от качалок и горки."""
+    asset_id = str(asset.get("id") or "")
+    motion = str(asset.get("motion") or "")
+    if asset_id.startswith("swing") or motion == "swing":
+        return "swing"
+    if asset_id.startswith("rocker"):
+        return "rocker"
+    if asset_id.startswith("sandbox"):
+        return "sandbox"
+    if asset_id.startswith("house"):
+        return "house"
+    if asset_id.startswith("slide") or motion == "slide":
+        return "slide"
+    if asset_id.startswith("gym"):
+        return "gym"
+    if asset_id.startswith("bar"):
+        return "bar"
+    return "complex"
+
+
+def playground_clearance(asset: dict) -> tuple[float, float, float, float]:
+    """Полоса зоны падения по ГОСТ 34614.1. Качели оставляют явную добавку по ходу качания.
+
+    clearance в каталоге — перекрытие, а не источник. Без высоты падения остаётся
+    записанная четвёрка, чтобы старые вызовы не потеряли зону.
+    """
+    motion = str(asset.get("motion") or "static")
+    stored = asset.get("clearance")
+    has_stored = isinstance(stored, (list, tuple)) and len(stored) >= 4
+    if (motion == "swing" or asset.get("clearance_override")) and has_stored:
+        return tuple(float(value) for value in stored[:4])
+    if "fall_height" in asset and asset.get("fall_height") is not None:
+        fall = min(max(float(asset["fall_height"]), 0.0), 3.0)
+    elif has_stored:
+        return tuple(float(value) for value in stored[:4])
+    else:
+        footprint = asset.get("footprint") or (0.0, 0.0, 0.0)
+        fall = min(max(float(footprint[2]), 0.0), 3.0)
+    margin = impact_margin(fall)
+    front = back = left = right = margin
+    if motion == "slide":
+        extra = max(float(asset.get("runout") or 0.0), 0.0)
+        side = str(asset.get("runout_side") or "front")
+        if side == "back":
+            back += extra
+        elif side == "left":
+            left += extra
+        elif side == "right":
+            right += extra
+        else:
+            front += extra
+    return (front, back, left, right)
+
+
+def _geometry_parts(geometry) -> list:
+    if geometry is None or geometry.is_empty:
+        return []
+    kind = geometry.geom_type
+    if kind == "Polygon":
+        return [geometry]
+    if kind in {"MultiPolygon", "GeometryCollection"}:
+        found = []
+        for part in geometry.geoms:
+            found.extend(_geometry_parts(part))
+        return found
+    return []
+
+
+def _candidate_points(polygon, limit: int = 8) -> list[tuple[float, float, float]]:
+    """Точки внутри полигона, сначала самые дальние от границы."""
+    Point, _polygon, _union, _prep = _shapely()
+    min_x, min_y, max_x, max_y = polygon.bounds
+    span = max(max_x - min_x, max_y - min_y, 1.0)
+    step = max(span / 28.0, 0.45)
+    boundary = polygon.boundary
+    center = polygon.centroid
+    found: list[tuple[float, float, float, float]] = []
+    y = min_y
+    while y <= max_y + 1e-6:
+        x = min_x
+        while x <= max_x + 1e-6:
+            point = Point(x, y)
+            if polygon.covers(point):
+                found.append((point.distance(boundary), -hypot(x - center.x, y - center.y), x, y))
+            x += step
+        y += step
+    if not found:
+        point = polygon.representative_point()
+        return [(float(point.x), float(point.y), 0.0)]
+    found.sort(reverse=True)
+    _distance, _center_bias, best_x, best_y = found[0]
+    fine = max(step / 5.0, 0.2)
+    for row in range(-4, 5):
+        for column in range(-4, 5):
+            px = best_x + column * fine
+            py = best_y + row * fine
+            point = Point(px, py)
+            if polygon.covers(point):
+                found.append((point.distance(boundary), -hypot(px - center.x, py - center.y), px, py))
+    found.sort(reverse=True)
+    chosen: list[tuple[float, float, float]] = []
+    for distance, _center_bias, x, y in found:
+        if any(hypot(x - other_x, y - other_y) < step * 0.75 for _other, other_x, other_y in chosen):
+            continue
+        chosen.append((x, y, distance))
+        if len(chosen) >= limit:
+            break
+    return chosen or [(best_x, best_y, found[0][0])]
+
+
+def _compose_spec(asset: dict) -> dict:
+    if "width" in asset and "depth" in asset:
+        width, depth = float(asset["width"]), float(asset["depth"])
+    else:
+        footprint = asset["footprint"]
+        width, depth = float(footprint[0]), float(footprint[1])
+    stored = asset.get("clearance")
+    if isinstance(stored, (list, tuple)) and len(stored) >= 4:
+        clearance = tuple(float(value) for value in stored[:4])
+    else:
+        clearance = playground_clearance(asset)
+    fall = asset.get("fall_height")
+    return {
+        "id": str(asset.get("id") or "item"),
+        "width": width,
+        "depth": depth,
+        "clearance": clearance,
+        "motion": str(asset.get("motion") or "static"),
+        "role": str(asset.get("role") or "activity"),
+        "fall_height": float(fall) if fall is not None else 0.0,
+        "group": str(asset.get("group") or play_group(asset)),
+    }
+
+
+def _try_sit(spec: dict, point: tuple[float, float], angle: float, orientation: str, usable, placed: list[dict]):
+    _point, polygon, _union, _prep = _shapely()
+    gap, safety = equipment_quads(
+        spec["width"], spec["depth"], spec["clearance"], angle, point,
+    )
+    if not usable.buffer(1e-3).covers(polygon(safety)):
+        return None
+    for other in placed:
+        if quads_overlap(gap, other["gap"]) or quads_overlap(safety, other["safety"]):
+            return None
+    return {
+        "id": spec["id"],
+        "x": float(point[0]),
+        "y": float(point[1]),
+        "angle": float(angle),
+        "orientation": orientation,
+        "motion": spec["motion"],
+        "role": spec["role"],
+        "fall_height": spec["fall_height"],
+        "group": spec["group"],
+        "gap": gap,
+        "safety": safety,
+    }
+
+
+def _seat_angles(edge_angle: float) -> list[tuple[float, str]]:
+    """Вдоль длинной стороны, поперёк и разворот каждой на 180°."""
+    along = float(edge_angle)
+    across = orientation_angle(along, "B")
+    return [
+        (along, "A"),
+        (along + pi, "A"),
+        (across, "B"),
+        (across + pi, "B"),
+    ]
+
+
+def _snap_axis(angle: float) -> float:
+    """Длинная сторона ближе 10° к мировой оси становится 0° или 90°."""
+    turned = float(angle) % pi
+    limit = pi / 18.0
+    if min(turned, pi - turned) <= limit:
+        return 0.0
+    if abs(turned - pi / 2.0) <= limit:
+        return pi / 2.0
+    return turned
+
+
+def _playground_axis(usable) -> float:
+    """Угол длинной стороны всего покрытия, не отдельного кармана."""
+    parts = _geometry_parts(usable)
+    if not parts:
+        return 0.0
+    part = max(parts, key=lambda item: item.area)
+    rectangle = minimum_rectangle([(float(x), float(y)) for x, y in part.exterior.coords])
+    if rectangle is None:
+        return 0.0
+    span_u, span_v, angle, _center = rectangle
+    if span_v > span_u:
+        angle += pi / 2.0
+    return _snap_axis(angle)
+
+
+def _facing_pair(angle: float, orientation: str) -> list[tuple[float, str]]:
+    return [(float(angle), orientation), (float(angle) + pi, orientation)]
+
+
+def _collect_seats(spec: dict, pocket, usable, placed: list[dict], angles: list[tuple[float, str]]) -> list[tuple[float, dict]]:
+    seats: list[tuple[float, dict]] = []
+    for x, y, radius in _candidate_points(pocket, limit=12):
+        for angle, orientation in angles:
+            found = _try_sit(spec, (x, y), angle, orientation, usable, placed)
+            if found is not None:
+                seats.append((radius, found))
+    return seats
+
+
+def _feasible_seats(spec: dict, pocket, usable, placed: list[dict], axis: float | None = None) -> list[tuple[float, dict]]:
+    """Сначала вдоль оси покрытия, затем поперёк. Чужой угол кармана — только если оба не влезли."""
+    if axis is not None:
+        along = _collect_seats(spec, pocket, usable, placed, _facing_pair(axis, "A"))
+        if along:
+            return along
+        across = _collect_seats(spec, pocket, usable, placed, _facing_pair(orientation_angle(axis, "B"), "B"))
+        if across:
+            return across
+    rectangle = minimum_rectangle([(float(x), float(y)) for x, y in pocket.exterior.coords])
+    if rectangle is None:
+        return []
+    _zone_width, _zone_depth, edge_angle, _center = rectangle
+    return _collect_seats(spec, pocket, usable, placed, _seat_angles(edge_angle))
+
+
+def _pick_seat(seats: list[tuple[float, dict]], rng: random.Random) -> dict | None:
+    """Сид берёт позу не хуже 70% лучшего зазора: в широкой части, но не в одной точке."""
+    if not seats:
+        return None
+    best = max(radius for radius, _pose in seats)
+    floor = best * 0.7
+    pool = [pose for radius, pose in seats if radius >= floor - 1e-6]
+    return rng.choice(pool or [pose for _radius, pose in seats])
+
+
+def _sit_in(spec: dict, pocket, usable, placed: list[dict], rng: random.Random, axis: float | None = None):
+    return _pick_seat(_feasible_seats(spec, pocket, usable, placed, axis), rng)
+
+
+def _pad_kind(spec: dict) -> str | None:
+    """Пятно покрытия нужно при падении выше 0.6 м или при принудительном движении."""
+    fall = float(spec.get("fall_height") or 0.0)
+    motion = str(spec.get("motion") or "static")
+    if fall <= 0.6 and motion == "static":
+        return None
+    if motion in {"swing", "slide"} or spec.get("role") == "hero":
+        return "rubber"
+    return "sand"
+
+
+def _satellite_budget(area: float, pockets: int, groups: int) -> int:
+    if area < 140.0 or pockets <= 0 or groups <= 0:
+        return 0
+    return min(4, pockets, groups, max(1, int(area / 300.0)))
+
+
+def _group_lists(specs: list[dict], rng: random.Random) -> list[list[dict]]:
+    ordered = list(specs)
+    rng.shuffle(ordered)
+    groups: list[list[dict]] = []
+    index: dict[str, int] = {}
+    for spec in ordered:
+        slot = index.get(spec["group"])
+        if slot is None:
+            index[spec["group"]] = len(groups)
+            groups.append([spec])
+        else:
+            groups[slot].append(spec)
+    return groups
+
+
+def _pockets_after(usable, placed: list[dict], limit: int = 4) -> list:
+    """Отдельные широкие места вокруг уже стоящих зон, а не одно кольцо на всех."""
+    Point, polygon, union, _prep = _shapely()
+    region = usable
+    if placed:
+        block = union([polygon(item["safety"]).buffer(0.4) for item in placed])
+        region = usable.difference(block)
+    pockets = []
+    for _slot in range(limit):
+        parts = [part for part in _geometry_parts(region) if part.area >= 12.0]
+        if not parts:
+            break
+        part = max(parts, key=lambda item: (_candidate_points(item, limit=1)[0][2], item.area))
+        x, y, radius = _candidate_points(part, limit=1)[0]
+        if radius < 1.2:
+            break
+        local = part.intersection(Point(x, y).buffer(max(radius * 1.8, 6.0)))
+        local_parts = [item for item in _geometry_parts(local) if item.area >= 8.0]
+        pockets.append(max(local_parts, key=lambda item: item.area) if local_parts else part)
+        region = region.difference(Point(x, y).buffer(max(radius, 4.0)))
+    return pockets
+
+
+def _urn_beside(
+    ground,
+    blocked: list,
+    pose: dict,
+    bench_width: float,
+    urn_width: float,
+    urn_depth: float,
+    signs: tuple[float, float] = (1.0, -1.0),
+) -> dict | None:
+    """Урна у торца лавки, на той же линии. Второй торец, если первый не влез."""
+    if urn_width <= 0.0 or urn_depth <= 0.0:
+        return None
+    angle = float(pose["angle"])
+    tangent = (cos(angle), sin(angle))
+    shift = bench_width * 0.5 + 0.15 + urn_width * 0.5
+    _point, polygon, _union, _prep = _shapely()
+    for sign in signs:
+        point = (pose["x"] + tangent[0] * shift * sign, pose["y"] + tangent[1] * shift * sign)
+        gap, _safety = equipment_quads(urn_width, urn_depth, (0.0, 0.0, 0.0, 0.0), angle, point)
+        if not ground.buffer(1e-3).covers(polygon(gap)):
+            continue
+        if any(quads_overlap(gap, other) for other in blocked):
+            continue
+        return {"x": float(point[0]), "y": float(point[1]), "angle": angle}
+    return None
+
+
+def _free_midpoint(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    inward: tuple[float, float],
+    inset: float,
+    width: float,
+    depth: float,
+    ground,
+    blocked: list,
+    angle: float,
+):
+    """Самый длинный отрезок края, куда тело лавки влезает целиком."""
+    dx = float(end[0]) - float(start[0])
+    dy = float(end[1]) - float(start[1])
+    length = hypot(dx, dy)
+    if length < width:
+        return None
+    ux, uy = dx / length, dy / length
+    margin = width * 0.5
+    step = 0.4
+    distances: list[float] = []
+    cursor = margin
+    while cursor <= length - margin + 1e-6:
+        distances.append(cursor)
+        cursor += step
+    if not distances:
+        distances = [length * 0.5]
+    _point, polygon, _union, _prep = _shapely()
+    fitting: list[tuple[int, tuple[float, float], list]] = []
+    for index, distance in enumerate(distances):
+        point = (
+            float(start[0]) + ux * distance + inward[0] * inset,
+            float(start[1]) + uy * distance + inward[1] * inset,
+        )
+        gap, _safety = equipment_quads(width, depth, (0.0, 0.0, 0.0, 0.0), angle, point)
+        if not ground.buffer(1e-3).covers(polygon(gap)):
+            continue
+        if any(quads_overlap(gap, other) for other in blocked):
+            continue
+        fitting.append((index, point, gap))
+    if not fitting:
+        return None
+    best: list[tuple[int, tuple[float, float], list]] = []
+    run: list[tuple[int, tuple[float, float], list]] = []
+    previous = -2
+    for item in fitting:
+        if item[0] != previous + 1:
+            if len(run) > len(best):
+                best = run
+            run = []
+        run.append(item)
+        previous = item[0]
+    if len(run) > len(best):
+        best = run
+    return [(item[1], item[2]) for item in best]
+
+
+def _compose_benches(
+    ground,
+    hero: tuple[float, float] | None,
+    placed: list[dict],
+    bench: dict,
+    rng: random.Random,
+    station: float = 0.5,
+) -> tuple[list[dict], list[dict]]:
+    """Пара на каждом внешнем краю, который смотрит внутрь и длиннее лавки.
+
+    Сид выбирает одну долю края для всех лавок. Сиденье смотрит внутрь.
+    """
+    del rng
+    width = float(bench.get("width") or 1.82)
+    depth = float(bench.get("depth") or 0.68)
+    urn_width = float(bench.get("urn_width") or 0.0)
+    urn_depth = float(bench.get("urn_depth") or 0.0)
+    inset = depth * 0.5 + 0.2
+    center = ground.centroid
+    focus = hero if hero is not None else (float(center.x), float(center.y))
+    parts = [part for part in _geometry_parts(ground) if part.area >= 30.0]
+    if not parts:
+        return [], []
+    Point, polygon, _union, _prep = _shapely()
+    edges = []
+    for part in parts:
+        others = [item for item in parts if item is not part]
+        ring = list(part.exterior.coords)
+        for index, (start, end) in enumerate(zip(ring, ring[1:])):
+            dx = float(end[0]) - float(start[0])
+            dy = float(end[1]) - float(start[1])
+            length = hypot(dx, dy)
+            if length < width:
+                continue
+            mid = ((float(start[0]) + float(end[0])) * 0.5, (float(start[1]) + float(end[1])) * 0.5)
+            left = (-dy / length, dx / length)
+            probe = Point(mid[0] + left[0] * 0.3, mid[1] + left[1] * 0.3)
+            inward = left if part.covers(probe) else (-left[0], -left[1])
+            toward = (focus[0] - mid[0], focus[1] - mid[1])
+            if toward[0] * inward[0] + toward[1] * inward[1] <= 0.0:
+                continue
+            outward = (-inward[0], -inward[1])
+            if any(
+                other.buffer(0.3).covers(Point(mid[0] + outward[0] * distance, mid[1] + outward[1] * distance))
+                for other in others
+                for distance in (1.2, 2.4, 3.6)
+            ):
+                continue
+            edges.append((length, index, (float(start[0]), float(start[1])), (float(end[0]), float(end[1])), inward))
+    edges.sort(key=lambda item: (-item[0], item[1]))
+    poses: list[dict] = []
+    urns: list[dict] = []
+    blocked = [item["safety"] for item in placed]
+    for _length, _index, start, end, inward in edges:
+        angle = forward_angle(inward[0], inward[1])
+        run = _free_midpoint(start, end, inward, inset, width, depth, ground, blocked, angle)
+        if not run:
+            continue
+        slot = int(round((len(run) - 1) * min(max(float(station), 0.0), 1.0)))
+        order = sorted(range(len(run)), key=lambda index: (abs(index - slot), index))
+        chosen = None
+        for index in order:
+            point, gap = run[index]
+            pose = {"x": float(point[0]), "y": float(point[1]), "angle": float(angle)}
+            urn = _urn_beside(ground, blocked + [gap], pose, width, urn_width, urn_depth, (1.0, -1.0))
+            if urn is None and urn_width > 0.0:
+                continue
+            chosen = (pose, gap, urn)
+            break
+        if chosen is None:
+            continue
+        pose, gap, urn = chosen
+        poses.append(pose)
+        blocked.append(gap)
+        if urn is None:
+            continue
+        urns.append(urn)
+        urn_gap, _urn_safety = equipment_quads(
+            urn_width, urn_depth, (0.0, 0.0, 0.0, 0.0), urn["angle"], (urn["x"], urn["y"]),
+        )
+        blocked.append(urn_gap)
+    return poses, urns
+
+
+def _safety_area(spec: dict) -> float:
+    front, back, left, right = spec["clearance"]
+    return (float(spec["width"]) + left + right) * (float(spec["depth"]) + front + back)
+
+
+def _place_compact(specs: list[dict], usable, placed: list[dict], rng: random.Random, axis: float) -> dict | None:
+    """Самая компактная модель, чья зона влезает в оставшийся полигон. Ставится одна."""
+    parts = _geometry_parts(usable)
+    if not parts:
+        return None
+    ground = max(parts, key=lambda item: item.area)
+    for spec in sorted(specs, key=_safety_area):
+        found = _sit_in(spec, ground, usable, placed, rng, axis)
+        if found is not None:
+            return found
+    return None
+
+
+_MAX_PLAY_ITEMS = 16
+
+
+def _model_spans(spec: dict, orientation: str) -> tuple[float, float]:
+    """Полный габарит зоны вдоль оси покрытия и поперёк неё."""
+    front, back, left, right = spec["clearance"]
+    span_x = float(spec["width"]) + float(left) + float(right)
+    span_y = float(spec["depth"]) + float(front) + float(back)
+    if orientation == "B":
+        return span_y, span_x
+    return span_x, span_y
+
+
+def _axis_attempts(axis: float, across_first: bool = False) -> tuple[tuple[str, float], ...]:
+    along = float(axis)
+    side = orientation_angle(axis, "B")
+    forward = (("A", along), ("A", along + pi))
+    across = (("B", side), ("B", side + pi))
+    if across_first:
+        return across + forward
+    return forward + across
+
+
+def _axis_frame(part, axis: float):
+    ux, uy = cos(axis), sin(axis)
+    vx, vy = -uy, ux
+    us: list[float] = []
+    vs: list[float] = []
+    for x, y in part.exterior.coords:
+        px, py = float(x), float(y)
+        us.append(px * ux + py * uy)
+        vs.append(px * vx + py * vy)
+    return min(us), max(us), min(vs), max(vs), ux, uy, vx, vy
+
+
+def _world_on_axis(u: float, v: float, ux: float, uy: float, vx: float, vy: float) -> tuple[float, float]:
+    return (u * ux + v * vx, u * uy + v * vy)
+
+
+def _sit_axis(spec: dict, point: tuple[float, float], usable, placed: list[dict], axis: float, across_first: bool = False):
+    """Вдоль оси, разворот на 180°, и только потом поперёк. Принцип 3 начинает поперёк."""
+    for orientation, angle in _axis_attempts(axis, across_first):
+        found = _try_sit(spec, point, angle, orientation, usable, placed)
+        if found is not None:
+            return found, _model_spans(spec, orientation)
+    return None, (0.0, 0.0)
+
+
+def _mix_bands(specs: list[dict], rng: random.Random) -> list[dict]:
+    """Полосы близкого размера мешает сид, крупные полосы остаются впереди."""
+    ordered = sorted(specs, key=_safety_area, reverse=True)
+    if len(ordered) <= 1:
+        return ordered
+    bands: list[list[dict]] = []
+    current = [ordered[0]]
+    leader = _safety_area(ordered[0])
+    for spec in ordered[1:]:
+        area = _safety_area(spec)
+        if leader > 0.0 and area < leader * 0.65:
+            bands.append(current)
+            current = [spec]
+            leader = area
+        else:
+            current.append(spec)
+    bands.append(current)
+    mixed: list[dict] = []
+    for band in bands:
+        rng.shuffle(band)
+        mixed.extend(band)
+    return mixed
+
+
+def _axis_cells(
+    min_u: float,
+    max_u: float,
+    min_v: float,
+    max_v: float,
+    step: float,
+    origin_u: float,
+    origin_v: float,
+) -> list[tuple[float, float]]:
+    """Клетки оси от точки сида, с общим рядом вдоль покрытия."""
+    span = max(max_u - min_u, max_v - min_v, step)
+    count = int(span / step) + 2
+    cells: list[tuple[float, float, float]] = []
+    mid_u = (min_u + max_u) * 0.5
+    mid_v = (min_v + max_v) * 0.5
+    for row in range(-count, count + 1):
+        v = mid_v + row * step
+        if v < min_v - 0.2 or v > max_v + 0.2:
+            continue
+        for column in range(-count, count + 1):
+            u = mid_u + column * step
+            if u < min_u - 0.2 or u > max_u + 0.2:
+                continue
+            cells.append((u, v, (u - origin_u) ** 2 + (v - origin_v) ** 2))
+    cells.sort(key=lambda item: item[2])
+    return [(u, v) for u, v, _distance in cells]
+
+
+def _zones_clear(safety: list, placed: list[dict], gap: float) -> bool:
+    if gap <= 0.0 or not placed:
+        return True
+    _point, polygon, _union, _prep = _shapely()
+    zone = polygon(safety)
+    limit = float(gap) - 1e-6
+    for other in placed:
+        if zone.distance(polygon(other["safety"])) < limit:
+            return False
+    return True
+
+
+def _lay_rows(specs: list[dict], usable, rng: random.Random, axis: float, gap: float, style: int = 0):
+    """Клетки оси от точки принципа. Сначала самая большая подходящая, кроме принципа 2."""
+    parts = [part for part in _geometry_parts(usable) if part.area >= 1.0]
+    heroes_exist = any(spec["role"] == "hero" for spec in specs)
+    if not parts:
+        return [], None, heroes_exist
+    frames = [_axis_frame(part, axis) for part in parts]
+    min_u = min(frame[0] for frame in frames)
+    max_u = max(frame[1] for frame in frames)
+    min_v = min(frame[2] for frame in frames)
+    max_v = max(frame[3] for frame in frames)
+    _min_u, _max_u, _min_v, _max_v, ux, uy, vx, vy = frames[0]
+    ordered = sorted(specs, key=_safety_area, reverse=True)
+    placed: list[dict] = []
+    span_u = max_u - min_u
+    span_v = max_v - min_v
+    mid_u = (min_u + max_u) * 0.5
+    mid_v = (min_v + max_v) * 0.5
+    if int(style) == 1:
+        sign = -1.0 if rng.random() < 0.5 else 1.0
+        origin_u = mid_u + sign * span_u * 0.42
+        origin_v = mid_v + (rng.random() - 0.5) * span_v * 0.15
+    else:
+        origin_u = mid_u + (rng.random() - 0.5) * span_u * 0.3
+        origin_v = mid_v + (rng.random() - 0.5) * span_v * 0.3
+    cells = _axis_cells(min_u, max_u, min_v, max_v, 1.5, origin_u, origin_v)
+    across_first = int(style) == 3
+
+    def sit_at(spec: dict, u: float, v: float):
+        point = _world_on_axis(u, v, ux, uy, vx, vy)
+        for item in placed:
+            xs = [corner[0] for corner in item["safety"]]
+            ys = [corner[1] for corner in item["safety"]]
+            if min(xs) - gap <= point[0] <= max(xs) + gap and min(ys) - gap <= point[1] <= max(ys) + gap:
+                return None
+        for orientation, angle in _axis_attempts(axis, across_first):
+            found = _try_sit(spec, point, angle, orientation, usable, placed)
+            if found is None or not _zones_clear(found["safety"], placed, gap):
+                continue
+            return found
+        return None
+
+    def place_once(candidates: list[dict]) -> int:
+        added = 0
+        for spec in candidates:
+            if len(placed) >= _MAX_PLAY_ITEMS:
+                break
+            for u, v in cells:
+                found = sit_at(spec, u, v)
+                if found is None:
+                    continue
+                placed.append(found)
+                added += 1
+                break
+        return added
+
+    if int(style) == 2 and ordered:
+        leader = _safety_area(ordered[0])
+        top = [spec for spec in ordered if _safety_area(spec) >= leader * 0.65]
+        rng.shuffle(top)
+        top_ids = {spec["id"] for spec in top}
+        first_queue = top + [spec for spec in ordered if spec["id"] not in top_ids]
+    else:
+        first_queue = ordered
+    for spec in first_queue:
+        if len(placed) >= _MAX_PLAY_ITEMS:
+            break
+        for u, v in cells:
+            found = sit_at(spec, u, v)
+            if found is None:
+                continue
+            placed.append(found)
+            break
+        if placed:
+            break
+    used = {item["id"] for item in placed}
+    place_once(_mix_bands([spec for spec in ordered if spec["id"] not in used], rng))
+    if len(placed) < _MAX_PLAY_ITEMS and placed and _widest_open(usable, placed) is not None:
+        for _round in range(4):
+            if len(placed) >= _MAX_PLAY_ITEMS:
+                break
+            if place_once(ordered) == 0:
+                break
+    hero_point = None
+    hero_missing = heroes_exist
+    for item in placed:
+        if item.get("role") == "hero":
+            hero_point = (item["x"], item["y"])
+            hero_missing = False
+            break
+    return placed, hero_point, hero_missing
+
+
+def _open_ground(usable, placed: list[dict]):
+    """Полигон без уже занятых зон безопасности."""
+    if not placed:
+        return usable
+    _point, polygon, union, _prep = _shapely()
+    block = union([polygon(item["safety"]).buffer(0.4) for item in placed])
+    return usable.difference(block).buffer(0)
+
+
+def _widest_open(usable, placed: list[dict]):
+    """Самая широкая свободная часть. Узкий остаток моделью не занимается."""
+    parts = [part for part in _geometry_parts(_open_ground(usable, placed)) if part.area >= 12.0]
+    if not parts:
+        return None
+    part = max(parts, key=lambda item: (_candidate_points(item, limit=1)[0][2], item.area))
+    _x, _y, radius = _candidate_points(part, limit=1)[0]
+    if radius < 1.2:
+        return None
+    return part
+
+
+def _seat_on_open(specs: list[dict], pocket, usable, placed: list[dict], rng: random.Random, axis: float) -> dict | None:
+    for spec in specs:
+        found = _sit_in(spec, pocket, usable, placed, rng, axis)
+        if found is not None:
+            return found
+    return None
+
+
+def _fill_open_pockets(specs: list[dict], usable, placed: list[dict], rng: random.Random, axis: float) -> None:
+    """Свободное место занимает ещё не стоявшая модель, иначе самая компактная.
+
+    Поиск идёт по всему оставшемуся полигону. Остановка на восьми объектах
+    или когда следующая зона уже не влезает.
+    """
+    others = [spec for spec in specs if spec["role"] != "hero"]
+    while len(placed) < _MAX_PLAY_ITEMS:
+        pocket = _widest_open(usable, placed)
+        if pocket is None:
+            break
+        used = {item["id"] for item in placed}
+        fresh = sorted((spec for spec in others if spec["id"] not in used), key=_safety_area, reverse=True)
+        found = _seat_on_open(fresh, pocket, usable, placed, rng, axis) if fresh else None
+        if found is None:
+            found = _seat_on_open(sorted(others, key=_safety_area), pocket, usable, placed, rng, axis)
+        if found is None:
+            break
+        placed.append(found)
+
+
+def cluster_nearby_islands(islands: list[tuple], gap: float = 4.0) -> list[tuple]:
+    """Острова ближе gap метров, включая цепочку, становятся одним полигоном."""
+    if len(islands) <= 1:
+        return list(islands)
+    geometries = []
+    for vertices, faces, _key in islands:
+        geometries.append(_Triangles(vertices, faces).geometry)
+    parent = list(range(len(islands)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for left in range(len(islands)):
+        shape = geometries[left]
+        if shape is None or shape.is_empty:
+            continue
+        for right in range(left + 1, len(islands)):
+            other = geometries[right]
+            if other is None or other.is_empty:
+                continue
+            if float(shape.distance(other)) < float(gap):
+                parent[find(right)] = find(left)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(islands)):
+        groups.setdefault(find(index), []).append(index)
+    merged = []
+    for indexes in groups.values():
+        if len(indexes) == 1:
+            merged.append(islands[indexes[0]])
+            continue
+        vertices: list = []
+        faces: list = []
+        for index in indexes:
+            island_vertices, island_faces, _key = islands[index]
+            base = len(vertices)
+            vertices.extend(island_vertices)
+            faces.extend(tuple(int(vertex) + base for vertex in face) for face in island_faces)
+        merged.append((vertices, faces, islands[indexes[0]][2]))
+    return merged
+
+
+def bench_island_keys(islands: list[tuple]) -> set[str]:
+    """Лавки получает только самый большой кусок каждого объекта."""
+    groups: dict[str, list[tuple[float, str]]] = {}
+    for vertices, faces, key in islands:
+        name = str(key).split(":", 1)[0]
+        groups.setdefault(name, []).append((polygon_area_xy(vertices, faces), str(key)))
+    return {max(parts, key=lambda item: item[0])[1] for parts in groups.values() if parts}
+
+
+def _public_item(item: dict) -> dict:
+    kind = _pad_kind(item)
+    return {
+        "id": item["id"],
+        "x": item["x"],
+        "y": item["y"],
+        "angle": item["angle"],
+        "orientation": item["orientation"],
+        "pad": list(item["safety"]) if kind else None,
+        "pad_kind": kind,
+    }
+
+
+def compose_playground(
+    vertices: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    assets: list[dict],
+    blocked: tuple[list[tuple[float, float, float]], list[tuple[int, ...]]] | None = None,
+    seed: int = 0,
+    bench: dict | None = None,
+    clearance_scale: float = 1.0,
+) -> dict:
+    """Модели рядами вдоль оси покрытия, затем лавки по краям.
+
+    Сид повторяет набор и места. Повтор модели — только когда других подходящих нет.
+    """
+    empty = {"items": [], "benches": [], "urns": [], "hero_missing": False}
+    if not assets or not faces:
+        return empty
+    specs = [_compose_spec(asset) for asset in assets]
+    zone = min(max(float(clearance_scale), 0.0), 1.0)
+    if zone < 1.0:
+        for spec in specs:
+            spec["clearance"] = scale_clearance(spec["clearance"], zone)
+    rng = random.Random(int(seed))
+    usable = _Triangles(vertices, faces).geometry
+    if blocked and blocked[1]:
+        obstacles = _Triangles(*blocked).geometry
+        if not obstacles.is_empty:
+            usable = usable.difference(obstacles)
+    usable = usable.buffer(0)
+    if usable.is_empty:
+        return empty
+    axis = _playground_axis(usable)
+    gap = (1.5, 1.0, 0.4)[int(seed) % 3]
+    style = int(seed) % 4
+    placed, hero_point, hero_missing = _lay_rows(specs, usable, rng, axis, gap, style)
+    station = (0.5, 0.25, 0.75)[int(seed) % 3]
+    benches, urns = _compose_benches(usable, hero_point, placed, bench, rng, station) if bench else ([], [])
+    return {
+        "items": [_public_item(item) for item in placed],
+        "benches": benches,
+        "urns": urns,
+        "hero_missing": hero_missing,
+    }
 
 
 def safety_inside(

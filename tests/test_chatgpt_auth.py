@@ -77,13 +77,17 @@ class PkceTests(unittest.TestCase):
             self.assertTrue(chatgpt_auth._open_browser("https://auth.openai.com/example"))
         self.assertEqual(run.call_args.args[0][:2], ["/usr/bin/open", "https://auth.openai.com/example"])
 
-    def test_windows_command_keeps_the_query_intact(self) -> None:
-        url = "https://auth.openai.com/api/accounts/authorize?a=1&b=2&c=hello%20world"
-        command = chatgpt_auth._windows_browser_command(url)
-        self.assertEqual(
-            command,
-            'cmd /d /c start "" "https://auth.openai.com/api/accounts/authorize?a=1&b=2&c=hello%%20world"',
+    def test_windows_launch_keeps_percent_and_ampersand(self) -> None:
+        url = (
+            "https://auth.openai.com/api/accounts/authorize?a=1&b=2"
+            "&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"
         )
+        argv, env = chatgpt_auth._windows_browser_launch(url)
+        self.assertEqual(env["DWGREADER_LOGIN_URL"], url)
+        self.assertNotIn("cmd", argv[0].lower())
+        self.assertNotIn(url, " ".join(argv))
+        self.assertNotIn("%%", " ".join(argv))
+        self.assertIn('"$env:DWGREADER_LOGIN_URL"', argv[-1])
 
     def test_windows_opens_a_child_process(self) -> None:
         url = "https://auth.openai.com/example?a=1&b=2"
@@ -92,7 +96,9 @@ class PkceTests(unittest.TestCase):
         ) as popen, patch.object(chatgpt_auth.webbrowser, "open") as browser:
             self.assertTrue(chatgpt_auth._open_browser(url))
         browser.assert_not_called()
-        self.assertEqual(popen.call_args.args[0], chatgpt_auth._windows_browser_command(url))
+        argv, env = chatgpt_auth._windows_browser_launch(url)
+        self.assertEqual(popen.call_args.args[0], argv)
+        self.assertEqual(popen.call_args.kwargs["env"]["DWGREADER_LOGIN_URL"], url)
         flags = popen.call_args.kwargs["creationflags"]
         for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
             bit = getattr(chatgpt_auth.subprocess, name, 0)
@@ -303,15 +309,76 @@ class SessionTests(unittest.TestCase):
             calls.append(str(saved.get("client_id") or ""))
             if len(calls) == 1:
                 chatgpt_auth.save_session({"client_id": "oaiapp_issued"})
+                job.redirect_uri = "http://127.0.0.1:1455/auth/callback"
                 error = chatgpt_auth.AuthError("отклонён")
                 error.code = "invalid_grant"
                 raise error
+            self.assertTrue(saved.get("reuse_client"))
+            self.assertEqual(saved.get("redirect_uri"), "http://127.0.0.1:1455/auth/callback")
             return {"email": "user@example.com", "scopes": ["openid"], "access_token": "new"}
 
         with patch.object(chatgpt_auth, "_authorize", side_effect=authorize):
             session = chatgpt_auth._login(chatgpt_auth.LoginJob())
         self.assertEqual(calls, ["", "oaiapp_issued"])
         self.assertEqual(session["access_token"], "new")
+
+    def test_signed_out_client_starts_a_new_registration(self) -> None:
+        client, port = chatgpt_auth._login_client({
+            "client_id": "oaiapp_test",
+            "redirect_uri": "http://127.0.0.1:1455/auth/callback",
+            "email": "user@example.com",
+        })
+        self.assertEqual(client, chatgpt_auth.DYNAMIC_CLIENT)
+        self.assertEqual(port, 0)
+
+    def test_live_session_reuses_the_registered_port(self) -> None:
+        client, port = chatgpt_auth._login_client({
+            "client_id": "oaiapp_test",
+            "refresh_token": "refresh",
+            "redirect_uri": "http://127.0.0.1:1455/auth/callback",
+        })
+        self.assertEqual(client, "oaiapp_test")
+        self.assertEqual(port, 1455)
+
+    def test_saved_client_without_redirect_registers_again(self) -> None:
+        client, port = chatgpt_auth._login_client({
+            "client_id": "oaiapp_test",
+            "refresh_token": "refresh",
+        })
+        self.assertEqual(client, chatgpt_auth.DYNAMIC_CLIENT)
+        self.assertEqual(port, 0)
+        client, port = chatgpt_auth._login_client({
+            "client_id": "oaiapp_test",
+            "refresh_token": "refresh",
+            "redirect_uri": "http://localhost:1455/auth/callback",
+        })
+        self.assertEqual(client, chatgpt_auth.DYNAMIC_CLIENT)
+
+    def test_retry_keeps_the_same_callback_port(self) -> None:
+        client, port = chatgpt_auth._login_client({
+            "client_id": "oaiapp_issued",
+            "redirect_uri": "http://127.0.0.1:1455/auth/callback",
+            "reuse_client": True,
+        })
+        self.assertEqual((client, port), ("oaiapp_issued", 1455))
+
+    def test_callback_rebinds_the_registered_port(self) -> None:
+        first, _, _ = chatgpt_auth._bind_callback(0)
+        port = int(first.server_address[1])
+        first.server_close()
+        again, redirect, kept = chatgpt_auth._bind_callback(port)
+        self.addCleanup(again.server_close)
+        self.assertTrue(kept)
+        self.assertEqual(redirect, f"http://127.0.0.1:{port}/auth/callback")
+
+    def test_busy_port_is_not_reported_as_the_old_callback(self) -> None:
+        held, _, _ = chatgpt_auth._bind_callback(0)
+        self.addCleanup(held.server_close)
+        port = int(held.server_address[1])
+        server, redirect, kept = chatgpt_auth._bind_callback(port)
+        self.addCleanup(server.server_close)
+        self.assertFalse(kept)
+        self.assertNotEqual(redirect, f"http://127.0.0.1:{port}/auth/callback")
 
     def test_cancel_before_exchange_skips_the_token_request(self) -> None:
         self._session()

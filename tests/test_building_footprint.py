@@ -48,12 +48,13 @@ class FootprintLoopTests(unittest.TestCase):
         self.assertLess(ns["_ring_area"](oriented[1]), 0.0)
         self.assertAlmostEqual(abs(ns["_ring_area"](oriented[0])), 100.0, places=3)
 
-    def test_place_path_follows_the_contour_without_a_boolean_cut(self) -> None:
+    def test_place_path_cuts_the_house_to_the_contour(self) -> None:
         text = SOURCE.read_text(encoding="utf-8")
         self.assertNotIn("def _seat_on_polygon", text)
         self.assertNotIn("def _footprint_span", text)
-        self.assertNotIn("def _clip_to_polygon", text)
-        self.assertNotIn('modifier.operation = "INTERSECT"', text)
+        self.assertIn("def _clip_to_polygon", text)
+        self.assertIn('modifier.operation = "INTERSECT"', text)
+        self.assertIn("_clip_to_polygon(obj, loops)", text)
         self.assertIn('modifier.name == "Полигон"', text)
         self.assertIn("_clean_loops(raw) or raw", text)
         self.assertIn("_drop_clip(obj)", text)

@@ -57,18 +57,18 @@ from dxf_read.dxf import (  # noqa: E402
 class SurfaceTextureTests(unittest.TestCase):
     def test_only_a_known_key_from_the_model_is_used(self) -> None:
         key = build_scene.surface_texture_key
-        for name in ("grass", "tile", "sidewalk", "asphalt", "rubber"):
+        for name in ("grass", "tile", "sidewalk", "asphalt"):
             self.assertEqual(key(name), name)
         self.assertEqual(key(" Asphalt "), "asphalt")
-        for name in ("none", "", "pavement", "ПЛИТКА", None):
+        for name in ("none", "", "pavement", "ПЛИТКА", "rubber", None):
             self.assertIsNone(key(name), name)
 
     def test_tile_size_and_files(self) -> None:
-        self.assertEqual(build_scene.SURFACE_TEXTURES["grass"], ("grass.jpg", 16.0))
-        self.assertEqual(build_scene.SURFACE_TEXTURES["asphalt"], ("asphalt.png", 8.0))
-        self.assertEqual(build_scene.SURFACE_TEXTURES["tile"], ("pavers.jpg", 8.0))
-        self.assertEqual(build_scene.SURFACE_TEXTURES["sidewalk"], ("sidewalk.jpg", 8.0))
-        self.assertEqual(build_scene.SURFACE_TEXTURES["rubber"], ("rubber.jpg", 8.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["grass"], ("grass.jpg", 32.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["asphalt"], ("asphalt.png", 16.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["tile"], ("pavers.jpg", 16.0))
+        self.assertEqual(build_scene.SURFACE_TEXTURES["sidewalk"], ("sidewalk.jpg", 16.0))
+        self.assertNotIn("rubber", build_scene.SURFACE_TEXTURES)
         names = {item[0] for item in build_scene.SURFACE_TEXTURES.values()}
         self.assertNotIn("асфальт1.jpg", names)
 
@@ -86,9 +86,10 @@ class TexturePromptTests(unittest.TestCase):
         self.assertIn("«тротуар_асфальт» — sidewalk", text)
         self.assertIn("«тротуарная плитка» — sidewalk", text)
         self.assertIn("«плитка_тротуар» — tile", text)
-        self.assertIn("«резиновая_крошка_плитка» — rubber", text)
+        self.assertIn("«резиновая_крошка_плитка» — none", text)
         self.assertIn("слева направо", text)
-        self.assertIn("rubber — резиновое покрытие", text)
+        self.assertNotIn("rubber — резиновое покрытие", text)
+        self.assertNotIn("asphalt, rubber", text)
 
     def test_prompt_keeps_the_layer_name_verbatim(self) -> None:
         prompt = build_texture_prompt(["1 ГП_асфальт_тротуар", "Резиновая крошка"])
@@ -113,7 +114,6 @@ class TexturePromptTests(unittest.TestCase):
             {
                 "1 ГП_асфальт_тротуар": "asphalt",
                 "Газон": "grass",
-                "Резина": "rubber",
             },
         )
 

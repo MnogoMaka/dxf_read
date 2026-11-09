@@ -62,19 +62,37 @@ class MafCatalogTests(unittest.TestCase):
         playgrounds = [item for item in self.catalog if item["family"] == "playground"]
         sports = {item["id"] for item in playgrounds if item.get("playground_type") == "sports"}
         children = {item["id"] for item in playgrounds if item.get("playground_type") == "children"}
-        self.assertEqual(sports, {"play_big"})
+        self.assertEqual(sports, {
+            "play_big",
+            "gym_01", "gym_02", "gym_03", "gym_04",
+            "bar_01", "bar_02", "bar_03", "bar_04", "bar_05",
+            "bar_06", "bar_07", "bar_08", "bar_09", "bar_11",
+        })
         self.assertEqual(children, {item["id"] for item in playgrounds} - sports)
         self.assertFalse(sports & children)
 
     def test_dimensions_and_clearance_are_valid(self) -> None:
+        heroes = {"children": set(), "sports": set()}
         for item in self.catalog:
             with self.subTest(asset=item["id"]):
                 self.assertEqual(len(item["footprint"]), 3)
                 self.assertTrue(all(math.isfinite(value) and value > 0 for value in item["footprint"]))
-                if item["family"] == "playground":
-                    self.assertIn(item.get("playground_type"), {"children", "sports"})
+                if item["family"] != "playground":
+                    continue
+                self.assertIn(item.get("playground_type"), {"children", "sports"})
+                self.assertIn(item.get("role"), {"hero", "activity", "accent"})
+                self.assertGreater(float(item["fall_height"]), 0.0)
+                self.assertLessEqual(float(item["fall_height"]), 3.0)
+                if item["role"] == "hero":
+                    heroes[item["playground_type"]].add(item["id"])
+                if item.get("motion") == "swing":
                     self.assertEqual(len(item["clearance"]), 4)
                     self.assertTrue(all(math.isfinite(value) and value >= 0 for value in item["clearance"]))
+                if item.get("motion") == "slide":
+                    self.assertEqual(item["runout"], 2.0)
+                    self.assertIn(item["runout_side"], {"front", "back", "left", "right"})
+        self.assertEqual(heroes["sports"], {"play_big"})
+        self.assertEqual(heroes["children"], {"play_08"})
 
 
 if __name__ == "__main__":
