@@ -340,11 +340,14 @@ def _import_mesh(context, asset: dict) -> bpy.types.Object:
 
 
 def _park_library_object(obj: bpy.types.Object) -> None:
-    """Прячем исходник глазом, не монитором: монитор выкидывает его из геонод, и на слое пусто."""
+    """Шаблон остаётся в отвязанной библиотеке: его не видно и он не попадает в GLB.
+
+    Глаз слоя не трогаем. hide_set на объекте вне слоя вида роняет посадку.
+    Монитор тоже выключен: иначе геоноды не видят модель.
+    """
     obj.hide_viewport = False
     obj.hide_render = False
     obj.hide_select = True
-    obj.hide_set(True)
 
 
 def _family_collection(context, family: str) -> bpy.types.Collection:
@@ -1629,7 +1632,37 @@ def _pad_material(kind: str):
     return material
 
 
+def _hide_model_zones(scene=None) -> bool:
+    """Отладочные пятна под моделями по умолчанию не рисуются."""
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    return bool(getattr(scene, "dwgreader_hide_model_zones", True))
+
+
+def _drop_play_pads() -> None:
+    """Убирает уже нарисованные зоны. Расчёт раскладки их не использует."""
+    doomed = []
+    for obj in list(bpy.data.objects):
+        try:
+            if str(obj.get("placement") or "") == "pad" or str(obj.get("family") or "") == "pad":
+                doomed.append(obj)
+        except ReferenceError:
+            continue
+    for obj in doomed:
+        mesh = obj.data if getattr(obj, "type", "") == "MESH" else None
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh is not None and getattr(mesh, "users", 1) == 0 and isinstance(mesh, bpy.types.Mesh):
+            bpy.data.meshes.remove(mesh)
+
+
+def _on_hide_model_zones(self, context):
+    if _hide_model_zones(self):
+        _drop_play_pads()
+
+
 def _spawn_pad(ring: list[tuple[float, float]], key: str, kind: str, height: float):
+    if _hide_model_zones():
+        return None
     mesh = bpy.data.meshes.new("PLAY_PAD")
     mesh.from_pydata([(float(x), float(y), height + 0.02) for x, y in ring], [], [tuple(range(len(ring)))])
     mesh.update()
@@ -1876,38 +1909,46 @@ def furnish_underlay(context) -> str:
             if obj.type == "MESH" and getattr(obj, "data", None) is not None and obj.data.polygons
         ]
     if trees_on:
-        lawns = [obj for obj in meshes if str(obj.get("category") or "") == "green"]
-        plants, used, _clamped = _plant_objects(context, lawns)
-        notes.append(f"деревья {plants} на газонах {used}")
+        try:
+            lawns = [obj for obj in meshes if str(obj.get("category") or "") == "green"]
+            plants, used, _clamped = _plant_objects(context, lawns)
+            notes.append(f"деревья {plants} на газонах {used}")
+        except Exception as exc:
+            notes.append(f"посадки не встали: {exc}")
     if maf_on:
-        zones = [obj for obj in meshes if _playground_mesh(obj)]
-        if not zones:
-            notes.append("площадки не найдены: нужно имя с «площад», «игров», «спорт» или «резин»")
-        else:
-            placed = 0
-            hero_missing = False
-            failed = ""
-            seed_value = int(getattr(scene, "dwgreader_play_seed", 1))
-            for kind, group in _auto_playground_groups(zones, scene):
-                group_islands = []
-                for obj in group:
-                    group_islands.extend(_mesh_islands(obj, False))
-                try:
-                    count, missing, _filled = _fill_islands(context, group_islands, group, kind=kind, seed=seed_value)
-                except PlacementError as exc:
-                    failed = str(exc)
-                    continue
-                placed += count
-                hero_missing = hero_missing or missing
-            if failed and placed == 0:
-                notes.append(failed)
+        try:
+            zones = [obj for obj in meshes if _playground_mesh(obj)]
+            if not zones:
+                notes.append("площадки не найдены: нужно имя с «площад», «игров», «спорт» или «резин»")
             else:
-                note = f"площадки {placed}"
-                if hero_missing:
-                    note += ", крупный объект не влез"
-                if failed:
-                    note += f", {failed}"
-                notes.append(note)
+                placed = 0
+                hero_missing = False
+                failed = ""
+                seed_value = int(getattr(scene, "dwgreader_play_seed", 1))
+                for kind, group in _auto_playground_groups(zones, scene):
+                    group_islands = []
+                    for obj in group:
+                        group_islands.extend(_mesh_islands(obj, False))
+                    try:
+                        count, missing, _filled = _fill_islands(
+                            context, group_islands, group, kind=kind, seed=seed_value,
+                        )
+                    except PlacementError as exc:
+                        failed = str(exc)
+                        continue
+                    placed += count
+                    hero_missing = hero_missing or missing
+                if failed and placed == 0:
+                    notes.append(failed)
+                else:
+                    note = f"площадки {placed}"
+                    if hero_missing:
+                        note += ", крупный объект не влез"
+                    if failed:
+                        note += f", {failed}"
+                    notes.append(note)
+        except Exception as exc:
+            notes.append(f"площадки не встали: {exc}")
     try:
         from . import building_export
         buildings = building_export.place_auto_buildings(context)
@@ -2300,13 +2341,17 @@ def _family_model_items(family: str, empty_label: str):
             assets = _assets(context, family)
         except Exception:
             assets = []
-        rows = [("all", "Все из каталога", "Случайная модель этого семейства")]
-        seen = {"all"}
         if family == "tree":
-            rows.append(("tree_01", "Дерево", "Дерево .glb"))
-            seen.add("tree_01")
-        elif not assets:
-            rows.append(("none", empty_label, ""))
+            rows = [
+                ("tree_01", "Дерево", "Дерево .glb"),
+                ("all", "Все из каталога", "Случайная модель этого семейства"),
+            ]
+            seen = {"tree_01", "all"}
+        else:
+            rows = [("all", "Все из каталога", "Случайная модель этого семейства")]
+            seen = {"all"}
+            if not assets:
+                rows.append(("none", empty_label, ""))
         for asset in assets:
             asset_id = str(asset.get("id") or "")
             if not asset_id or asset_id in seen:
@@ -2833,6 +2878,7 @@ def draw_panel(layout, context) -> None:
             box.prop(scene, "dwgreader_playground_type", text="Тип площадки")
             box.prop(scene, "dwgreader_play_seed", text="Seed МАФ")
             box.prop(scene, "dwgreader_safety_scale", text="Зона безопасности", slider=True)
+            box.prop(scene, "dwgreader_hide_model_zones")
             hint = box.column(align=True)
             hint.scale_y = 0.75
             hint.label(text="Тип применяется кнопкой «Заполнить». Сид и зона меняют выделенные полигоны.")
@@ -2911,7 +2957,6 @@ def register() -> None:
     bpy.types.Scene.dwgreader_tree_model = EnumProperty(
         name="Дерево",
         items=_tree_model_items,
-        default="tree_01",
         update=_on_plant_update,
     )
     bpy.types.Scene.dwgreader_trees_avoid_polygons = BoolProperty(
@@ -3010,6 +3055,12 @@ def register() -> None:
         precision=2,
         update=_on_safety_scale,
     )
+    bpy.types.Scene.dwgreader_hide_model_zones = BoolProperty(
+        name="Скрывать зоны под моделями",
+        description="Не рисовать прямоугольники под горками, качелями и турниками. На расстановку моделей это не влияет",
+        default=True,
+        update=_on_hide_model_zones,
+    )
     bpy.types.Scene.dwgreader_auto_play_kind = EnumProperty(
         name="Тип площадок",
         description="Какой каталог ставить при автоматической расстановке. Случайно выбирает тип отдельно на каждом полигоне",
@@ -3054,6 +3105,7 @@ def unregister() -> None:
         "dwgreader_play_scale",
         "dwgreader_play_asset",
         "dwgreader_play_seed",
+        "dwgreader_hide_model_zones",
         "dwgreader_safety_scale",
         "dwgreader_auto_play_kind",
         "dwgreader_playground_type",

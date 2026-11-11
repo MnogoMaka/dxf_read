@@ -1464,24 +1464,20 @@ def buildings_in(scene) -> list:
 
 
 def chosen_building(context):
-    """Выделенный дом. Если выделен не дом, панель открывает последний поставленный."""
-    active = context.view_layer.objects.active if context.view_layer is not None else None
+    """Только выделенный дом. Пустой полигон панель старого дома не открывает."""
+    view_layer = getattr(context, "view_layer", None)
+    active = view_layer.objects.active if view_layer is not None else None
     if active is not None and building_modifier(active) is not None:
         return active
-    found = buildings_in(context.scene)
-    if not found:
-        return None
-    return found[-1]
+    return None
 
 
 def draw_controls(layout, context) -> None:
-    found = buildings_in(context.scene)
-    if not found:
-        return
     obj = chosen_building(context)
     if obj is None:
-        layout.label(text="Выделите один дом: у каждого свои этажи и фасад", icon="INFO")
+        layout.label(text="Выберите полигон или ноду", icon="INFO")
         return
+    found = buildings_in(context.scene)
     modifier = building_modifier(obj)
     inputs = getattr(getattr(modifier, "properties", None), "inputs", None)
     if inputs is None:
@@ -1992,11 +1988,10 @@ def _spawn_building(context, template=None):
 
 
 def _use_house_preset(obj) -> None:
-    """Круглая башня основного нода сменяется на «Дом 2». Чужая нода не переписывается."""
+    """Новый дом основного нода начинается с «Дом 2». Чужая нода не переписывается."""
     if not _preset_fits(obj):
         return
-    if preset_label(obj) == "Круглая башня":
-        apply_preset(obj, DEFAULT_BUILDING_PRESET)
+    apply_preset(obj, DEFAULT_BUILDING_PRESET)
 
 
 def _boundary_loops(faces: list[tuple[int, ...]]) -> list[list[int]]:
