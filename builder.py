@@ -44,6 +44,8 @@ def pack_python(files: SourceMap, folder: Path, arc_root: str) -> None:
 def add_building(files: SourceMap, fallbacks: set[str], project: Path, existing_zip: Path | None) -> None:
     source = project / "actual_node"
     blend = source / "Building 2.0.blend"
+    if not blend.is_file():
+        blend = source / "new.blend"
     if blend.is_file():
         _put(files, blend, "dwgreader_underlay/building/Building 2.0.blend")
         textures = source / "textures"

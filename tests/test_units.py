@@ -137,6 +137,18 @@ class SheetCopyTests(unittest.TestCase):
         self.assertTrue(is_junk_layer("Красные линии_4"))
         self.assertFalse(is_junk_layer("Граница участка"))
 
+    def test_safety_zone_drops_only_when_asked_and_rubber_stays(self) -> None:
+        from dxf_read.dxf import is_safety_zone_layer, resolve_ground_category
+
+        self.assertTrue(is_safety_zone_layer("Зона безопасности_1"))
+        self.assertTrue(is_safety_zone_layer("Зоны безопасности"))
+        self.assertFalse(is_safety_zone_layer("Безопасное покрытие"))
+        with use_settings(PipelineSettings(omit_safety_zones=False)):
+            self.assertEqual(resolve_ground_category("Зона безопасности_1", "pavement"), "pavement")
+        with use_settings(PipelineSettings(omit_safety_zones=True)):
+            self.assertIsNone(resolve_ground_category("Зона безопасности_1", "pavement"))
+            self.assertEqual(resolve_ground_category("Безопасное покрытие", "pavement"), "pavement")
+
     def test_interior_copy_stays_out_of_automatic_groups(self) -> None:
         name = "Интерьер - Перегородка_Ном._пера__150"
         self.assertTrue(is_junk_layer(name))

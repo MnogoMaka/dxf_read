@@ -48,7 +48,6 @@ from .config import (
     EXCLUDE_HINT,
     FILL_TYPES,
     GENERIC_BLOCK_LAYERS,
-    GREEN_ISLAND_KEEP_RATIO,
     HATCH_DRAW_COLORS,
     HATCH_DRAW_ORDER,
     HINT_SUFFIX_RE,
@@ -191,6 +190,12 @@ def is_fence_layer(name: str) -> bool:
     return any(token in text for token in ("ОГРАД", "ОГРАЖД", "ЗАБОР"))
 
 
+def is_safety_zone_layer(name: str) -> bool:
+    """Зона безопасности вокруг площадки. Безопасное покрытие самой площадки остаётся."""
+    text = layer_leaf(name)
+    return "ЗОНА БЕЗОПАС" in text or "БЕЗОПАСНОСТ" in text
+
+
 def is_junk_layer(name: str) -> bool:
     """Подписи, Civil 3D, интерьер — не площадка.
 
@@ -215,6 +220,8 @@ def resolve_ground_category(name: str, category: str | None) -> str | None:
     if bool(getattr(config.settings(), "omit_fences", False)) and (
         category == "fence" or is_fence_layer(name)
     ):
+        return None
+    if bool(getattr(config.settings(), "omit_safety_zones", False)) and is_safety_zone_layer(name):
         return None
     if category in TARGET_OBJECT_TYPES:
         return category
@@ -2353,36 +2360,6 @@ def _prepare_ground_pieces(pieces: Sequence[HatchPiece]) -> list[HatchPiece]:
     return prepared
 
 
-def keep_large_islands(geometry: BaseGeometry, keep_ratio: float = GREEN_ISLAND_KEEP_RATIO) -> BaseGeometry:
-    """Оставляет куски не меньше доли самого большого. Самый большой остаётся всегда."""
-    polygons = [polygon for polygon in _iter_shapely_polygons(geometry) if polygon.area > 0.0]
-    if len(polygons) < 2:
-        return geometry
-    largest = max(polygon.area for polygon in polygons)
-    if largest <= 0.0:
-        return geometry
-    limit = largest * float(keep_ratio)
-    kept = [polygon for polygon in polygons if polygon.area + 1e-9 >= limit]
-    if len(kept) == len(polygons):
-        return geometry
-    if not kept:
-        kept = [max(polygons, key=lambda polygon: polygon.area)]
-    return unary_union(kept)
-
-
-def _drop_small_green_islands(
-    items: Sequence[tuple[BaseGeometry, str, str]],
-) -> list[tuple[BaseGeometry, str, str]]:
-    kept: list[tuple[BaseGeometry, str, str]] = []
-    for geometry, category, layer in items:
-        if category == "green":
-            geometry = keep_large_islands(geometry)
-        if geometry is None or geometry.is_empty:
-            continue
-        kept.append((geometry, category, layer))
-    return kept
-
-
 def arrange_hatch_faces_by_layer(
     pieces: Sequence[HatchPiece],
 ) -> list[tuple[BaseGeometry, str, str]]:
@@ -2391,13 +2368,13 @@ def arrange_hatch_faces_by_layer(
     По умолчанию слои типов «МАФ» и «Посадки» не режут газоны и покрытия:
     они добавляются своим слоем поверх целой площадки.
     Если отметки убраны, эти слои дырки закрывают и в сцену не попадают.
-    Цветники идут как посадки. Мелкие острова газона отбрасываются.
+    Цветники идут как посадки. Полигоны газона остаются все, любого размера.
     """
     pieces = _prepare_ground_pieces(pieces)
     pieces = _without_symbol_holes(pieces)
     symbols = [piece for piece in pieces if _is_overlay(piece.category, piece.layer)]
     if not symbols:
-        return _drop_small_green_islands(_arrange_piece_polygons(pieces))
+        return _arrange_piece_polygons(pieces)
     base = [piece for piece in pieces if not _is_overlay(piece.category, piece.layer)]
     arranged = _arrange_piece_polygons(base)
     if config.settings().omit_symbols:
@@ -2411,15 +2388,15 @@ def arrange_hatch_faces_by_layer(
             for polygon in _piece_polygons(piece)
         ]
         if not extra:
-            return _drop_small_green_islands(arranged)
-        return _drop_small_green_islands(_merge_arranged([*arranged, *extra]))
+            return arranged
+        return _merge_arranged([*arranged, *extra])
     extra: list[tuple[BaseGeometry, str, str]] = []
     for piece in symbols:
         for polygon in _piece_polygons(piece):
             extra.append((polygon, piece.category, piece.layer))
     if not extra:
-        return _drop_small_green_islands(arranged)
-    return _drop_small_green_islands(_merge_arranged([*arranged, *extra]))
+        return arranged
+    return _merge_arranged([*arranged, *extra])
 
 
 def _merge_arranged(

@@ -81,7 +81,7 @@ from .install_support import (
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 5, 18),
+    "version": (1, 5, 24),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF, жилой дом и расстановка благоустройства в сцене",
@@ -345,6 +345,7 @@ def _settings_payload(prefs, source: Path) -> dict:
         "cut_vegetation": bool(prefs.cut_vegetation),
         "omit_symbols": bool(prefs.omit_symbols),
         "omit_fences": bool(prefs.omit_fences),
+        "omit_safety_zones": bool(prefs.omit_safety_zones),
         "scene_scale": float(prefs.scene_scale),
         "origin_mode": str(prefs.origin_mode),
         "batch_size": int(prefs.batch_size),
@@ -565,6 +566,11 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         description="Слои оград, заборов и ограждений не попадают в подложку и не режут газон и покрытия",
         default=True,
     )
+    omit_safety_zones: BoolProperty(
+        name="Скрывать зоны безопасности",
+        description="Слои «зона безопасности» не рисуются на подложке. Безопасное покрытие площадки остаётся",
+        default=True,
+    )
     cut_vegetation: BoolProperty(
         name="Вырезать полигоны под МАФ и посадками",
         description="Выключено: слои типов «МАФ» и «Посадки» лежат поверх целого газона и покрытия. Включено: их контур вырезает землю",
@@ -588,7 +594,7 @@ class DWGREADER_AddonPreferences(AddonPreferences):
         name="Разбиение на объекты",
         description="Как делить полигоны одного слоя AutoCAD на объекты Blender",
         items=SPLIT_MODES,
-        default="gap",
+        default="polygon",
     )
     by_type_collections: BoolProperty(
         name="Раскладывать по коллекциям типов",
@@ -2041,6 +2047,7 @@ def _draw_step_objects(layout, context, prefs) -> None:
         col.prop(prefs, "origin_mode")
         col.prop(prefs, "omit_symbols")
         col.prop(prefs, "omit_fences")
+        col.prop(prefs, "omit_safety_zones")
         cut = col.row()
         cut.enabled = not prefs.omit_symbols
         cut.prop(prefs, "cut_vegetation")
@@ -2219,6 +2226,7 @@ def _draw_building(layout, context) -> None:
     text.scale_y = 0.8
     text.label(text="Выделенный полигон задаёт контур дома.")
     text.label(text="Тип дома — в списке под кнопкой, не только номер.")
+    building_export.draw_node_picker(box, context)
     run = box.row()
     run.scale_y = 1.3
     run.operator("dwgreader.place_building", text="Поставить здание в сцену", icon="HOME")
@@ -2561,7 +2569,7 @@ def build_underlay(json_path: Path, scene: bpy.types.Scene | None = None) -> int
     return commit_underlay(
         json_path,
         gap,
-        split_mode=str(getattr(prefs, "split_mode", "gap") or "gap"),
+        split_mode=str(getattr(prefs, "split_mode", "polygon") or "polygon"),
         by_type=bool(getattr(prefs, "by_type_collections", True)),
         scene=target,
     )
@@ -2712,6 +2720,11 @@ def register() -> None:
         description="После построения заполнить каждую площадку несколькими моделями, зона безопасности остаётся внутри полигона",
         default=True,
     )
+    bpy.types.Scene.dwgreader_building_node = StringProperty(
+        name="Нода здания",
+        description="Какую ноду ставить на контур полигона",
+        default="",
+    )
     bpy.types.Scene.dwgreader_auto_buildings = BoolProperty(
         name="Расстановка зданий",
         description="После построения поставить дом на каждый полигон зданий",
@@ -2789,6 +2802,7 @@ def unregister() -> None:
         "dwgreader_plan_zoom",
         "dwgreader_min_building_area_m2",
         "dwgreader_skip_small_buildings",
+        "dwgreader_building_node",
         "dwgreader_auto_buildings",
         "dwgreader_auto_prune_sheets",
         "dwgreader_auto_maf",

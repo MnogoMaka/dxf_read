@@ -927,20 +927,14 @@ PLANT_OVERLAP_LIMIT = 0.30
 # Стартовые значения и для кнопки, и для авторасстановки: оба читают одни свойства сцены.
 DEFAULT_PLANT_DENSITY = 1.0  # шт/100 м²
 DEFAULT_TREE_SHARE = 30.0  # проценты
-# Прошлые стартовые значения. Сцена, которая их ещё хранит, переходит на новые при включении аддона.
-_PREVIOUS_PLANT_DENSITY = 3.0
-_PREVIOUS_TREE_SHARE = 10.0
 
 
 def adopt_plant_defaults(density: float, share: float) -> tuple[float, float]:
-    """Старые стартовые 3 шт/100 м² и 10% деревьев заменяются на текущие.
+    """Сохранённые плотность и долю деревьев не переписывает.
 
-    Любое другое число остаётся: его выставил пользователь.
+    Новая сцена берёт стартовые 1 шт/100 м² и 30% из свойства. Уже выбранные
+    3 и 10, как и любое другое число, остаются как есть.
     """
-    if abs(float(density) - _PREVIOUS_PLANT_DENSITY) < 1e-6:
-        density = DEFAULT_PLANT_DENSITY
-    if abs(float(share) - _PREVIOUS_TREE_SHARE) < 1e-6:
-        share = DEFAULT_TREE_SHARE
     return float(density), float(share)
 
 
@@ -1055,7 +1049,9 @@ def _unite_rings(rings: list[list[tuple[float, float]]]):
 class PlantObstacles:
     """Здания и покрытия, собранные один раз на проход расстановки.
 
-    Здание закрывает и дерево, и куст. Покрытие закрывает только куст.
+    Здание закрывает и дерево, и куст. Покрытие закрывает только куст,
+    пока для дерева не включён запрет заходить на полигоны.
+    Полигон, на котором уже стоит дом, закрывает только дерево.
     Порог площади — FOOTPRINT_SLIVER_M2, см. polygon_overlap_area.
     """
 
@@ -1063,12 +1059,15 @@ class PlantObstacles:
         self,
         buildings: list[list[tuple[float, float]]] | None = None,
         pavements: list[list[tuple[float, float]]] | None = None,
+        hosts: list[list[tuple[float, float]]] | None = None,
     ) -> None:
         _point, _polygon, _union, prep = _shapely()
         self.buildings = _unite_rings(list(buildings or []))
         self.pavements = _unite_rings(list(pavements or []))
+        self.hosts = _unite_rings(list(hosts or []))
         self._buildings = prep(self.buildings) if self.buildings is not None else None
         self._pavements = prep(self.pavements) if self.pavements is not None else None
+        self._hosts = prep(self.hosts) if self.hosts is not None else None
 
     def _hits(self, geometry, prepared, quad: list[tuple[float, float]]) -> bool:
         if geometry is None or prepared is None:
@@ -1079,10 +1078,44 @@ class PlantObstacles:
             return False
         return polygon_overlap_area(geometry, footprint) > 0.0
 
-    def blocks(self, quad: list[tuple[float, float]], family: str) -> bool:
+    def blocks(self, quad: list[tuple[float, float]], family: str, avoid_ground: bool = False) -> bool:
         if self._hits(self.buildings, self._buildings, quad):
             return True
-        return family == "bush" and self._hits(self.pavements, self._pavements, quad)
+        if family == "tree" and self._hits(self.hosts, self._hosts, quad):
+            return True
+        if family == "bush" or (family == "tree" and avoid_ground):
+            return self._hits(self.pavements, self._pavements, quad)
+        return False
+
+
+def point_in_ring(point: tuple[float, float], ring: list[tuple[float, float]]) -> bool:
+    """Точка внутри кольца. Горизонтальное ребро границу не двигает."""
+    if len(ring) < 3:
+        return False
+    x, y = float(point[0]), float(point[1])
+    inside = False
+    previous = ring[-1]
+    for current in ring:
+        x1, y1 = float(previous[0]), float(previous[1])
+        x2, y2 = float(current[0]), float(current[1])
+        if (y1 > y) != (y2 > y):
+            cross = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+            if x < cross:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def host_rings(
+    groups: list[list[list[tuple[float, float]]]],
+    points: list[tuple[float, float]],
+) -> list[list[tuple[float, float]]]:
+    """Все кольца объекта, если хотя бы одно содержит точку стоящего дома."""
+    kept: list[list[tuple[float, float]]] = []
+    for rings in groups:
+        if any(point_in_ring(point, ring) for ring in rings for point in points):
+            kept.extend(rings)
+    return kept
 
 
 class OccupiedFootprints:

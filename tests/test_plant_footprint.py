@@ -16,6 +16,7 @@ from placement_math import (
     adopt_plant_defaults,
     OccupiedFootprints,
     PlantObstacles,
+    host_rings,
     footprint_overlap_fraction,
     footprints_overlap_too_much,
     glb_node_scale,
@@ -106,6 +107,31 @@ class FootprintRuleTests(unittest.TestCase):
         self.assertFalse(obstacles.blocks(still, "tree"))
         self.assertTrue(obstacles.blocks(turned, "bush"))
         self.assertTrue(obstacles.blocks(turned, "tree"))
+
+    def test_tree_crosses_pavement_until_the_flag_is_on(self) -> None:
+        pavement = [[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]]
+        obstacles = PlantObstacles([], pavement)
+        quad = oriented_square((5.0, 5.0), 2.0, 0.2)
+        self.assertFalse(obstacles.blocks(quad, "tree"))
+        self.assertTrue(obstacles.blocks(quad, "tree", avoid_ground=True))
+        self.assertTrue(obstacles.blocks(quad, "bush"))
+
+    def test_polygon_under_a_house_blocks_only_trees(self) -> None:
+        lawn = [[(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]]
+        split = [
+            [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+            [(10.0, 0.0), (20.0, 0.0), (20.0, 10.0), (10.0, 10.0)],
+        ]
+        far = [[(40.0, 0.0), (50.0, 0.0), (50.0, 10.0), (40.0, 10.0)]]
+        house = [[(8.0, 8.0), (12.0, 8.0), (12.0, 12.0), (8.0, 12.0)]]
+        self.assertEqual(host_rings([split, far], [(5.0, 5.0)]), split)
+        obstacles = PlantObstacles(house, [], lawn)
+        on_lawn = oriented_square((2.0, 2.0), 2.0, 0.0)
+        on_house = oriented_square((10.0, 10.0), 2.0, 0.0)
+        self.assertTrue(obstacles.blocks(on_lawn, "tree"))
+        self.assertFalse(obstacles.blocks(on_lawn, "bush"))
+        self.assertTrue(obstacles.blocks(on_house, "tree"))
+        self.assertTrue(obstacles.blocks(on_house, "bush"))
 
 
 class PlanSizeTests(unittest.TestCase):
@@ -233,7 +259,7 @@ class SlotMixTests(unittest.TestCase):
     def test_generation_starts_at_one_per_hundred_and_thirty_percent_trees(self) -> None:
         self.assertEqual(DEFAULT_PLANT_DENSITY, 1.0)
         self.assertEqual(DEFAULT_TREE_SHARE, 30.0)
-        self.assertEqual(adopt_plant_defaults(3.0, 10.0), (1.0, 30.0))
+        self.assertEqual(adopt_plant_defaults(3.0, 10.0), (3.0, 10.0))
         self.assertEqual(adopt_plant_defaults(5.0, 80.0), (5.0, 80.0))
         self.assertEqual(adopt_plant_defaults(1.0, 30.0), (1.0, 30.0))
 

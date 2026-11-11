@@ -20,7 +20,6 @@ from bpy_extras import view3d_utils
 from mathutils import Vector
 
 from .placement_math import (
-    adopt_plant_defaults,
     bench_path,
     DEFAULT_PLANT_DENSITY,
     DEFAULT_TREE_SHARE,
@@ -38,6 +37,7 @@ from .placement_math import (
     orientation_angle,
     mesh_plan_side,
     OccupiedFootprints,
+    host_rings,
     plant_footprint,
     plant_slot_count,
     PlantObstacles,
@@ -161,10 +161,41 @@ def _asset(context, asset_id: str) -> dict:
     raise PlacementError(f"В каталоге нет модели {asset_id}")
 
 
+def _detach_library(collection) -> None:
+    """Шаблоны остаются в файле для ноды и не входят в сцену, поэтому не попадают в GLB."""
+    if collection is None:
+        return
+    scene = bpy.context.scene
+    master = scene.collection if scene is not None else None
+    if master is not None and collection.name in master.children:
+        master.children.unlink(collection)
+    for parent in list(bpy.data.collections):
+        if parent == collection:
+            continue
+        name = str(getattr(parent, "name", "") or "")
+        if name == LIBRARY_NAME or name.startswith(f"{LIBRARY_NAME}."):
+            continue
+        try:
+            linked = collection.name in parent.children
+        except ReferenceError:
+            continue
+        if linked:
+            parent.children.unlink(collection)
+    try:
+        collection.use_fake_user = True
+    except AttributeError:
+        pass
+
+
 def _collection(name: str, parent: bpy.types.Collection | None) -> bpy.types.Collection:
     collection = bpy.data.collections.get(name)
     if collection is None:
         collection = bpy.data.collections.new(name)
+    if name == LIBRARY_NAME or str(name).startswith(f"{LIBRARY_NAME}."):
+        _detach_library(collection)
+        if parent is not None and collection.name not in {child.name for child in parent.children}:
+            parent.children.link(collection)
+        return collection
     if parent is None:
         if collection.name not in bpy.context.scene.collection.children:
             bpy.context.scene.collection.children.link(collection)
@@ -689,8 +720,10 @@ def _replace_owned(collection: bpy.types.Collection, zone_key: str, prefix: bool
 
 _PLANT_LOCK = False
 _PLANT_PENDING = False
+_PLANT_AGAIN = False
 _PLANT_UI_SEEN = False
 _PLANT_TARGETS: list[str] = []
+_PLANT_REQUEST: dict = {"names": None, "lawns": False}
 _PLANT_SCOPE = "zone"
 _PLAY_LOCK = False
 _PLAY_PENDING = False
@@ -801,6 +834,20 @@ def _asset_plan_side(asset: dict, mesh_object) -> float:
     return side
 
 
+def _object_rings(obj) -> list[list[tuple[float, float]]]:
+    world = obj.matrix_world
+    vertices = obj.data.vertices
+    rings: list[list[tuple[float, float]]] = []
+    for polygon in obj.data.polygons:
+        ring = []
+        for index in polygon.vertices:
+            co = world @ vertices[index].co
+            ring.append((float(co.x), float(co.y)))
+        if len(ring) >= 3:
+            rings.append(ring)
+    return rings
+
+
 def _category_rings(category: str) -> list[list[tuple[float, float]]]:
     root = bpy.data.collections.get(UNDERLAY_NAME)
     if root is None:
@@ -812,23 +859,64 @@ def _category_rings(category: str) -> list[list[tuple[float, float]]]:
                 continue
             if str(obj.get("category") or "") != category:
                 continue
-            world = obj.matrix_world
-            vertices = obj.data.vertices
-            for polygon in obj.data.polygons:
-                ring = []
-                for index in polygon.vertices:
-                    co = world @ vertices[index].co
-                    ring.append((float(co.x), float(co.y)))
-                if len(ring) >= 3:
-                    rings.append(ring)
+            rings.extend(_object_rings(obj))
         except ReferenceError:
             continue
     return rings
 
 
-def _plant_obstacles() -> PlantObstacles:
-    """Здания и покрытия подложки. Забор, мебель и символы растений не мешают."""
-    return PlantObstacles(_category_rings("building"), _category_rings("pavement"))
+def _underlay_ring_groups() -> list[list[list[tuple[float, float]]]]:
+    """Кольца каждого объекта подложки, без фильтра категории."""
+    root = bpy.data.collections.get(UNDERLAY_NAME)
+    if root is None:
+        return []
+    groups: list[list[list[tuple[float, float]]]] = []
+    for obj in list(root.all_objects):
+        try:
+            if obj.type != "MESH" or obj.data is None or not obj.data.polygons:
+                continue
+            rings = _object_rings(obj)
+            if rings:
+                groups.append(rings)
+        except ReferenceError:
+            continue
+    return groups
+
+
+def _placed_house_marks(context) -> tuple[list[list[tuple[float, float]]], list[tuple[float, float]]]:
+    """Контур уже стоящего дома и точка, по которой ищется полигон под ним."""
+    from .building_export import buildings_in
+
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return [], []
+    footprints: list[list[tuple[float, float]]] = []
+    points: list[tuple[float, float]] = []
+    for obj in buildings_in(scene):
+        try:
+            origin = obj.matrix_world.translation
+            points.append((float(origin.x), float(origin.y)))
+            if obj.type == "MESH" and obj.data is not None and obj.data.polygons:
+                footprints.extend(_object_rings(obj))
+        except ReferenceError:
+            continue
+    return footprints, points
+
+
+def _plant_obstacles(context=None) -> PlantObstacles:
+    """Здания, покрытия и полигон под уже стоящим домом.
+
+    Контур дома закрывает дерево и куст. Полигон, на котором дом стоит,
+    закрывает только дерево, как бы этот полигон ни назывался.
+    """
+    buildings = _category_rings("building")
+    hosts: list[list[tuple[float, float]]] = []
+    if context is not None:
+        footprints, points = _placed_house_marks(context)
+        buildings.extend(footprints)
+        if points:
+            hosts = host_rings(_underlay_ring_groups(), points)
+    return PlantObstacles(buildings, _category_rings("pavement"), hosts)
 
 
 def _plant_zone_key(obj) -> str:
@@ -913,7 +1001,7 @@ def _run_plantings(
     seed = int(context.scene.dwgreader_seed)
     tree_assets = _assets(context, "tree")
     bush_assets = _assets(context, "bush")
-    tree_choice = str(getattr(context.scene, "dwgreader_tree_model", "all") or "all")
+    tree_choice = str(getattr(context.scene, "dwgreader_tree_model", "tree_01") or "tree_01")
     bush_choice = str(getattr(context.scene, "dwgreader_bush_model", "all") or "all")
     if tree_choice != "all":
         tree_assets = [asset for asset in tree_assets if asset["id"] == tree_choice]
@@ -931,8 +1019,9 @@ def _run_plantings(
             sources[asset["id"]] = cached
         return cached
 
+    avoid_ground = bool(getattr(context.scene, "dwgreader_trees_avoid_polygons", False))
     if obstacles is None:
-        obstacles = _plant_obstacles()
+        obstacles = _plant_obstacles(context)
     if occupied is None:
         occupied = _existing_footprints(context, {key for _vertices, _faces, key, _height in zones})
     collection = _placement_collection("plantings")
@@ -973,7 +1062,7 @@ def _run_plantings(
                 cursor += 1
                 yaw = rng.random() * tau
                 quad = plant_footprint((point[0], point[1]), plan_side, yaw, scale)
-                if obstacles.blocks(quad, str(asset.get("family") or "")):
+                if obstacles.blocks(quad, str(asset.get("family") or ""), avoid_ground=avoid_ground):
                     continue
                 if occupied.blocks(quad):
                     continue
@@ -1017,8 +1106,8 @@ def _run_plantings(
 
 
 def _on_plant_update(self, context):
-    global _PLANT_PENDING
-    if _PLANT_LOCK or not _PLANT_UI_SEEN or context is None or _busy(context):
+    global _PLANT_PENDING, _PLANT_AGAIN, _PLANT_REQUEST
+    if not _PLANT_UI_SEEN or context is None or _busy(context):
         return
     scene = getattr(context, "scene", None)
     if scene is None:
@@ -1033,23 +1122,28 @@ def _on_plant_update(self, context):
             _status(context, "Выделите полигоны подложки")
             return
         pending_names = [obj.name for obj in targets]
+    _PLANT_REQUEST = {"names": pending_names, "lawns": all_lawns}
+    if _PLANT_LOCK:
+        _PLANT_AGAIN = True
+        return
     if _PLANT_PENDING:
         return
     _PLANT_PENDING = True
 
-    def _later(names=pending_names, lawns=all_lawns):
-        global _PLANT_LOCK, _PLANT_PENDING
+    def _later():
+        global _PLANT_LOCK, _PLANT_PENDING, _PLANT_AGAIN
         _PLANT_PENDING = False
         current = bpy.context
         if current is None or _PLANT_LOCK or _busy(current):
             return None
+        request = _PLANT_REQUEST
         _PLANT_LOCK = True
         try:
-            if lawns:
+            if request["lawns"]:
                 note = _replant_lawns(current)
             else:
                 objects = []
-                for name in names or []:
+                for name in request["names"] or []:
                     obj = bpy.data.objects.get(name)
                     if _is_plant_zone(obj):
                         objects.append(obj)
@@ -1064,6 +1158,9 @@ def _on_plant_update(self, context):
             _status(current, f"Посадки: {exc}")
         finally:
             _PLANT_LOCK = False
+            if _PLANT_AGAIN:
+                _PLANT_AGAIN = False
+                _on_plant_update(None, current)
         return None
 
     bpy.app.timers.register(_later, first_interval=0.2)
@@ -1145,7 +1242,7 @@ def _plant_objects(context, objects) -> tuple[int, int, bool]:
         ready.append(obj)
         skip.add(key)
     occupied = _existing_footprints(context, skip)
-    obstacles = _plant_obstacles()
+    obstacles = _plant_obstacles(context)
     total = 0
     used = 0
     clamped = False
@@ -1193,6 +1290,7 @@ def draw_plant_controls(layout, context, *, all_lawns: bool) -> None:
     _PLANT_SCOPE = "lawns" if all_lawns else "zone"
     scene = context.scene
     layout.prop(scene, "dwgreader_tree_model", text="Дерево")
+    layout.prop(scene, "dwgreader_trees_avoid_polygons")
     layout.prop(scene, "dwgreader_bush_model", text="Куст")
     layout.prop(scene, "dwgreader_tree_share")
     layout.prop(scene, "dwgreader_density")
@@ -1653,7 +1751,7 @@ def _fill_playground_on(
     return len(layout["items"]), bool(layout["hero_missing"])
 
 
-def _fill_islands(context, islands, zones=None, kind: str | None = None, seed: int | None = None, merge_nearby: bool = False) -> tuple[int, bool]:
+def _fill_islands(context, islands, zones=None, kind: str | None = None, seed: int | None = None, merge_nearby: bool = False) -> tuple[int, bool, int]:
     if not _play_assets(context, kind):
         raise PlacementError("В каталоге нет моделей выбранного типа площадки")
     collection = _placement_collection("playgrounds")
@@ -1673,7 +1771,7 @@ def _fill_islands(context, islands, zones=None, kind: str | None = None, seed: i
         )
         total += count
         missing = missing or missed
-    return total, missing
+    return total, missing, len(work)
 
 
 def _all_playground_meshes() -> list:
@@ -1687,12 +1785,10 @@ def _all_playground_meshes() -> list:
 
 
 def _play_targets(context, prefer_selection: bool) -> list:
-    selected = _underlay_selection(context)
-    if prefer_selection:
+    """Выделенные площадки. Газон и дорога в этот набор не входят."""
+    selected = [obj for obj in _underlay_selection(context) if _playground_mesh(obj)]
+    if prefer_selection or selected:
         return selected
-    marked = [obj for obj in selected if _playground_mesh(obj)]
-    if marked:
-        return marked
     return _all_playground_meshes()
 
 
@@ -1713,9 +1809,9 @@ def refill_playgrounds(context, prefer_selection: bool = False) -> str:
             continue
     if not islands:
         return "Выберите полигоны площадки"
-    total, hero_missing = _fill_islands(context, islands, targets, merge_nearby=prefer_selection)
+    total, hero_missing, filled = _fill_islands(context, islands, targets, merge_nearby=prefer_selection)
     if total:
-        note = f"На площадках {total} объектов, полигонов {len(islands)}"
+        note = f"На площадках {total} объектов, полигонов {filled}"
         if hero_missing:
             note += ". Крупный объект не влез"
         return note
@@ -1797,7 +1893,7 @@ def furnish_underlay(context) -> str:
                 for obj in group:
                     group_islands.extend(_mesh_islands(obj, False))
                 try:
-                    count, missing = _fill_islands(context, group_islands, group, kind=kind, seed=seed_value)
+                    count, missing, _filled = _fill_islands(context, group_islands, group, kind=kind, seed=seed_value)
                 except PlacementError as exc:
                     failed = str(exc)
                     continue
@@ -2778,24 +2874,6 @@ CLASSES = (
 )
 
 
-def _adopt_saved_plant_defaults():
-    """Старые стартовые плотность и долю деревьев подменяет уже после включения.
-
-    Пока аддон ставится из настроек, у bpy.data нет сцен: обращение к ним
-    роняет включение с '_RestrictData' object has no attribute 'scenes'.
-    """
-    scenes = getattr(getattr(bpy, "data", None), "scenes", None)
-    if scenes is None:
-        return 0.2
-    for scene in scenes:
-        density, share = adopt_plant_defaults(scene.dwgreader_density, scene.dwgreader_tree_share)
-        if density != scene.dwgreader_density:
-            scene.dwgreader_density = density
-        if share != scene.dwgreader_tree_share:
-            scene.dwgreader_tree_share = share
-    return None
-
-
 def register() -> None:
     global _MODEL_PREVIEWS
     _MODEL_PREVIEWS = previews.new()
@@ -2824,6 +2902,13 @@ def register() -> None:
     bpy.types.Scene.dwgreader_tree_model = EnumProperty(
         name="Дерево",
         items=_tree_model_items,
+        default="tree_01",
+        update=_on_plant_update,
+    )
+    bpy.types.Scene.dwgreader_trees_avoid_polygons = BoolProperty(
+        name="Деревья не заходят на полигоны",
+        description="Крона дерева не пересекает покрытия, как у куста",
+        default=False,
         update=_on_plant_update,
     )
     bpy.types.Scene.dwgreader_bush_model = EnumProperty(
@@ -2946,14 +3031,10 @@ def register() -> None:
         soft_max=4.0,
         update=_on_play_scale,
     )
-    if not bpy.app.timers.is_registered(_adopt_saved_plant_defaults):
-        bpy.app.timers.register(_adopt_saved_plant_defaults, first_interval=0.1)
 
 
 def unregister() -> None:
     global _MODEL_PREVIEWS
-    if bpy.app.timers.is_registered(_adopt_saved_plant_defaults):
-        bpy.app.timers.unregister(_adopt_saved_plant_defaults)
     if bpy.app.timers.is_registered(_preview_timer):
         bpy.app.timers.unregister(_preview_timer)
     if _MODEL_PREVIEWS is not None:
@@ -2975,6 +3056,7 @@ def unregister() -> None:
         "dwgreader_bench_step",
         "dwgreader_plant_scale",
         "dwgreader_bush_model",
+        "dwgreader_trees_avoid_polygons",
         "dwgreader_tree_model",
         "dwgreader_seed",
         "dwgreader_density",

@@ -68,8 +68,6 @@ MIN_ARRANGEMENT_AREA_M2 = 0.05
 MAX_CONTOUR_SPAN_M = 8000.0
 # Открытые линии ограждений становятся узкими полигонами-препятствиями.
 FENCE_WIDTH_M = 0.20
-# Остров газона мельче этой доли от самого большого куска того же слоя не строится.
-GREEN_ISLAND_KEEP_RATIO = 0.05
 # Слой 0 / HATCH: SOLID-заливка внутри контура стен здания.
 GENERIC_FILL_ASSOCIATE_M = 15.0
 FILL_POLYLINE_TOKENS = ("ЗАЛИВ", "ЗАПОЛН", "ПЯТН")
@@ -264,6 +262,7 @@ class PipelineSettings:
     cut_vegetation: bool = False
     omit_symbols: bool = False
     omit_fences: bool = False
+    omit_safety_zones: bool = False
     scene_scale: float = 1.0
     origin_mode: str = "mass"
     batch_size: int = 600
@@ -299,6 +298,7 @@ def settings() -> PipelineSettings:
         cut_vegetation=False,
         omit_symbols=False,
         omit_fences=False,
+        omit_safety_zones=False,
         scene_scale=1.0,
         origin_mode="mass",
         batch_size=DEFAULT_BATCH_SIZE,

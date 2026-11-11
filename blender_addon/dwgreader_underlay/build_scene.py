@@ -478,7 +478,7 @@ def layer_parts(layer: dict, vertices, faces, split_mode: str, part_gap_m: float
 def build(
     json_path: Path,
     part_gap_m: float = LAYER_PART_GAP_M,
-    split_mode: str = "gap",
+    split_mode: str = "polygon",
     by_type: bool = True,
     scene: bpy.types.Scene | None = None,
     root_name: str | None = None,
@@ -494,7 +494,7 @@ def build(
     root["scale"] = float(payload.get("scale") or 1.0)
     root["split_mode"] = split_mode
     if split_mode not in SPLIT_MODES:
-        split_mode = "gap"
+        split_mode = "polygon"
 
     used_names: set[str] = set()
     built = 0
@@ -827,7 +827,7 @@ def _rollback_underlay(root_name: str, parked: list[tuple[str, str]], materials:
 def commit_underlay(
     json_path: Path,
     part_gap_m: float = LAYER_PART_GAP_M,
-    split_mode: str = "gap",
+    split_mode: str = "polygon",
     by_type: bool = True,
     scene: bpy.types.Scene | None = None,
 ) -> int:

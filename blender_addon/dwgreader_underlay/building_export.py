@@ -19,7 +19,7 @@ import bpy
 from bpy.props import EnumProperty, StringProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper
-from mathutils import Euler, Matrix, Vector
+from mathutils import Euler, Matrix
 
 
 # Recommended names first; the old names remain supported for compatibility.
@@ -576,10 +576,12 @@ def _gltf_export_kwargs(filepath):
 BUILDING_COLLECTION = "SITE_BUILDING"
 BUILDING_BLEND = "Building 2.0.blend"
 BUILDING_GROUP = "1_Building"
-BUILDING_SOURCE = "Circle"
+MODULES_COLLECTION = "modules"
 DEFAULT_BUILDING_PRESET = "main002"
 _SETTING_LABELS = {"Колчисетво этажей": "Количество этажей", "Тип модуля": "Номер формы"}
 _SKIP_COLLECTIONS = ("SITE_BUILDING", "SITE_PLACEMENT", "SITE_LIBRARY")
+_CATALOG = {"key": "", "drivers": []}
+_NODE_ITEMS: list[tuple[str, str, str]] = [("none", "Нет ноды", "В файле здания нет ноды дома")]
 
 BUILDING_PRESETS = (
     ('circle', 'Круглая башня', {
@@ -1229,8 +1231,75 @@ def preset_label(obj) -> str:
     return "Свой тип"
 
 
+def preset_fits_ids(socket_ids, needed) -> bool:
+    """Пресет подходит только если у ноды есть все его сокеты.
+
+    Иначе «Дом 2» записал бы общие Socket_38 и Socket_29 в чужой граф.
+    """
+    return set(needed).issubset({str(item) for item in socket_ids})
+
+
+def _group_key(name: str) -> str:
+    """«1_Building.001» после повторной загрузки — тот же граф."""
+    text = str(name or "")
+    head, dot, tail = text.rpartition(".")
+    if dot and tail.isdigit():
+        return head
+    return text
+
+
+def _same_group(left: str, right: str) -> bool:
+    key = _group_key(left)
+    return bool(key) and key == _group_key(right)
+
+
+def _inside_modules(collections) -> bool:
+    for name in collections or ():
+        text = str(name)
+        if text == MODULES_COLLECTION or text.startswith(f"{MODULES_COLLECTION}."):
+            return True
+    return False
+
+
+def _prefer_main(drivers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    main = [item for item in drivers if _same_group(item[1], BUILDING_GROUP)]
+    rest = [item for item in drivers if not _same_group(item[1], BUILDING_GROUP)]
+    return main + rest
+
+
+def driver_records(rows) -> list[tuple[str, str]]:
+    """Объекты с нодой вне коллекции деталей. Первая заготовка каждой ноды."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for object_name, group_name, collections in rows:
+        group = str(group_name or "")
+        if not group or _inside_modules(collections):
+            continue
+        key = _group_key(group)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append((str(object_name), key))
+    return _prefer_main(found)
+
+
+def chosen_driver(drivers, selected: str):
+    """Выбранная нода, иначе основной 1_Building, иначе первая в файле."""
+    if not drivers:
+        return None
+    for item in drivers:
+        if _same_group(item[1], selected):
+            return item
+    for item in drivers:
+        if _same_group(item[1], BUILDING_GROUP):
+            return item
+    return drivers[0]
+
+
 def apply_preset(obj, key: str) -> None:
     values = next(item[2] for item in BUILDING_PRESETS if item[0] == key)
+    if not preset_fits_ids(_socket_ids(obj), values):
+        return
     modifier = building_modifier(obj)
     if modifier is None:
         return
@@ -1256,10 +1325,15 @@ def _building_collection(scene):
     return collection
 
 
-def _exclude_collection(scene, collection) -> None:
+def _hide_module_collection(scene, collection) -> None:
+    """Прячет заготовки глазом. Монитор коллекции и исключение ноду выключают."""
+    collection.hide_viewport = False
+    collection.hide_render = True
+
     def walk(layer) -> None:
         if layer.collection == collection:
-            layer.exclude = True
+            layer.exclude = False
+            layer.hide_viewport = True
             return
         for child in layer.children:
             walk(child)
@@ -1268,29 +1342,118 @@ def _exclude_collection(scene, collection) -> None:
         walk(view_layer.layer_collection)
 
 
-def _is_building_group(name: str) -> bool:
-    """Повторная загрузка файла дома даёт «1_Building.001», это тот же граф."""
-    text = str(name or "")
-    return text == BUILDING_GROUP or text.startswith(f"{BUILDING_GROUP}.")
+def _held_by_warehouse(parent) -> bool:
+    name = str(getattr(parent, "name", "") or "")
+    return _inside_modules([name]) or name == "SITE_LIBRARY" or name.startswith("SITE_LIBRARY.")
+
+
+def _detach_warehouse(collection) -> None:
+    """Склад деталей остаётся в файле для ноды и не входит в сцену, поэтому не попадает в GLB."""
+    if collection is None:
+        return
+    scene = bpy.context.scene
+    master = getattr(scene, "collection", None) if scene is not None else None
+    if master is not None and collection.name in master.children:
+        master.children.unlink(collection)
+    for parent in list(bpy.data.collections):
+        if parent == collection or _held_by_warehouse(parent):
+            continue
+        try:
+            linked = collection.name in parent.children
+        except ReferenceError:
+            continue
+        if linked:
+            parent.children.unlink(collection)
+    try:
+        collection.use_fake_user = True
+    except AttributeError:
+        pass
+
+
+def _has_local_modules() -> bool:
+    for collection in bpy.data.collections:
+        if getattr(collection, "library", None) is not None:
+            continue
+        try:
+            name = collection.name
+        except ReferenceError:
+            continue
+        if _inside_modules([name]):
+            return True
+    return False
+
+
+def _release_modules(scene, root) -> None:
+    """Прячет уже лежащие в сцене заготовки и вынимает их вместе с библиотекой моделей."""
+    del root
+    for collection in list(bpy.data.collections):
+        if getattr(collection, "library", None) is not None:
+            continue
+        try:
+            name = collection.name
+        except ReferenceError:
+            continue
+        if _inside_modules([name]):
+            _hide_module_collection(scene, collection)
+            _detach_warehouse(collection)
+        elif name == "SITE_LIBRARY" or name.startswith("SITE_LIBRARY."):
+            _detach_warehouse(collection)
+
+
+def _in_building_collection(obj) -> bool:
+    for collection in getattr(obj, "users_collection", ()) or ():
+        if getattr(collection, "name", "") == BUILDING_COLLECTION:
+            return True
+    return False
 
 
 def building_modifier(obj):
-    modifiers = list(getattr(obj, "modifiers", []))
-    for modifier in modifiers:
-        group = getattr(modifier, "node_group", None)
-        if modifier.type == "NODES" and group is not None and _is_building_group(group.name):
-            return modifier
+    """Дом — объект в SITE_BUILDING с любой группой Geometry Nodes."""
+    if obj is None:
+        return None
+    modifiers = list(getattr(obj, "modifiers", []) or [])
     try:
         marked = bool(obj.get("dwgreader_building"))
     except ReferenceError:
         return None
-    if not marked:
+    if not marked and not _in_building_collection(obj):
         return None
     for modifier in modifiers:
         group = getattr(modifier, "node_group", None)
-        if modifier.type == "NODES" and group is not None:
+        if getattr(modifier, "type", "") == "NODES" and group is not None:
             return modifier
     return None
+
+
+def _socket_ids(obj) -> set[str]:
+    modifier = building_modifier(obj)
+    group = getattr(modifier, "node_group", None)
+    if group is None:
+        return set()
+    found = set()
+    for item in group.interface.items_tree:
+        if getattr(item, "in_out", "") != "INPUT":
+            continue
+        if getattr(item, "socket_type", "") == "NodeSocketGeometry":
+            continue
+        found.add(str(item.identifier))
+    return found
+
+
+def _preset_fits(obj, key: str = DEFAULT_BUILDING_PRESET) -> bool:
+    values = next(item[2] for item in BUILDING_PRESETS if item[0] == key)
+    return preset_fits_ids(_socket_ids(obj), values)
+
+
+def _group_of(obj) -> str:
+    modifier = building_modifier(obj)
+    group = getattr(getattr(modifier, "node_group", None), "name", "")
+    if group:
+        return _group_key(group)
+    try:
+        return str(obj.get("dwgreader_building_group") or "")
+    except ReferenceError:
+        return ""
 
 
 def buildings_in(scene) -> list:
@@ -1324,12 +1487,15 @@ def draw_controls(layout, context) -> None:
     if inputs is None:
         return
     box = layout.box()
-    box.label(text=obj.name, icon="HOME")
-    box.operator_menu_enum("dwgreader.building_preset", "kind", text=preset_label(obj))
-    hint = box.column(align=True)
-    hint.scale_y = 0.75
-    hint.label(text="Список меняет форму целиком. Новый дом — «Дом 2».")
-    hint.label(text="Номер формы сам по себе тип не сменяет.")
+    group = _group_of(obj)
+    title = obj.name if not group else f"{obj.name} · {group}"
+    box.label(text=title, icon="HOME")
+    if _preset_fits(obj):
+        box.operator_menu_enum("dwgreader.building_preset", "kind", text=preset_label(obj))
+        hint = box.column(align=True)
+        hint.scale_y = 0.75
+        hint.label(text="Список меняет форму целиком. Новый дом — «Дом 2».")
+        hint.label(text="Номер формы сам по себе тип не сменяет.")
     if len(found) > 1:
         note = box.column(align=True)
         note.scale_y = 0.75
@@ -1492,8 +1658,11 @@ def _selected_islands(context):
     return found
 
 
-def _mark_building(obj):
+def _mark_building(obj, group_name: str = ""):
     obj["dwgreader_building"] = True
+    group = _group_key(group_name) or _group_of(obj)
+    if group:
+        obj["dwgreader_building_group"] = group
     _unlock_transform(obj)
     return obj
 
@@ -1507,48 +1676,325 @@ def _unlock_transform(obj) -> None:
         obj.lock_scale[index] = False
 
 
-def _spawn_building(context, template=None):
-    scene = context.scene
-    root = _building_collection(scene)
-    if template is not None:
-        copy = template.copy()
-        copy.data = template.data
-        copy.name = "Здание"
-        root.objects.link(copy)
-        return _mark_building(copy)
-    existing = [obj for obj in root.objects if building_modifier(obj) is not None]
-    if existing:
-        source = chosen_building(context) or existing[-1]
-        copy = source.copy()
-        copy.data = source.data
-        copy.name = "Здание"
-        root.objects.link(copy)
-        return _mark_building(copy)
+def _copy_building(root, source):
+    copy = source.copy()
+    copy.data = source.data
+    copy.name = "Здание"
+    root.objects.link(copy)
+    _mark_building(copy, _group_of(source))
+    _drop_clip(copy)
+    return copy
+
+
+def _file_stamp(path: Path) -> str:
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _library_name(obj, known: set[str]) -> str:
+    name = obj.name
+    if name in known:
+        return name
+    head, dot, tail = name.rpartition(".")
+    if dot and tail.isdigit() and head in known:
+        return head
+    return name
+
+
+def _node_group_name(obj) -> str:
+    for modifier in getattr(obj, "modifiers", []) or []:
+        group = getattr(modifier, "node_group", None)
+        if getattr(modifier, "type", "") == "NODES" and group is not None:
+            return _group_key(group.name)
+    return ""
+
+
+def _collect_pointers(collection, found: set[int]) -> None:
+    for obj in collection.objects:
+        found.add(obj.as_pointer())
+    for child in collection.children:
+        _collect_pointers(child, found)
+
+
+def _driver_rows(collection, hidden: set[int], known: set[str], rows: list) -> None:
+    for obj in collection.objects:
+        if obj.as_pointer() in hidden:
+            continue
+        rows.append((_library_name(obj, known), _node_group_name(obj), []))
+    for child in collection.children:
+        if _inside_modules([child.name]):
+            continue
+        _driver_rows(child, hidden, known, rows)
+
+
+def _library_blocks(library) -> list:
+    blocks = []
+    for name in dir(bpy.data):
+        if name.startswith("_"):
+            continue
+        collection = getattr(bpy.data, name, None)
+        if not callable(getattr(collection, "remove", None)):
+            continue
+        try:
+            found = [block for block in collection if getattr(block, "library", None) == library]
+        except TypeError:
+            continue
+        blocks.extend(found)
+    return blocks
+
+
+def _discard_library(library) -> None:
+    """Убирает временную связь. У этого файла счётчик библиотеки залипает на 1."""
+    blocks = _library_blocks(library)
+    if blocks:
+        bpy.data.batch_remove(blocks)
+    if getattr(library, "users", 0):
+        library.user_clear()
+    if getattr(library, "users", 1) == 0:
+        bpy.data.libraries.remove(library)
+
+
+def _scan_drivers(path: Path) -> list[tuple[str, str]]:
+    """Читает ноды-дома и убирает временную связь с файлом."""
+    before = {lib.as_pointer() for lib in bpy.data.libraries}
+    known: set[str] = set()
+    with bpy.data.libraries.load(str(path), link=True) as (data_from, data_to):
+        known = set(data_from.objects)
+        data_to.scenes = list(data_from.scenes)
+    try:
+        rows = []
+        for scene in data_to.scenes:
+            if scene is None:
+                continue
+            hidden: set[int] = set()
+            for child in scene.collection.children:
+                if _inside_modules([child.name]):
+                    _collect_pointers(child, hidden)
+            _driver_rows(scene.collection, hidden, known, rows)
+        return driver_records(rows)
+    finally:
+        for library in list(bpy.data.libraries):
+            if library.as_pointer() not in before:
+                _discard_library(library)
+
+
+def node_catalog(path: Path | None = None) -> list[tuple[str, str]]:
+    """Список (объект, нода) на размер и время файла здания."""
+    source = Path(path) if path is not None else blend_path()
+    if not source.is_file():
+        return []
+    key = f"{source.resolve()}|{_file_stamp(source)}"
+    if _CATALOG["key"] == key:
+        return list(_CATALOG["drivers"])
+    drivers = _scan_drivers(source)
+    _CATALOG["key"] = key
+    _CATALOG["drivers"] = list(drivers)
+    return list(drivers)
+
+
+def _find_node_group(group_name: str):
+    matches = []
+    for group in bpy.data.node_groups:
+        if getattr(group, "bl_idname", "") != "GeometryNodeTree":
+            continue
+        if _same_group(getattr(group, "name", ""), group_name):
+            matches.append(group)
+    if not matches:
+        return None
+    key = _group_key(group_name)
+    for group in matches:
+        if group.name == key:
+            return group
+    return matches[0]
+
+
+def _reset_node_inputs(modifier) -> None:
+    """Старые значения сокетов не переносятся: у новой ноды свои числа по умолчанию."""
+    group = getattr(modifier, "node_group", None)
+    inputs = getattr(getattr(modifier, "properties", None), "inputs", None)
+    if group is None or inputs is None:
+        return
+    for item in group.interface.items_tree:
+        if getattr(item, "in_out", "") != "INPUT":
+            continue
+        if getattr(item, "socket_type", "") == "NodeSocketGeometry":
+            continue
+        socket = getattr(inputs, item.identifier, None)
+        if socket is None or not hasattr(socket, "value"):
+            continue
+        default = getattr(item, "default_value", None)
+        if default is None:
+            continue
+        try:
+            socket.value = default
+        except (TypeError, ValueError, AttributeError):
+            try:
+                socket.value = tuple(default)
+            except (TypeError, ValueError):
+                continue
+
+
+def _drop_temp_driver(obj) -> None:
+    mesh = obj.data if getattr(obj, "type", "") == "MESH" else None
+    for collection in list(getattr(obj, "users_collection", ()) or ()):
+        collection.objects.unlink(obj)
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and getattr(mesh, "users", 1) == 0 and isinstance(mesh, bpy.types.Mesh):
+        bpy.data.meshes.remove(mesh)
+
+
+def _append_group_source(scene, root, group_name: str):
+    """Догружает граф из файла здания и не оставляет вторую заготовку в сцене."""
     path = blend_path()
     if not path.is_file():
         raise FileNotFoundError(path)
+    driver = chosen_driver(node_catalog(path), group_name)
+    if driver is None:
+        raise RuntimeError("В файле здания нет такой ноды")
+    object_name, _group = driver
+    need_modules = not _has_local_modules()
+    before = {collection.as_pointer() for collection in bpy.data.collections}
     with bpy.data.libraries.load(str(path), link=False) as (data_from, data_to):
-        if BUILDING_SOURCE not in set(data_from.objects):
+        if object_name not in set(data_from.objects):
             raise RuntimeError("В файле здания нет объекта дома")
-        data_to.objects = [BUILDING_SOURCE]
-        data_to.collections = ["modules"] if "modules" in set(data_from.collections) else []
+        data_to.objects = [object_name]
+        data_to.collections = [MODULES_COLLECTION] if need_modules and MODULES_COLLECTION in set(data_from.collections) else []
+    created = [obj for obj in data_to.objects if obj is not None]
+    if not created:
+        raise RuntimeError("В файле здания нет объекта дома")
+    temp = created[0]
+    group = None
+    for modifier in getattr(temp, "modifiers", []) or []:
+        candidate = getattr(modifier, "node_group", None)
+        if getattr(modifier, "type", "") == "NODES" and candidate is not None and _same_group(candidate.name, group_name):
+            group = candidate
+            break
+    for collection in data_to.collections:
+        if collection is None:
+            continue
+        _hide_module_collection(scene, collection)
+        _detach_warehouse(collection)
+    _link_new_modules(scene, root, before)
+    if group is None:
+        _drop_temp_driver(temp)
+        raise RuntimeError("В заготовке нет ноды дома")
+    root["dwgreader_building_blend"] = _file_stamp(path)
+    return group, temp
+
+
+def _retarget_building(context, obj, group_name: str) -> None:
+    """Ставит выбранную ноду на уже стоящий дом. Контур и место не меняются."""
+    if obj is None or _same_group(_group_of(obj), group_name):
+        return
+    modifier = building_modifier(obj)
+    if modifier is None:
+        raise RuntimeError("У дома нет ноды")
+    scene = context.scene
+    root = _building_collection(scene)
+    _release_modules(scene, root)
+    group = _find_node_group(group_name)
+    temp = None
+    if group is None:
+        group, temp = _append_group_source(scene, root, group_name)
+    modifier.node_group = group
+    _reset_node_inputs(modifier)
+    obj["dwgreader_building_group"] = _group_key(group.name)
+    _drop_clip(obj)
+    if temp is not None:
+        _drop_temp_driver(temp)
+    obj.update_tag()
+
+
+def node_enum_items(self, context):
+    try:
+        drivers = node_catalog()
+    except Exception:
+        logging.warning("Не удалось прочитать ноды здания", exc_info=True)
+        drivers = []
+    items = [(group, group, object_name) for object_name, group in drivers]
+    if not items:
+        items = [("none", "Нет ноды", "В файле здания нет ноды дома")]
+    _NODE_ITEMS[:] = items
+    return _NODE_ITEMS
+
+
+def _link_new_modules(scene, root, before: set[int]) -> None:
+    fresh = [
+        collection for collection in bpy.data.collections
+        if collection.as_pointer() not in before and _inside_modules([collection.name])
+    ]
+    nested: set[int] = set()
+    for collection in fresh:
+        for child in collection.children_recursive:
+            nested.add(child.as_pointer())
+    for collection in fresh:
+        if collection.as_pointer() in nested:
+            continue
+        _hide_module_collection(scene, collection)
+        _detach_warehouse(collection)
+
+
+def _append_driver(scene, root, path: Path, object_name: str):
+    need_modules = not _has_local_modules()
+    before = {collection.as_pointer() for collection in bpy.data.collections}
+    with bpy.data.libraries.load(str(path), link=False) as (data_from, data_to):
+        names = set(data_from.objects)
+        if object_name not in names:
+            raise RuntimeError("В файле здания нет объекта дома")
+        data_to.objects = [object_name]
+        data_to.collections = [MODULES_COLLECTION] if need_modules and MODULES_COLLECTION in set(data_from.collections) else []
     created = [obj for obj in data_to.objects if obj is not None]
     if not created:
         raise RuntimeError("В файле здания нет объекта дома")
     obj = created[0]
+    group_name = _node_group_name(obj)
     obj.name = "Здание"
     root.objects.link(obj)
-    _mark_building(obj)
+    _mark_building(obj, group_name)
     for collection in data_to.collections:
-        if collection is None or collection.name in {child.name for child in root.children}:
+        if collection is None:
             continue
-        root.children.link(collection)
-        _exclude_collection(scene, collection)
+        _hide_module_collection(scene, collection)
+        _detach_warehouse(collection)
+    _link_new_modules(scene, root, before)
+    _drop_clip(obj)
+    return obj
+
+
+def _spawn_building(context, template=None):
+    scene = context.scene
+    root = _building_collection(scene)
+    _release_modules(scene, root)
+    path = blend_path()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    stamp = _file_stamp(path)
+    driver = chosen_driver(node_catalog(path), str(getattr(scene, "dwgreader_building_node", "") or ""))
+    if driver is None:
+        raise RuntimeError("В файле здания нет ноды дома")
+    object_name, group_name = driver
+    same_file = str(root.get("dwgreader_building_blend") or "") == stamp
+    if same_file and template is not None and _same_group(_group_of(template), group_name):
+        return _copy_building(root, template)
+    if same_file:
+        pool = [
+            obj for obj in root.objects
+            if building_modifier(obj) is not None and _same_group(_group_of(obj), group_name)
+        ]
+        if pool:
+            source = chosen_building(context)
+            if source not in pool:
+                source = pool[-1]
+            return _copy_building(root, source)
+    obj = _append_driver(scene, root, path, object_name)
+    root["dwgreader_building_blend"] = stamp
     return obj
 
 
 def _use_house_preset(obj) -> None:
-    """Файл здания открывается круглой башней. Для контура нужен обычный дом."""
+    """Круглая башня основного нода сменяется на «Дом 2». Чужая нода не переписывается."""
+    if not _preset_fits(obj):
+        return
     if preset_label(obj) == "Круглая башня":
         apply_preset(obj, DEFAULT_BUILDING_PRESET)
 
@@ -1780,60 +2226,6 @@ def _footprint_mesh(loops: list[list[tuple[float, float, float]]]):
     return mesh
 
 
-def _prism_mesh(loops: list[list[tuple[float, float, float]]]):
-    """Высокая призма контура с дырами. По ней дом обрезается в плане, не по высоте."""
-    from mathutils.geometry import tessellate_polygon
-
-    flat: list[Vector] = []
-    vectors: list[list[Vector]] = []
-    for loop in loops:
-        ring = [Vector((point[0], point[1], 0.0)) for point in loop]
-        vectors.append(ring)
-        flat.extend(ring)
-    triangles = tessellate_polygon(vectors)
-    if not triangles:
-        return None
-    count = len(flat)
-    verts = [(point.x, point.y, -50.0) for point in flat]
-    verts.extend((point.x, point.y, 500.0) for point in flat)
-    faces: list[tuple[int, ...]] = []
-    for tri in triangles:
-        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-        faces.append((a, c, b))
-        faces.append((a + count, b + count, c + count))
-    offset = 0
-    for index, loop in enumerate(loops):
-        size = len(loop)
-        for step in range(size):
-            nxt = (step + 1) % size
-            bottom0 = offset + step
-            bottom1 = offset + nxt
-            top0 = bottom0 + count
-            top1 = bottom1 + count
-            if index == 0:
-                faces.append((bottom0, bottom1, top1, top0))
-            else:
-                faces.append((bottom0, top0, top1, bottom1))
-        offset += size
-    mesh = bpy.data.meshes.new("Здание.призма")
-    mesh.from_pydata(verts, [], faces)
-    mesh.update()
-    _outward_normals(mesh)
-    return mesh
-
-
-def _outward_normals(mesh) -> None:
-    import bmesh
-
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    if bm.calc_volume(signed=True) < 0:
-        bmesh.ops.reverse_faces(bm, faces=bm.faces)
-    bm.to_mesh(mesh)
-    bm.free()
-
-
 def _drop_clip(obj) -> None:
     for modifier in list(obj.modifiers):
         if modifier.type == "BOOLEAN" and modifier.name == "Полигон":
@@ -1845,35 +2237,6 @@ def _drop_clip(obj) -> None:
         bpy.data.objects.remove(child, do_unlink=True)
         if mesh is not None and getattr(mesh, "users", 1) == 0 and isinstance(mesh, bpy.types.Mesh):
             bpy.data.meshes.remove(mesh)
-
-
-def _clip_to_polygon(obj, loops: list[list[tuple[float, float, float]]]) -> None:
-    """Пересечение с призмой контура. Нода строит круглую башню, призма оставляет только пятно."""
-    _drop_clip(obj)
-    collection = next(iter(obj.users_collection), None)
-    if collection is None:
-        return
-    mesh = _prism_mesh(loops)
-    if mesh is None:
-        return
-    cutter = bpy.data.objects.new("Здание.контур", mesh)
-    collection.objects.link(cutter)
-    cutter.parent = obj
-    cutter.matrix_parent_inverse.identity()
-    cutter.location = (0.0, 0.0, 0.0)
-    cutter.rotation_euler = (0.0, 0.0, 0.0)
-    cutter.scale = (1.0, 1.0, 1.0)
-    cutter.hide_render = True
-    cutter.hide_select = True
-    try:
-        cutter.hide_set(True)
-    except Exception:
-        pass
-    modifier = obj.modifiers.new("Полигон", "BOOLEAN")
-    modifier.operation = "INTERSECT"
-    modifier.object = cutter
-    solvers = {item.identifier for item in modifier.bl_rna.properties["solver"].enum_items}
-    modifier.solver = "MANIFOLD" if "MANIFOLD" in solvers else "FLOAT"
 
 
 def _apply_polygon(obj, vertices, faces, origin, height: float) -> None:
@@ -1892,10 +2255,7 @@ def _apply_polygon(obj, vertices, faces, origin, height: float) -> None:
     obj.rotation_euler = Euler((obj.rotation_euler.x, obj.rotation_euler.y, 0.0), "XYZ")
     obj.scale = (1.0, 1.0, kept_z)
     _unlock_transform(obj)
-    if loops:
-        _clip_to_polygon(obj, loops)
-    else:
-        _drop_clip(obj)
+    _drop_clip(obj)
 
 
 def place_building(context):
@@ -2074,6 +2434,9 @@ class DWGREADER_OT_building_preset(Operator):
         if obj is None:
             self.report({"WARNING"}, "Сначала выделите дом")
             return {"CANCELLED"}
+        if not _preset_fits(obj, self.kind):
+            self.report({"WARNING"}, "У этой ноды другие параметры")
+            return {"CANCELLED"}
         try:
             apply_preset(obj, self.kind)
         except StopIteration:
@@ -2215,8 +2578,54 @@ class DWGREADER_OT_export_building_glb(Operator, ExportHelper):
         return {"FINISHED"}
 
 
+class DWGREADER_OT_pick_building_node(Operator):
+    bl_idname = "dwgreader.pick_building_node"
+    bl_label = "Нода здания"
+    bl_description = "Какую ноду ставить. Уже выбранный дом пересобирается на эту ноду"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group: EnumProperty(name="Нода", items=node_enum_items)
+
+    def execute(self, context):
+        if not self.group or self.group == "none":
+            return {"CANCELLED"}
+        context.scene.dwgreader_building_node = self.group
+        obj = chosen_building(context)
+        if obj is None:
+            return {"FINISHED"}
+        try:
+            _retarget_building(context, obj, self.group)
+        except Exception as error:
+            self.report({"ERROR"}, f"Не удалось сменить ноду: {error}")
+            return {"CANCELLED"}
+        if context.view_layer is not None:
+            context.view_layer.update()
+        label = _group_of(obj) or self.group
+        context.scene.dwgreader_status = f"Нода дома: {label}"
+        return {"FINISHED"}
+
+
+def draw_node_picker(layout, context) -> None:
+    try:
+        drivers = node_catalog()
+    except Exception:
+        logging.warning("Не удалось прочитать ноды здания", exc_info=True)
+        layout.label(text="Не удалось прочитать ноды здания", icon="ERROR")
+        return
+    if not drivers:
+        layout.label(text="В файле здания нет ноды дома", icon="ERROR")
+        return
+    current = str(getattr(context.scene, "dwgreader_building_node", "") or "")
+    picked = chosen_driver(drivers, current)
+    label = picked[1] if picked else drivers[0][1]
+    row = layout.row(align=True)
+    row.label(text="Нода")
+    row.operator_menu_enum("dwgreader.pick_building_node", "group", text=label)
+
+
 CLASSES = (
     DWGREADER_OT_building_preset,
+    DWGREADER_OT_pick_building_node,
     DWGREADER_OT_place_building,
     DWGREADER_OT_export_building_glb,
 )

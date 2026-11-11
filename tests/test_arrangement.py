@@ -404,14 +404,14 @@ class SymbolCutoutTests(unittest.TestCase):
         self.assertAlmostEqual(areas["Газон"], 100.0, places=3)
         self.assertAlmostEqual(areas["Б_цветники"], 4.0, places=3)
 
-    def test_small_green_islands_drop_and_a_fifth_stays(self) -> None:
+    def test_small_green_islands_stay_with_the_large_lawn(self) -> None:
         pieces = [
             HatchPiece("green", "Леса и газоны", _ring(0, 0, 10)),
             HatchPiece("green", "Леса и газоны", _ring(20, 0, 2)),
             HatchPiece("green", "Леса и газоны", _ring(40, 0, 20.0 ** 0.5)),
         ]
         areas = _areas(pieces, cut=False)
-        self.assertAlmostEqual(areas["Леса и газоны"], 120.0, places=3)
+        self.assertAlmostEqual(areas["Леса и газоны"], 124.0, places=3)
 
     def test_equal_green_islands_all_stay(self) -> None:
         pieces = [
