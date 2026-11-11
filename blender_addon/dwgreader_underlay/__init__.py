@@ -81,7 +81,7 @@ from .install_support import (
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 5, 24),
+    "version": (1, 5, 25),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF, жилой дом и расстановка благоустройства в сцене",

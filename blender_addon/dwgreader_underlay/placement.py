@@ -2298,12 +2298,21 @@ def _family_model_items(family: str, empty_label: str):
     def items(self, context):
         try:
             assets = _assets(context, family)
-        except PlacementError:
+        except Exception:
             assets = []
         rows = [("all", "Все из каталога", "Случайная модель этого семейства")]
-        if not assets:
+        seen = {"all"}
+        if family == "tree":
+            rows.append(("tree_01", "Дерево", "Дерево .glb"))
+            seen.add("tree_01")
+        elif not assets:
             rows.append(("none", empty_label, ""))
-        rows.extend((asset["id"], asset["name"], asset["file"]) for asset in assets)
+        for asset in assets:
+            asset_id = str(asset.get("id") or "")
+            if not asset_id or asset_id in seen:
+                continue
+            rows.append((asset_id, str(asset.get("name") or asset_id), str(asset.get("file") or "")))
+            seen.add(asset_id)
         return rows
     return items
 

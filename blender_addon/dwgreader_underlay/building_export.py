@@ -2589,17 +2589,20 @@ class DWGREADER_OT_pick_building_node(Operator):
     def execute(self, context):
         if not self.group or self.group == "none":
             return {"CANCELLED"}
-        context.scene.dwgreader_building_node = self.group
         obj = chosen_building(context)
+        if obj is not None:
+            try:
+                _retarget_building(context, obj, self.group)
+            except Exception as error:
+                message = f"Не удалось сменить ноду: {error}"
+                self.report({"ERROR"}, message)
+                context.scene.dwgreader_status = message[:180]
+                return {"CANCELLED"}
+            if context.view_layer is not None:
+                context.view_layer.update()
+        context.scene.dwgreader_building_node = self.group
         if obj is None:
             return {"FINISHED"}
-        try:
-            _retarget_building(context, obj, self.group)
-        except Exception as error:
-            self.report({"ERROR"}, f"Не удалось сменить ноду: {error}")
-            return {"CANCELLED"}
-        if context.view_layer is not None:
-            context.view_layer.update()
         label = _group_of(obj) or self.group
         context.scene.dwgreader_status = f"Нода дома: {label}"
         return {"FINISHED"}
