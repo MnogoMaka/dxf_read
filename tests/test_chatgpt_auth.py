@@ -352,6 +352,16 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(parsed["code"], "ab+cd")
         self.assertEqual(chatgpt_auth.oauth_query("code=ab+cd&state=s1")["code"], "ab+cd")
 
+    def test_issued_client_keeps_the_existing_session(self) -> None:
+        self._session(redirect_uri="http://127.0.0.1:1455/auth/callback")
+        chatgpt_auth._retain_client("oaiapp_issued")
+        saved = chatgpt_auth.load_session()
+        assert saved is not None
+        self.assertEqual(saved["client_id"], "oaiapp_issued")
+        self.assertEqual(saved["refresh_token"], "old-refresh")
+        self.assertEqual(saved["email"], "user@example.com")
+        self.assertEqual(saved["redirect_uri"], "http://127.0.0.1:1455/auth/callback")
+
     def test_invalid_grant_retries_with_the_issued_client(self) -> None:
         calls: list[str] = []
 
@@ -389,6 +399,24 @@ class SessionTests(unittest.TestCase):
         })
         self.assertEqual(client, "oaiapp_test")
         self.assertEqual(port, 1455)
+
+    def test_another_account_registers_a_new_client(self) -> None:
+        saved = {
+            "client_id": "oaiapp_test",
+            "refresh_token": "refresh",
+            "redirect_uri": "http://127.0.0.1:1455/auth/callback",
+        }
+        client, port = chatgpt_auth._login_client(saved, another=True)
+        self.assertEqual(client, chatgpt_auth.DYNAMIC_CLIENT)
+        self.assertEqual(port, 0)
+
+    def test_another_account_retry_keeps_the_issued_client(self) -> None:
+        client, port = chatgpt_auth._login_client({
+            "client_id": "oaiapp_issued",
+            "redirect_uri": "http://127.0.0.1:1455/auth/callback",
+            "reuse_client": True,
+        }, another=True)
+        self.assertEqual((client, port), ("oaiapp_issued", 1455))
 
     def test_saved_client_without_redirect_registers_again(self) -> None:
         client, port = chatgpt_auth._login_client({

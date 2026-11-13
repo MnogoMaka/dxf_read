@@ -497,22 +497,27 @@ def _redirect_port(value: str) -> int:
     return port
 
 
-def _login_client(saved: dict) -> tuple[str, int]:
+def _login_client(saved: dict, another: bool = False) -> tuple[str, int]:
     """Какой client_id открывать в браузере и какой порт под него занять.
 
     Выданный oaiapp_ OpenAI принимает только с тем адресом, на котором клиент
-    зарегистрировали. После выхода refresh отозван, и повтор с новым портом
-    отвечает invalid redirect_uri. Тогда вход начинается заново через
-    dynamic_agent_client. Повтор того же кода (invalid_grant) обязан остаться
-    на выданном клиенте и на том же порту.
+    зарегистрировали, и только для рабочей области того аккаунта. После выхода
+    refresh отозван, и повтор с новым портом отвечает invalid redirect_uri.
+    Тогда вход начинается заново через dynamic_agent_client. Другой аккаунт
+    тоже регистрирует новое приложение: старый oaiapp_ чужой области не пускает.
+    Повтор того же кода (invalid_grant) обязан остаться на выданном клиенте
+    и на том же порту.
     """
     issued = str(saved.get("client_id") or "")
     port = _redirect_port(str(saved.get("redirect_uri") or ""))
-    if not issued.startswith("oaiapp_") or not port:
-        return DYNAMIC_CLIENT, 0
-    if saved.get("reuse_client") or saved.get("refresh_token"):
+    reusable = issued.startswith("oaiapp_") and bool(port)
+    if saved.get("reuse_client") and reusable:
         return issued, port
-    return DYNAMIC_CLIENT, 0
+    if another:
+        return DYNAMIC_CLIENT, 0
+    if not reusable or not saved.get("refresh_token"):
+        return DYNAMIC_CLIENT, 0
+    return issued, port
 
 
 class _LoopbackServer(http.server.HTTPServer):
@@ -568,7 +573,7 @@ def _login(job: LoginJob) -> dict:
 
 
 def _authorize(job: LoginJob, saved: dict) -> dict:
-    client_id, preferred = _login_client(saved)
+    client_id, preferred = _login_client(saved, another=bool(getattr(job, "another", False)))
     verifier = new_verifier()
     state = new_secret()
     nonce = new_secret()
@@ -649,7 +654,7 @@ def _retain_client(client_id: str) -> None:
     session = load_session() or {}
     if session.get("client_id") == client_id:
         return
-    save_session({"client_id": client_id})
+    save_session({**session, "client_id": client_id})
 
 
 def _finish_authorization(
