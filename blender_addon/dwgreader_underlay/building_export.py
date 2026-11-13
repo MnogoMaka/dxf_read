@@ -1308,7 +1308,14 @@ def apply_preset(obj, key: str) -> None:
         socket = getattr(inputs, ident, None)
         if socket is None or not hasattr(socket, "value"):
             continue
-        socket.value = value
+        try:
+            socket.value = value
+        except (TypeError, ValueError, AttributeError):
+            try:
+                socket.value = tuple(value)
+            except (TypeError, ValueError, AttributeError):
+                logging.warning("Сокет %s пресета дома пропущен", ident, exc_info=True)
+                continue
     obj.update_tag()
 
 
@@ -1386,18 +1393,21 @@ def _has_local_modules() -> bool:
 def _release_modules(scene, root) -> None:
     """Прячет уже лежащие в сцене заготовки и вынимает их вместе с библиотекой моделей."""
     del root
-    for collection in list(bpy.data.collections):
-        if getattr(collection, "library", None) is not None:
-            continue
-        try:
-            name = collection.name
-        except ReferenceError:
-            continue
-        if _inside_modules([name]):
-            _hide_module_collection(scene, collection)
-            _detach_warehouse(collection)
-        elif name == "SITE_LIBRARY" or name.startswith("SITE_LIBRARY."):
-            _detach_warehouse(collection)
+    try:
+        for collection in list(bpy.data.collections):
+            if getattr(collection, "library", None) is not None:
+                continue
+            try:
+                name = collection.name
+            except ReferenceError:
+                continue
+            if _inside_modules([name]):
+                _hide_module_collection(scene, collection)
+                _detach_warehouse(collection)
+            elif name == "SITE_LIBRARY" or name.startswith("SITE_LIBRARY."):
+                _detach_warehouse(collection)
+    except Exception:
+        logging.warning("Не удалось спрятать склад деталей дома", exc_info=True)
 
 
 def _in_building_collection(obj) -> bool:
@@ -1672,11 +1682,37 @@ def _unlock_transform(obj) -> None:
         obj.lock_scale[index] = False
 
 
-def _copy_building(root, source):
+def _unlink_everywhere(obj) -> None:
+    for collection in list(getattr(obj, "users_collection", ()) or ()):
+        try:
+            collection.objects.unlink(obj)
+        except (RuntimeError, ReferenceError):
+            continue
+
+
+def _clear_file_pose(obj) -> None:
+    """Точка заготовки из файла ноды, в том числе x=-39, в сцену не попадает."""
+    obj.location = (0.0, 0.0, 0.0)
+    obj.rotation_euler = (0.0, 0.0, 0.0)
+
+
+def _reveal_building(root, obj):
+    """Дом появляется в сцене уже с контуром полигона или в точке курсора."""
+    for collection in getattr(obj, "users_collection", ()) or ():
+        if collection == root:
+            return obj
+    root.objects.link(obj)
+    return obj
+
+
+def _copy_building(source):
     copy = source.copy()
-    copy.data = source.data
+    mesh = getattr(source, "data", None)
+    if mesh is not None and hasattr(mesh, "copy"):
+        copy.data = mesh.copy()
     copy.name = "Здание"
-    root.objects.link(copy)
+    _clear_file_pose(copy)
+    _unlink_everywhere(copy)
     _mark_building(copy, _group_of(source))
     _drop_clip(copy)
     return copy
@@ -1740,7 +1776,35 @@ def _library_blocks(library) -> list:
 
 
 def _discard_library(library) -> None:
-    """Убирает временную связь. У этого файла счётчик библиотеки залипает на 1."""
+    """Убирает временную связь. Объекты файла здания из сцены уходят даже если счётчик залип."""
+    scene = getattr(bpy.context, "scene", None)
+    master = getattr(scene, "collection", None) if scene is not None else None
+    for obj in list(bpy.data.objects):
+        try:
+            owned = getattr(obj, "library", None) == library
+        except ReferenceError:
+            continue
+        if owned:
+            _unlink_everywhere(obj)
+    for collection in list(bpy.data.collections):
+        try:
+            owned = getattr(collection, "library", None) == library
+        except ReferenceError:
+            continue
+        if not owned or master is None or collection.name not in master.children:
+            continue
+        master.children.unlink(collection)
+    for extra in list(bpy.data.scenes):
+        try:
+            owned = getattr(extra, "library", None) == library
+        except ReferenceError:
+            continue
+        if not owned or extra == scene:
+            continue
+        try:
+            bpy.data.scenes.remove(extra)
+        except RuntimeError:
+            logging.warning("Не удалось убрать временную сцену здания", exc_info=True)
     blocks = _library_blocks(library)
     if blocks:
         bpy.data.batch_remove(blocks)
@@ -1839,6 +1903,19 @@ def _drop_temp_driver(obj) -> None:
         bpy.data.meshes.remove(mesh)
 
 
+def _settle_modules(scene, collections, before: set[int]) -> None:
+    """Склад прячется отдельно. Сбой этого шага дом не отменяет."""
+    try:
+        for collection in list(collections or ()):
+            if collection is None:
+                continue
+            _hide_module_collection(scene, collection)
+            _detach_warehouse(collection)
+        _link_new_modules(scene, None, before)
+    except Exception:
+        logging.warning("Не удалось спрятать склад деталей дома", exc_info=True)
+
+
 def _append_group_source(scene, root, group_name: str):
     """Догружает граф из файла здания и не оставляет вторую заготовку в сцене."""
     path = blend_path()
@@ -1859,23 +1936,23 @@ def _append_group_source(scene, root, group_name: str):
     if not created:
         raise RuntimeError("В файле здания нет объекта дома")
     temp = created[0]
-    group = None
-    for modifier in getattr(temp, "modifiers", []) or []:
-        candidate = getattr(modifier, "node_group", None)
-        if getattr(modifier, "type", "") == "NODES" and candidate is not None and _same_group(candidate.name, group_name):
-            group = candidate
-            break
-    for collection in data_to.collections:
-        if collection is None:
-            continue
-        _hide_module_collection(scene, collection)
-        _detach_warehouse(collection)
-    _link_new_modules(scene, root, before)
-    if group is None:
+    try:
+        _clear_file_pose(temp)
+        _unlink_everywhere(temp)
+        group = None
+        for modifier in getattr(temp, "modifiers", []) or []:
+            candidate = getattr(modifier, "node_group", None)
+            if getattr(modifier, "type", "") == "NODES" and candidate is not None and _same_group(candidate.name, group_name):
+                group = candidate
+                break
+        _settle_modules(scene, data_to.collections, before)
+        if group is None:
+            raise RuntimeError("В заготовке нет ноды дома")
+        root["dwgreader_building_blend"] = _file_stamp(path)
+        return group, temp
+    except Exception:
         _drop_temp_driver(temp)
-        raise RuntimeError("В заготовке нет ноды дома")
-    root["dwgreader_building_blend"] = _file_stamp(path)
-    return group, temp
+        raise
 
 
 def _retarget_building(context, obj, group_name: str) -> None:
@@ -1931,6 +2008,8 @@ def _link_new_modules(scene, root, before: set[int]) -> None:
 
 
 def _append_driver(scene, root, path: Path, object_name: str):
+    """Заготовка остаётся вне сцены, без координаты из файла ноды."""
+    del root
     need_modules = not _has_local_modules()
     before = {collection.as_pointer() for collection in bpy.data.collections}
     with bpy.data.libraries.load(str(path), link=False) as (data_from, data_to):
@@ -1943,18 +2022,18 @@ def _append_driver(scene, root, path: Path, object_name: str):
     if not created:
         raise RuntimeError("В файле здания нет объекта дома")
     obj = created[0]
-    group_name = _node_group_name(obj)
-    obj.name = "Здание"
-    root.objects.link(obj)
-    _mark_building(obj, group_name)
-    for collection in data_to.collections:
-        if collection is None:
-            continue
-        _hide_module_collection(scene, collection)
-        _detach_warehouse(collection)
-    _link_new_modules(scene, root, before)
-    _drop_clip(obj)
-    return obj
+    try:
+        _clear_file_pose(obj)
+        _unlink_everywhere(obj)
+        group_name = _node_group_name(obj)
+        obj.name = "Здание"
+        _mark_building(obj, group_name)
+        _settle_modules(scene, data_to.collections, before)
+        _drop_clip(obj)
+        return obj
+    except Exception:
+        _drop_temp_driver(obj)
+        raise
 
 
 def _spawn_building(context, template=None):
@@ -1971,7 +2050,7 @@ def _spawn_building(context, template=None):
     object_name, group_name = driver
     same_file = str(root.get("dwgreader_building_blend") or "") == stamp
     if same_file and template is not None and _same_group(_group_of(template), group_name):
-        return _copy_building(root, template)
+        return _copy_building(template)
     if same_file:
         pool = [
             obj for obj in root.objects
@@ -1981,7 +2060,7 @@ def _spawn_building(context, template=None):
             source = chosen_building(context)
             if source not in pool:
                 source = pool[-1]
-            return _copy_building(root, source)
+            return _copy_building(source)
     obj = _append_driver(scene, root, path, object_name)
     root["dwgreader_building_blend"] = stamp
     return obj
@@ -2258,9 +2337,14 @@ def place_building(context):
     islands = _selected_islands(context)
     if not islands:
         obj = _spawn_building(context)
-        _use_house_preset(obj)
-        obj.location = _cursor(context.scene)
-        return [obj]
+        try:
+            _use_house_preset(obj)
+            obj.location = _cursor(context.scene)
+            _reveal_building(_building_collection(context.scene), obj)
+        except Exception:
+            _drop_temp_driver(obj)
+            raise
+        return [obj], ""
     return _place_islands(context, islands)
 
 
@@ -2268,6 +2352,8 @@ def _place_islands(context, islands, template=None, auto: bool = False):
     from .placement_math import polygon_centroid_xy
 
     made = []
+    first_error = ""
+    root = _building_collection(context.scene)
     for vertices, faces in islands:
         centroid = polygon_centroid_xy(vertices, faces)
         if centroid is None:
@@ -2276,17 +2362,26 @@ def _place_islands(context, islands, template=None, auto: bool = False):
         else:
             origin = (float(centroid[0]), float(centroid[1]))
             height = float(centroid[2])
-        obj = _spawn_building(context, template)
-        if auto:
-            apply_preset(obj, DEFAULT_BUILDING_PRESET)
-        else:
-            _use_house_preset(obj)
-        template = obj
-        _apply_polygon(obj, vertices, faces, origin, height)
-        if auto:
-            obj["dwgreader_auto"] = True
-        made.append(obj)
-    return made
+        obj = None
+        try:
+            obj = _spawn_building(context, template)
+            if auto:
+                apply_preset(obj, DEFAULT_BUILDING_PRESET)
+            else:
+                _use_house_preset(obj)
+            _apply_polygon(obj, vertices, faces, origin, height)
+            _reveal_building(root, obj)
+            if auto:
+                obj["dwgreader_auto"] = True
+            made.append(obj)
+            template = obj
+        except Exception as exc:
+            logging.warning("Не удалось поставить дом на полигон", exc_info=True)
+            if obj is not None and obj not in made:
+                _drop_temp_driver(obj)
+            if not first_error:
+                first_error = str(exc)
+    return made, first_error
 
 
 def clear_auto_buildings() -> None:
@@ -2382,21 +2477,31 @@ def place_auto_buildings(context) -> str:
     )
     made = 0
     skipped = 0
+    failed = 0
+    first_error = ""
     template = None
     for (source_name, spot_vertices, spot_faces, _area, _side), area_m2 in zip(pending, areas_m2):
         if skip_small and area_m2 < min_area:
             skipped += 1
             continue
         try:
-            built = _place_islands(context, [(spot_vertices, spot_faces)], template, auto=True)
-        except Exception:
+            built, error = _place_islands(context, [(spot_vertices, spot_faces)], template, auto=True)
+        except Exception as exc:
             logging.warning("Не удалось построить здание из %s", source_name, exc_info=True)
+            failed += 1
+            if not first_error:
+                first_error = str(exc)
             continue
+        if error:
+            logging.warning("Не удалось построить здание из %s: %s", source_name, error)
+            failed += 1
+            if not first_error:
+                first_error = error
         if not built:
             continue
         template = built[-1]
         made += len(built)
-    if made <= 0 and skipped <= 0:
+    if made <= 0 and skipped <= 0 and failed <= 0:
         return ""
     view_layer = getattr(context, "view_layer", None)
     if template is not None and view_layer is not None:
@@ -2410,6 +2515,10 @@ def place_auto_buildings(context) -> str:
     note = f"здания {made}"
     if skipped:
         note += f", мельче порога {skipped}"
+    if failed:
+        note += f", не встали {failed}"
+        if first_error:
+            note += f": {first_error}"
     return note
 
 
@@ -2456,9 +2565,12 @@ class DWGREADER_OT_place_building(Operator):
             self.report({"ERROR"}, "В аддоне нет файла здания")
             return {"CANCELLED"}
         try:
-            made = place_building(context)
-        except Exception as error:
-            self.report({"ERROR"}, f"Не удалось поставить здание: {error}")
+            made, error = place_building(context)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Не удалось поставить здание: {exc}")
+            return {"CANCELLED"}
+        if not made:
+            self.report({"ERROR"}, error or "Не удалось поставить здание")
             return {"CANCELLED"}
         for item in list(context.selected_objects):
             item.select_set(False)
@@ -2469,8 +2581,10 @@ class DWGREADER_OT_place_building(Operator):
             note = "Здание поставлено. Параметры ниже меняют выделенный дом"
         else:
             note = f"Здания поставлены: {len(made)}. Параметры ниже меняют выделенный дом"
+        if error:
+            note += f". Не встали: {error}"
         context.scene.dwgreader_status = note
-        self.report({"INFO"}, note)
+        self.report({"WARNING"} if error else {"INFO"}, note)
         return {"FINISHED"}
 
 

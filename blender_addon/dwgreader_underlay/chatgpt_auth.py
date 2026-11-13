@@ -12,6 +12,7 @@ import hashlib
 import http.client
 import http.server
 import json
+import logging
 import socket
 import os
 import secrets
@@ -391,8 +392,9 @@ class LoginJob:
         except AuthError as error:
             self.error = str(error)
             _set_login_failure(self.error)
-        except Exception:
-            self.error = "Не удалось войти в ChatGPT"
+        except Exception as error:
+            _log_login_failure(error)
+            self.error = _public_login_failure(error)
             _set_login_failure(self.error)
         finally:
             self.done = True
@@ -520,7 +522,10 @@ class _LoopbackServer(http.server.HTTPServer):
 
     def server_bind(self) -> None:
         if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
         super().server_bind()
 
 
@@ -568,64 +573,73 @@ def _authorize(job: LoginJob, saved: dict) -> dict:
     state = new_secret()
     nonce = new_secret()
     challenge = pkce_challenge(verifier)
-    server, redirect, kept_port = _bind_callback(preferred)
-    if client_id != DYNAMIC_CLIENT and not kept_port:
-        client_id = DYNAMIC_CLIENT
-    server.timeout = LOGIN_TIMEOUT_S
-    server.expected_state = state
-    server.captured_ready = False
-    job._server = server
-    job.redirect_uri = redirect
-    params = {
-        "response_type": "code",
-        "client_id": client_id,
-        "redirect_uri": redirect,
-        "scope": SCOPES,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "state": state,
-        "nonce": nonce,
-        "resource": RESOURCE,
-        "ext_agent_host_id": host_id(),
-    }
-    if client_id == DYNAMIC_CLIENT:
-        params["agent_name_hint"] = AGENT_NAME
-    elif saved.get("email") and not job.another:
-        params["login_hint"] = str(saved["email"])
-    if job.another:
-        params["prompt"] = "login"
-    url = AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
-    job.url = url
-    job.notice = "Подтвердите вход в браузере"
-    server.timeout = 0.5
-    deadline = time.monotonic() + LOGIN_TIMEOUT_S
-    while time.monotonic() < deadline and not job.cancelled:
-        server.handle_request()
-        if getattr(server, "captured_ready", False):
-            job.notice = "Браузер подтвердил вход, сохраняем сессию…"
-            break
-    server.server_close()
-    if job.cancelled:
-        raise AuthError("Вход отменён")
-    accept_callback(getattr(server, "captured", None), getattr(server, "captured_path", ""), state)
-    captured = server.captured
-    callback_client = str(captured.get("client_id") or client_id)
-    if callback_client == DYNAMIC_CLIENT or not callback_client.startswith("oaiapp_"):
-        raise AuthError("Сервер не выдал client_id")
-    if client_id.startswith("oaiapp_") and callback_client != client_id:
-        raise AuthError("Вход вернул другое приложение. Выйдите и войдите снова")
-    _retain_client(callback_client)
-    auth_code = str(captured.get("code") or "")
-    if not auth_code or " " in auth_code:
-        raise AuthError("Сервер не вернул код входа")
-    return _finish_authorization(job, {
-        "grant_type": "authorization_code",
-        "client_id": callback_client,
-        "code": auth_code,
-        "code_verifier": verifier,
-        "redirect_uri": redirect,
-        "resource": RESOURCE,
-    }, callback_client, nonce, saved)
+    server = None
+    try:
+        server, redirect, kept_port = _bind_callback(preferred)
+        if client_id != DYNAMIC_CLIENT and not kept_port:
+            client_id = DYNAMIC_CLIENT
+        server.timeout = LOGIN_TIMEOUT_S
+        server.expected_state = state
+        server.captured_ready = False
+        job._server = server
+        job.redirect_uri = redirect
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect,
+            "scope": SCOPES,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "nonce": nonce,
+            "resource": RESOURCE,
+            "ext_agent_host_id": host_id(),
+        }
+        if client_id == DYNAMIC_CLIENT:
+            params["agent_name_hint"] = AGENT_NAME
+        elif saved.get("email") and not job.another:
+            params["login_hint"] = str(saved["email"])
+        if job.another:
+            params["prompt"] = "login"
+        url = AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+        job.url = url
+        job.notice = "Подтвердите вход в браузере"
+        server.timeout = 0.5
+        deadline = time.monotonic() + LOGIN_TIMEOUT_S
+        while time.monotonic() < deadline and not job.cancelled:
+            server.handle_request()
+            if getattr(server, "captured_ready", False):
+                job.notice = "Браузер подтвердил вход, сохраняем сессию…"
+                break
+        if job.cancelled:
+            raise AuthError("Вход отменён")
+        accept_callback(getattr(server, "captured", None), getattr(server, "captured_path", ""), state)
+        captured = server.captured
+        callback_client = str(captured.get("client_id") or client_id)
+        if callback_client == DYNAMIC_CLIENT or not callback_client.startswith("oaiapp_"):
+            raise AuthError("Сервер не выдал client_id")
+        if client_id.startswith("oaiapp_") and callback_client != client_id:
+            raise AuthError("Вход вернул другое приложение. Выйдите и войдите снова")
+        _retain_client(callback_client)
+        auth_code = str(captured.get("code") or "")
+        if not auth_code or " " in auth_code:
+            raise AuthError("Сервер не вернул код входа")
+        return _finish_authorization(job, {
+            "grant_type": "authorization_code",
+            "client_id": callback_client,
+            "code": auth_code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect,
+            "resource": RESOURCE,
+        }, callback_client, nonce, saved)
+    finally:
+        if server is not None:
+            try:
+                server.server_close()
+            except OSError:
+                pass
+            if job._server is server:
+                job._server = None
 
 
 def _retain_client(client_id: str) -> None:
@@ -961,12 +975,7 @@ class _LoginHTTPSHandler(urllib.request.HTTPSHandler):
             link._job = job
             return link
 
-        return self.do_open(
-            connection,
-            req,
-            context=self._context,
-            check_hostname=self._check_hostname,
-        )
+        return self.do_open(connection, req, context=self._context)
 
 
 def _open_form(request: urllib.request.Request, timeout: float, job: LoginJob | None):
@@ -1137,36 +1146,90 @@ _KEYCHAIN_SERVICE = b"dwgreader.chatgpt"
 _KEYCHAIN_ACCOUNT = b"session"
 
 
-def _windows_browser_launch(url: str) -> tuple[list[str], dict[str, str]]:
-    """Ссылка уходит в переменную окружения, не в командную строку cmd.
-
-    cmd раскрывает %3A% и %2F% как переменные и режет строку по &. В буфере
-    обмена ссылка целая, поэтому вставка открывала вход, а кнопка браузера нет.
-    """
-    env = os.environ.copy()
-    env["DWGREADER_LOGIN_URL"] = str(url)
-    argv = [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
-        "-Command",
-        'Start-Process "$env:DWGREADER_LOGIN_URL"',
-    ]
-    return argv, env
+def _executable_from_command(command: str) -> str:
+    """Путь exe из команды открытия. Шаблон %1 через cmd не запускаем."""
+    text = str(command or "").strip()
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        return text[1:end] if end > 1 else ""
+    token = text.split(" ", 1)[0] if text else ""
+    return "" if "%" in token else token
 
 
-def _open_windows_browser(url: str) -> bool:
+def _windows_browser_argv(executable: str, url: str) -> list[str]:
+    exe = str(executable or "").strip()
+    if not exe:
+        return []
+    return [exe, str(url)]
+
+
+def _same_executable(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def _default_browser_executable() -> str:
+    """Браузер, назначенный в Windows для https."""
+    if os.name != "nt":
+        return ""
+    import winreg
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+        ) as key:
+            prog_id, _kind = winreg.QueryValueEx(key, "ProgId")
+    except OSError:
+        return ""
+    prog_id = str(prog_id or "").strip()
+    if not prog_id or "\\" in prog_id or "/" in prog_id:
+        return ""
+    roots = (
+        (winreg.HKEY_CURRENT_USER, rf"Software\Classes\{prog_id}\shell\open\command"),
+        (winreg.HKEY_LOCAL_MACHINE, rf"Software\Classes\{prog_id}\shell\open\command"),
+        (winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\shell\open\command"),
+    )
+    for root, path in roots:
+        try:
+            with winreg.OpenKey(root, path) as key:
+                command, _kind = winreg.QueryValueEx(key, "")
+        except OSError:
+            continue
+        executable = _executable_from_command(str(command or ""))
+        if executable:
+            return executable
+    return ""
+
+
+def _system_edge_executable() -> str:
+    """Встроенный браузер Windows."""
+    names = ("ProgramFiles(x86)", "ProgramFiles", "ProgramW6432")
+    seen: set[str] = set()
+    for name in names:
+        root = str(os.environ.get(name) or "").strip()
+        if not root:
+            continue
+        candidate = os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe")
+        key = os.path.normcase(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _spawn_browser(argv: list[str]) -> bool:
     """Отдельный процесс. ShellExecute внутри blender.exe на части машин гасит весь процесс."""
+    if len(argv) < 2 or not argv[0] or not os.path.isfile(argv[0]):
+        return False
     flags = getattr(subprocess, "DETACHED_PROCESS", 0)
     flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    argv, env = _windows_browser_launch(url)
     try:
         subprocess.Popen(
             argv,
-            env=env,
             close_fds=True,
             creationflags=flags,
             stdin=subprocess.DEVNULL,
@@ -1176,6 +1239,39 @@ def _open_windows_browser(url: str) -> bool:
     except OSError:
         return False
     return True
+
+
+def _open_windows_browser(url: str) -> bool:
+    """Сначала браузер по умолчанию. Если процесс не стартовал — Microsoft Edge."""
+    default = _default_browser_executable()
+    if default and _spawn_browser(_windows_browser_argv(default, url)):
+        return True
+    edge = _system_edge_executable()
+    if not edge or _same_executable(default, edge):
+        return False
+    return _spawn_browser(_windows_browser_argv(edge, url))
+
+
+def _log_login_failure(error: BaseException) -> None:
+    """В лог попадает тип сбоя. Токен и код входа туда не пишутся."""
+    detail = _safe(str(error))
+    marker = "code="
+    while marker in detail.lower():
+        start = detail.lower().find(marker)
+        end = start + len(marker)
+        while end < len(detail) and detail[end] not in "& \t":
+            end += 1
+        detail = detail[:start] + "code=[скрыто]" + detail[end:]
+    logging.warning("Вход в ChatGPT не выполнен (%s): %s", type(error).__name__, detail[:180])
+
+
+def _public_login_failure(error: BaseException) -> str:
+    if isinstance(error, OSError):
+        return "Не удалось открыть локальный адрес входа"
+    name = type(error).__name__
+    if name.isidentifier():
+        return f"Не удалось войти в ChatGPT ({name})"
+    return "Не удалось войти в ChatGPT"
 
 
 def _open_browser(url: str) -> bool:

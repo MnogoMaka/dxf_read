@@ -82,28 +82,78 @@ class PkceTests(unittest.TestCase):
             "https://auth.openai.com/api/accounts/authorize?a=1&b=2"
             "&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"
         )
-        argv, env = chatgpt_auth._windows_browser_launch(url)
-        self.assertEqual(env["DWGREADER_LOGIN_URL"], url)
-        self.assertNotIn("cmd", argv[0].lower())
-        self.assertNotIn(url, " ".join(argv))
-        self.assertNotIn("%%", " ".join(argv))
-        self.assertIn('"$env:DWGREADER_LOGIN_URL"', argv[-1])
+        command = r'"C:\Program Files\Google\Chrome\Application\chrome.exe" --single-argument %1'
+        executable = chatgpt_auth._executable_from_command(command)
+        argv = chatgpt_auth._windows_browser_argv(executable, url)
+        self.assertEqual(argv[0], r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+        self.assertEqual(argv[1], url)
+        self.assertIn("%3A", argv[1])
+        self.assertIn("&", argv[1])
+        joined = " ".join(argv).lower()
+        self.assertNotIn("powershell", joined)
+        self.assertNotIn("cmd", joined)
+        self.assertNotIn("%%", joined)
+        self.assertNotIn("%1", argv[1])
 
-    def test_windows_opens_a_child_process(self) -> None:
+    def test_windows_opens_the_default_browser(self) -> None:
         url = "https://auth.openai.com/example?a=1&b=2"
+        chrome = r"C:\Chrome\chrome.exe"
         with patch.object(chatgpt_auth.sys, "platform", "win32"), patch.object(
+            chatgpt_auth, "_default_browser_executable", return_value=chrome,
+        ), patch.object(
+            chatgpt_auth.os.path, "isfile", return_value=True,
+        ), patch.object(
             chatgpt_auth.subprocess, "Popen",
-        ) as popen, patch.object(chatgpt_auth.webbrowser, "open") as browser:
+        ) as popen, patch.object(chatgpt_auth.webbrowser, "open") as browser, patch.object(
+            chatgpt_auth, "_system_edge_executable",
+        ) as edge:
             self.assertTrue(chatgpt_auth._open_browser(url))
         browser.assert_not_called()
-        argv, env = chatgpt_auth._windows_browser_launch(url)
-        self.assertEqual(popen.call_args.args[0], argv)
-        self.assertEqual(popen.call_args.kwargs["env"]["DWGREADER_LOGIN_URL"], url)
+        edge.assert_not_called()
+        self.assertEqual(popen.call_args.args[0], [chrome, url])
         flags = popen.call_args.kwargs["creationflags"]
-        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+        hidden = getattr(chatgpt_auth.subprocess, "CREATE_NO_WINDOW", 0)
+        if hidden:
+            self.assertFalse(flags & hidden)
+        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
             bit = getattr(chatgpt_auth.subprocess, name, 0)
             if bit:
                 self.assertTrue(flags & bit)
+
+    def test_windows_falls_back_to_edge(self) -> None:
+        url = (
+            "https://auth.openai.com/example?a=1&b=2"
+            "&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"
+        )
+        chrome = r"C:\Chrome\chrome.exe"
+        edge = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+        with patch.object(chatgpt_auth, "_default_browser_executable", return_value=chrome), patch.object(
+            chatgpt_auth, "_system_edge_executable", return_value=edge,
+        ), patch.object(chatgpt_auth, "_spawn_browser", side_effect=[False, True]) as spawn:
+            self.assertTrue(chatgpt_auth._open_windows_browser(url))
+        self.assertEqual(spawn.call_args_list[0].args[0], [chrome, url])
+        self.assertEqual(spawn.call_args_list[1].args[0], [edge, url])
+        self.assertIn("%3A", spawn.call_args_list[1].args[0][1])
+        self.assertIn("&", spawn.call_args_list[1].args[0][1])
+
+    def test_windows_does_not_open_edge_after_default_starts(self) -> None:
+        url = "https://auth.openai.com/example?a=1&b=2"
+        chrome = r"C:\Chrome\chrome.exe"
+        with patch.object(chatgpt_auth, "_default_browser_executable", return_value=chrome), patch.object(
+            chatgpt_auth, "_system_edge_executable",
+        ) as edge, patch.object(chatgpt_auth, "_spawn_browser", return_value=True) as spawn:
+            self.assertTrue(chatgpt_auth._open_windows_browser(url))
+        spawn.assert_called_once_with([chrome, url])
+        edge.assert_not_called()
+
+    def test_windows_does_not_retry_the_same_edge(self) -> None:
+        url = "https://auth.openai.com/example?a=1&b=2"
+        edge = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+        with patch.object(chatgpt_auth, "_default_browser_executable", return_value=edge), patch.object(
+            chatgpt_auth, "_system_edge_executable", return_value=edge,
+        ), patch.object(chatgpt_auth, "_spawn_browser", return_value=False) as spawn:
+            self.assertFalse(chatgpt_auth._open_windows_browser(url))
+        spawn.assert_called_once_with([edge, url])
 
     def test_login_browser_starts_once(self) -> None:
         job = chatgpt_auth.LoginJob()
@@ -488,6 +538,21 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(saved["access_token"], "new-access")
         self.assertEqual(saved["refresh_token"], "new-refresh")
         self.assertEqual(saved["client_id"], "oaiapp_test")
+
+    def test_token_exchange_uses_only_the_ssl_context(self) -> None:
+        handler = chatgpt_auth._LoginHTTPSHandler(chatgpt_auth.LoginJob())
+        request = urllib.request.Request(chatgpt_auth.TOKEN_URL, data=b"grant_type=authorization_code", method="POST")
+        seen: dict[str, object] = {}
+
+        def fake_do_open(http_class, req, **kwargs):
+            seen["kwargs"] = kwargs
+            http_class("auth.openai.com", timeout=1, **kwargs)
+            return object()
+
+        handler.do_open = fake_do_open
+        handler.https_open(request)
+        self.assertEqual(set(seen["kwargs"]), {"context"})
+        self.assertNotIn("check_hostname", seen["kwargs"])
 
     def test_form_oserror_while_cancelled_is_cancel(self) -> None:
         job = chatgpt_auth.LoginJob()

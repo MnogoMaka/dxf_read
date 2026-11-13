@@ -81,7 +81,7 @@ from .install_support import (
 bl_info = {
     "name": "Подложка DWG",
     "author": "DWGREADER",
-    "version": (1, 5, 29),
+    "version": (1, 5, 37),
     "blender": (4, 0, 0),
     "location": "3D Viewport → Sidebar → Подложка",
     "description": "DXF, жилой дом и расстановка благоустройства в сцене",
@@ -2060,6 +2060,7 @@ def _draw_step_objects(layout, context, prefs) -> None:
     maf = flags.column(align=True)
     maf.enabled = bool(scene.dwgreader_auto_maf)
     maf.prop(scene, "dwgreader_auto_play_kind", text="Тип площадок")
+    maf.prop(scene, "dwgreader_play_layout", text="Способ")
     maf.prop(scene, "dwgreader_safety_scale", text="Зона безопасности", slider=True)
     maf.prop(scene, "dwgreader_hide_model_zones")
     flags.prop(scene, "dwgreader_auto_buildings", text="Расстановка зданий")

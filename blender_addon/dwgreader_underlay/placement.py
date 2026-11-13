@@ -27,6 +27,7 @@ from .placement_math import (
     bench_island_keys,
     blocks_playground,
     cluster_nearby_islands,
+    glue_selected_islands,
     compose_playground,
     is_playground_surface,
     minimum_rectangle,
@@ -283,6 +284,57 @@ def _drop_mirrored_half(obj: bpy.types.Object) -> None:
     _ground_center(obj)
 
 
+def _selection_snapshot(context):
+    view_layer = getattr(context, "view_layer", None)
+    selected = [obj for obj in list(getattr(context, "selected_objects", []) or []) if obj is not None]
+    active = view_layer.objects.active if view_layer is not None else None
+    return selected, active
+
+
+def _deselect_in_view(context, obj) -> None:
+    """Снимает выделение, только пока объект в слое вида. Вне слоя select_set падает."""
+    if obj is None or context is None:
+        return
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is None:
+        return
+    try:
+        if obj.name not in view_layer.objects:
+            return
+        obj.select_set(False)
+        if view_layer.objects.active == obj:
+            view_layer.objects.active = None
+    except (RuntimeError, ReferenceError):
+        return
+
+
+def _restore_selection(context, selected, active) -> None:
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is None:
+        return
+    for obj in list(view_layer.objects):
+        try:
+            if obj.select_get():
+                obj.select_set(False)
+        except (RuntimeError, ReferenceError):
+            continue
+    kept = None
+    for obj in selected:
+        try:
+            if obj is None or obj.name not in view_layer.objects:
+                continue
+            obj.select_set(True)
+            kept = kept or obj
+        except (RuntimeError, ReferenceError):
+            continue
+    chosen = active if active is not None else kept
+    try:
+        if chosen is not None and chosen.name in view_layer.objects:
+            view_layer.objects.active = chosen
+    except (RuntimeError, ReferenceError):
+        pass
+
+
 def _import_mesh(context, asset: dict) -> bpy.types.Object:
     name = f"LIB_{asset['id']}"
     existing = bpy.data.objects.get(name)
@@ -291,6 +343,7 @@ def _import_mesh(context, asset: dict) -> bpy.types.Object:
         if asset["id"] == "lounger_01":
             _drop_mirrored_half(existing)
         _park_library_object(existing)
+        _deselect_in_view(context, existing)
         return existing
     folder = library_path(context)
     if folder is None:
@@ -298,45 +351,50 @@ def _import_mesh(context, asset: dict) -> bpy.types.Object:
     filepath = folder / asset["file"]
     if not filepath.is_file():
         raise PlacementError(f"Нет файла модели: {asset['file']}")
-    if context.mode != "OBJECT":
-        bpy.ops.object.mode_set(mode="OBJECT")
-    before = set(bpy.data.objects)
-    bpy.ops.import_scene.gltf(filepath=str(filepath))
-    imported = [obj for obj in bpy.data.objects if obj not in before]
-    meshes = [obj for obj in imported if obj.type == "MESH"]
-    if not meshes:
+    selected, active = _selection_snapshot(context)
+    try:
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        before = set(bpy.data.objects)
+        bpy.ops.import_scene.gltf(filepath=str(filepath))
+        imported = [obj for obj in bpy.data.objects if obj not in before]
+        meshes = [obj for obj in imported if obj.type == "MESH"]
+        if not meshes:
+            for obj in imported:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            raise PlacementError(f"В {asset['file']} нет сетки")
+        bpy.ops.object.select_all(action="DESELECT")
+        for obj in meshes:
+            world = obj.matrix_world.copy()
+            obj.parent = None
+            obj.matrix_world = world
+            obj.hide_set(False)
+            obj.hide_viewport = False
+            obj.select_set(True)
+        context.view_layer.objects.active = meshes[0]
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        if len(meshes) > 1:
+            bpy.ops.object.join()
+        mesh_object = context.view_layer.objects.active
+        _ground_center(mesh_object)
+        if asset["id"] == "lounger_01":
+            _drop_mirrored_half(mesh_object)
+        mesh_object.name = name
+        mesh_object.data.name = name
+        mesh_object.rotation_mode = "XYZ"
+        mesh_object["asset_id"] = asset["id"]
+        library = _collection(LIBRARY_NAME, None)
+        _deselect_in_view(context, mesh_object)
+        for collection in list(mesh_object.users_collection):
+            collection.objects.unlink(mesh_object)
+        library.objects.link(mesh_object)
+        _park_library_object(mesh_object)
         for obj in imported:
-            bpy.data.objects.remove(obj, do_unlink=True)
-        raise PlacementError(f"В {asset['file']} нет сетки")
-    bpy.ops.object.select_all(action="DESELECT")
-    for obj in meshes:
-        world = obj.matrix_world.copy()
-        obj.parent = None
-        obj.matrix_world = world
-        obj.hide_set(False)
-        obj.hide_viewport = False
-        obj.select_set(True)
-    context.view_layer.objects.active = meshes[0]
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    if len(meshes) > 1:
-        bpy.ops.object.join()
-    mesh_object = context.view_layer.objects.active
-    _ground_center(mesh_object)
-    if asset["id"] == "lounger_01":
-        _drop_mirrored_half(mesh_object)
-    mesh_object.name = name
-    mesh_object.data.name = name
-    mesh_object.rotation_mode = "XYZ"
-    mesh_object["asset_id"] = asset["id"]
-    library = _collection(LIBRARY_NAME, None)
-    for collection in list(mesh_object.users_collection):
-        collection.objects.unlink(mesh_object)
-    library.objects.link(mesh_object)
-    _park_library_object(mesh_object)
-    for obj in imported:
-        if obj != mesh_object and obj.name in bpy.data.objects:
-            bpy.data.objects.remove(obj, do_unlink=True)
-    return mesh_object
+            if obj != mesh_object and obj.name in bpy.data.objects:
+                bpy.data.objects.remove(obj, do_unlink=True)
+        return mesh_object
+    finally:
+        _restore_selection(context, selected, active)
 
 
 def _park_library_object(obj: bpy.types.Object) -> None:
@@ -732,6 +790,7 @@ _PLAY_LOCK = False
 _PLAY_PENDING = False
 _PLAY_UI_SEEN = False
 _PLAY_SCOPE = "all"
+_PLAY_TARGETS: list[str] = []
 
 
 def _is_plant_zone(obj) -> bool:
@@ -1592,6 +1651,7 @@ def _spawn_playground(context, asset: dict, location: tuple[float, float, float]
     obj["zone_key"] = key
     collection.objects.link(obj)
     obj.hide_set(False)
+    _deselect_in_view(context, obj)
     return obj
 
 
@@ -1674,6 +1734,7 @@ def _spawn_pad(ring: list[tuple[float, float]], key: str, kind: str, height: flo
     obj["pad_kind"] = kind
     _placement_collection("playgrounds").objects.link(obj)
     obj.hide_set(False)
+    _deselect_in_view(bpy.context, obj)
     return obj
 
 
@@ -1711,6 +1772,7 @@ def _spawn_layout_bench(context, asset: dict, point: dict, key: str, height: flo
     obj["zone_key"] = key
     _placement_collection("benches").objects.link(obj)
     obj.hide_set(False)
+    _deselect_in_view(context, obj)
     return obj
 
 
@@ -1730,6 +1792,7 @@ def _spawn_layout_urn(context, asset: dict, point: dict, key: str, height: float
     obj["zone_key"] = key
     _placement_collection("benches").objects.link(obj)
     obj.hide_set(False)
+    _deselect_in_view(context, obj)
     return obj
 
 
@@ -1751,10 +1814,14 @@ def _fill_playground_on(
         seed_value = int(getattr(context.scene, "dwgreader_play_seed", 1))
     else:
         seed_value = int(seed)
+    layout_mode = str(getattr(context.scene, "dwgreader_play_layout", "set") or "set")
+    if layout_mode != "single":
+        layout_mode = "set"
     bench_asset, bench_spec = _layout_bench(context) if with_benches else (None, None)
     layout = compose_playground(
         vertices, faces, [_play_spec(asset) for asset in catalog], blocked=blocked,
         seed=seed_value, bench=bench_spec, clearance_scale=_safety_scale(context),
+        layout=layout_mode,
     )
     catalog_by_id = {asset["id"]: asset for asset in catalog}
     centroid = polygon_centroid_xy(vertices, faces)
@@ -1784,15 +1851,25 @@ def _fill_playground_on(
     return len(layout["items"]), bool(layout["hero_missing"])
 
 
-def _fill_islands(context, islands, zones=None, kind: str | None = None, seed: int | None = None, merge_nearby: bool = False) -> tuple[int, bool, int]:
+def _fill_islands(
+    context, islands, zones=None, kind: str | None = None, seed: int | None = None,
+    merge_nearby: bool = False, glue_selected: bool = False,
+) -> tuple[int, bool, int]:
     if not _play_assets(context, kind):
         raise PlacementError("В каталоге нет моделей выбранного типа площадки")
+    if zones:
+        _remember_play_targets(zones)
     collection = _placement_collection("playgrounds")
     benches = _placement_collection("benches")
     for _vertices, _faces, key in islands:
         _replace_owned(collection, key, prefix=True)
         _replace_owned(benches, key, prefix=True)
-    work = cluster_nearby_islands(islands) if merge_nearby else islands
+    if glue_selected and len(islands) > 1:
+        work = glue_selected_islands(islands)
+    elif merge_nearby:
+        work = cluster_nearby_islands(islands)
+    else:
+        work = islands
     blocked = _playground_blocked(exclude=zones)
     total = 0
     missing = False
@@ -1817,11 +1894,58 @@ def _all_playground_meshes() -> list:
     ]
 
 
+def _remember_play_targets(objects) -> None:
+    global _PLAY_TARGETS
+    names: list[str] = []
+    seen: set[str] = set()
+    for obj in objects or []:
+        try:
+            name = obj.name
+        except ReferenceError:
+            continue
+        if not name or name in seen or not _playground_mesh(obj):
+            continue
+        seen.add(name)
+        names.append(name)
+    if names:
+        _PLAY_TARGETS = names
+
+
+def _remembered_play_targets() -> list:
+    found = []
+    for name in _PLAY_TARGETS:
+        obj = bpy.data.objects.get(name)
+        if obj is not None and _playground_mesh(obj):
+            found.append(obj)
+    return found
+
+
+def _keep_playground_selected(context, targets) -> None:
+    """После расстановки выделен полигон площадки, а не поставленная модель."""
+    if getattr(context, "mode", "OBJECT") != "OBJECT":
+        return
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is None:
+        return
+    alive = []
+    for obj in targets or []:
+        try:
+            if obj is not None and obj.name in view_layer.objects:
+                alive.append(obj)
+        except ReferenceError:
+            continue
+    if alive:
+        _select_only(context, alive)
+
+
 def _play_targets(context, prefer_selection: bool) -> list:
-    """Выделенные площадки. Газон и дорога в этот набор не входят."""
+    """Выделенные площадки. Если выделен только поставленный объект, берём прошлый полигон."""
     selected = [obj for obj in _underlay_selection(context) if _playground_mesh(obj)]
-    if prefer_selection or selected:
+    if selected:
+        _remember_play_targets(selected)
         return selected
+    if prefer_selection:
+        return _remembered_play_targets()
     return _all_playground_meshes()
 
 
@@ -1841,8 +1965,13 @@ def refill_playgrounds(context, prefer_selection: bool = False) -> str:
         except PlacementError:
             continue
     if not islands:
+        _keep_playground_selected(context, targets)
         return "Выберите полигоны площадки"
-    total, hero_missing, filled = _fill_islands(context, islands, targets, merge_nearby=prefer_selection)
+    glue = prefer_selection and len(islands) > 1 and (len(targets) > 1 or edit)
+    total, hero_missing, filled = _fill_islands(
+        context, islands, targets, merge_nearby=False, glue_selected=glue,
+    )
+    _keep_playground_selected(context, targets)
     if total:
         note = f"На площадках {total} объектов, полигонов {filled}"
         if hero_missing:
@@ -2876,12 +3005,13 @@ def draw_panel(layout, context) -> None:
             note_play_scope("selection")
             box.label(text="«Заполнить» ставит несколько моделей, зона остаётся внутри полигона")
             box.prop(scene, "dwgreader_playground_type", text="Тип площадки")
+            box.prop(scene, "dwgreader_play_layout", text="Способ")
             box.prop(scene, "dwgreader_play_seed", text="Seed МАФ")
             box.prop(scene, "dwgreader_safety_scale", text="Зона безопасности", slider=True)
             box.prop(scene, "dwgreader_hide_model_zones")
             hint = box.column(align=True)
             hint.scale_y = 0.75
-            hint.label(text="Тип применяется кнопкой «Заполнить». Сид и зона меняют выделенные полигоны.")
+            hint.label(text="Число моделей зависит от полигона. Поворот — вдоль стороны или поперёк.")
             box.prop(scene, "dwgreader_play_asset", text="Модель")
             box.prop(scene, "dwgreader_play_scale", text="Размер площадки")
             box.operator("dwgreader.fill_playground", text="Заполнить", icon="MESH_GRID")
@@ -3071,9 +3201,19 @@ def register() -> None:
         ),
         default="random",
     )
+    bpy.types.Scene.dwgreader_play_layout = EnumProperty(
+        name="Способ площадки",
+        description="Оба способа ставят крупные и мелкие модели по размеру полигона и лавки. Один объект начинает с центра",
+        items=(
+            ("set", "Набор и лавки", "Сразу несколько моделей разного размера и лавки по сторонам"),
+            ("single", "Один объект", "Сначала большая модель в центре, затем ещё модели и лавки, сколько влезает"),
+        ),
+        default="set",
+        update=_on_play_seed,
+    )
     bpy.types.Scene.dwgreader_play_seed = IntProperty(
         name="Seed МАФ",
-        description="Меняет выбор и позиции моделей и сразу переставляет площадки",
+        description="Меняет порядок, положение и поворот на 90° внутри выбранного способа. Тот же сид повторяет раскладку",
         default=1,
         min=0,
         max=1_000_000,
@@ -3105,6 +3245,7 @@ def unregister() -> None:
         "dwgreader_play_scale",
         "dwgreader_play_asset",
         "dwgreader_play_seed",
+        "dwgreader_play_layout",
         "dwgreader_hide_model_zones",
         "dwgreader_safety_scale",
         "dwgreader_auto_play_kind",

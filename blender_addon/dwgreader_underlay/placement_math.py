@@ -1462,15 +1462,23 @@ def _collect_seats(spec: dict, pocket, usable, placed: list[dict], angles: list[
     return seats
 
 
-def _feasible_seats(spec: dict, pocket, usable, placed: list[dict], axis: float | None = None) -> list[tuple[float, dict]]:
-    """Сначала вдоль оси покрытия, затем поперёк. Чужой угол кармана — только если оба не влезли."""
+def _feasible_seats(
+    spec: dict,
+    pocket,
+    usable,
+    placed: list[dict],
+    axis: float | None = None,
+    across_first: bool = False,
+) -> list[tuple[float, dict]]:
+    """Сид начинает вдоль стороны или поперёк. Второй поворот — только если первый не влез."""
     if axis is not None:
         along = _collect_seats(spec, pocket, usable, placed, _facing_pair(axis, "A"))
-        if along:
-            return along
         across = _collect_seats(spec, pocket, usable, placed, _facing_pair(orientation_angle(axis, "B"), "B"))
-        if across:
-            return across
+        first, second = (across, along) if across_first else (along, across)
+        if first:
+            return first
+        if second:
+            return second
     rectangle = minimum_rectangle([(float(x), float(y)) for x, y in pocket.exterior.coords])
     if rectangle is None:
         return []
@@ -1488,8 +1496,16 @@ def _pick_seat(seats: list[tuple[float, dict]], rng: random.Random) -> dict | No
     return rng.choice(pool or [pose for _radius, pose in seats])
 
 
-def _sit_in(spec: dict, pocket, usable, placed: list[dict], rng: random.Random, axis: float | None = None):
-    return _pick_seat(_feasible_seats(spec, pocket, usable, placed, axis), rng)
+def _sit_in(
+    spec: dict,
+    pocket,
+    usable,
+    placed: list[dict],
+    rng: random.Random,
+    axis: float | None = None,
+    across_first: bool = False,
+):
+    return _pick_seat(_feasible_seats(spec, pocket, usable, placed, axis, across_first), rng)
 
 
 def _pad_kind(spec: dict) -> str | None:
@@ -1651,7 +1667,7 @@ def _compose_benches(
     inset = depth * 0.5 + 0.2
     center = ground.centroid
     focus = hero if hero is not None else (float(center.x), float(center.y))
-    parts = [part for part in _geometry_parts(ground) if part.area >= 30.0]
+    parts = [part for part in _geometry_parts(ground) if part.area >= 1.0]
     if not parts:
         return [], []
     Point, polygon, _union, _prep = _shapely()
@@ -1773,7 +1789,7 @@ def _world_on_axis(u: float, v: float, ux: float, uy: float, vx: float, vy: floa
 
 
 def _sit_axis(spec: dict, point: tuple[float, float], usable, placed: list[dict], axis: float, across_first: bool = False):
-    """Вдоль оси, разворот на 180°, и только потом поперёк. Принцип 3 начинает поперёк."""
+    """Вдоль стороны или поперёк, как выбрал сид. Второй поворот — если первый не влез."""
     for orientation, angle in _axis_attempts(axis, across_first):
         found = _try_sit(spec, point, angle, orientation, usable, placed)
         if found is not None:
@@ -1845,8 +1861,32 @@ def _zones_clear(safety: list, placed: list[dict], gap: float) -> bool:
     return True
 
 
-def _lay_rows(specs: list[dict], usable, rng: random.Random, axis: float, gap: float, style: int = 0):
-    """Клетки оси от точки принципа. Сначала самая большая подходящая, кроме принципа 2."""
+def _covers_pad(spec: dict, pad_area: float, span_u: float, span_v: float) -> bool:
+    """Модель одна занимает почти весь полигон: её не ставят в набор."""
+    del span_u, span_v
+    area = _safety_area(spec)
+    return pad_area > 0.0 and area >= pad_area * 0.45
+
+
+def _hero_outcome(placed: list[dict], heroes_exist: bool):
+    hero_point = None
+    hero_missing = heroes_exist
+    for item in placed:
+        if item.get("role") == "hero":
+            return (item["x"], item["y"]), False
+    return hero_point, hero_missing
+
+
+def _lay_rows(
+    specs: list[dict],
+    usable,
+    rng: random.Random,
+    axis: float,
+    gap: float,
+    layout: str = "set",
+    across_first: bool = False,
+):
+    """Набор сначала ставит комплекс, если он влезает, затем мешает остальные размеры. Один объект начинает с центра."""
     parts = [part for part in _geometry_parts(usable) if part.area >= 1.0]
     heroes_exist = any(spec["role"] == "hero" for spec in specs)
     if not parts:
@@ -1863,15 +1903,13 @@ def _lay_rows(specs: list[dict], usable, rng: random.Random, axis: float, gap: f
     span_v = max_v - min_v
     mid_u = (min_u + max_u) * 0.5
     mid_v = (min_v + max_v) * 0.5
-    if int(style) == 1:
-        sign = -1.0 if rng.random() < 0.5 else 1.0
-        origin_u = mid_u + sign * span_u * 0.42
-        origin_v = mid_v + (rng.random() - 0.5) * span_v * 0.15
+    mode = "single" if layout == "single" else "set"
+    if mode == "single":
+        origin_u, origin_v = mid_u, mid_v
     else:
         origin_u = mid_u + (rng.random() - 0.5) * span_u * 0.3
         origin_v = mid_v + (rng.random() - 0.5) * span_v * 0.3
     cells = _axis_cells(min_u, max_u, min_v, max_v, 1.5, origin_u, origin_v)
-    across_first = int(style) == 3
 
     def sit_at(spec: dict, u: float, v: float):
         point = _world_on_axis(u, v, ux, uy, vx, vy)
@@ -1887,8 +1925,7 @@ def _lay_rows(specs: list[dict], usable, rng: random.Random, axis: float, gap: f
             return found
         return None
 
-    def place_once(candidates: list[dict]) -> int:
-        added = 0
+    def place_once(candidates: list[dict]) -> None:
         for spec in candidates:
             if len(placed) >= _MAX_PLAY_ITEMS:
                 break
@@ -1897,44 +1934,41 @@ def _lay_rows(specs: list[dict], usable, rng: random.Random, axis: float, gap: f
                 if found is None:
                     continue
                 placed.append(found)
-                added += 1
                 break
-        return added
 
-    if int(style) == 2 and ordered:
-        leader = _safety_area(ordered[0])
-        top = [spec for spec in ordered if _safety_area(spec) >= leader * 0.65]
-        rng.shuffle(top)
-        top_ids = {spec["id"] for spec in top}
-        first_queue = top + [spec for spec in ordered if spec["id"] not in top_ids]
+    if mode == "single":
+        center = _world_on_axis(mid_u, mid_v, ux, uy, vx, vy)
+        chosen = None
+        chosen_id = None
+        for spec in ordered:
+            found, _spans = _sit_axis(spec, center, usable, [], axis, across_first)
+            if found is not None:
+                chosen = found
+                chosen_id = spec["id"]
+                break
+        if chosen is None:
+            for spec in ordered:
+                for u, v in cells:
+                    found = sit_at(spec, u, v)
+                    if found is None:
+                        continue
+                    chosen = found
+                    chosen_id = spec["id"]
+                    break
+                if chosen is not None:
+                    break
+        if chosen is not None:
+            placed.append(chosen)
+        rest = [spec for spec in ordered if spec["id"] != chosen_id]
     else:
-        first_queue = ordered
-    for spec in first_queue:
-        if len(placed) >= _MAX_PLAY_ITEMS:
-            break
-        for u, v in cells:
-            found = sit_at(spec, u, v)
-            if found is None:
-                continue
-            placed.append(found)
-            break
-        if placed:
-            break
-    used = {item["id"] for item in placed}
-    place_once(_mix_bands([spec for spec in ordered if spec["id"] not in used], rng))
-    if len(placed) < _MAX_PLAY_ITEMS and placed and _widest_open(usable, placed) is not None:
-        for _round in range(4):
-            if len(placed) >= _MAX_PLAY_ITEMS:
-                break
-            if place_once(ordered) == 0:
-                break
-    hero_point = None
-    hero_missing = heroes_exist
-    for item in placed:
-        if item.get("role") == "hero":
-            hero_point = (item["x"], item["y"])
-            hero_missing = False
-            break
+        pad_area = sum(float(part.area) for part in parts)
+        rest = [spec for spec in ordered if not _covers_pad(spec, pad_area, span_u, span_v)]
+        heroes = [spec for spec in rest if spec["role"] == "hero"]
+        rest = [spec for spec in rest if spec["role"] != "hero"]
+        place_once(heroes)
+    place_once(_mix_bands(rest, rng))
+    _fill_open_pockets(rest, usable, placed, rng, axis, across_first)
+    hero_point, hero_missing = _hero_outcome(placed, heroes_exist)
     return placed, hero_point, hero_missing
 
 
@@ -1959,15 +1993,30 @@ def _widest_open(usable, placed: list[dict]):
     return part
 
 
-def _seat_on_open(specs: list[dict], pocket, usable, placed: list[dict], rng: random.Random, axis: float) -> dict | None:
+def _seat_on_open(
+    specs: list[dict],
+    pocket,
+    usable,
+    placed: list[dict],
+    rng: random.Random,
+    axis: float,
+    across_first: bool = False,
+) -> dict | None:
     for spec in specs:
-        found = _sit_in(spec, pocket, usable, placed, rng, axis)
+        found = _sit_in(spec, pocket, usable, placed, rng, axis, across_first)
         if found is not None:
             return found
     return None
 
 
-def _fill_open_pockets(specs: list[dict], usable, placed: list[dict], rng: random.Random, axis: float) -> None:
+def _fill_open_pockets(
+    specs: list[dict],
+    usable,
+    placed: list[dict],
+    rng: random.Random,
+    axis: float,
+    across_first: bool = False,
+) -> None:
     """Свободное место занимает ещё не стоявшая модель, иначе самая компактная.
 
     Поиск идёт по всему оставшемуся полигону. Остановка на восьми объектах
@@ -1980,9 +2029,9 @@ def _fill_open_pockets(specs: list[dict], usable, placed: list[dict], rng: rando
             break
         used = {item["id"] for item in placed}
         fresh = sorted((spec for spec in others if spec["id"] not in used), key=_safety_area, reverse=True)
-        found = _seat_on_open(fresh, pocket, usable, placed, rng, axis) if fresh else None
+        found = _seat_on_open(fresh, pocket, usable, placed, rng, axis, across_first) if fresh else None
         if found is None:
-            found = _seat_on_open(sorted(others, key=_safety_area), pocket, usable, placed, rng, axis)
+            found = _seat_on_open(sorted(others, key=_safety_area), pocket, usable, placed, rng, axis, across_first)
         if found is None:
             break
         placed.append(found)
@@ -2032,6 +2081,19 @@ def cluster_nearby_islands(islands: list[tuple], gap: float = 4.0) -> list[tuple
     return merged
 
 
+def glue_selected_islands(islands: list[tuple]) -> list[tuple]:
+    """Выделенные острова становятся одним мультиполигоном. Расстояние не проверяется."""
+    if len(islands) <= 1:
+        return list(islands)
+    vertices: list = []
+    faces: list = []
+    for island_vertices, island_faces, _key in islands:
+        base = len(vertices)
+        vertices.extend(island_vertices)
+        faces.extend(tuple(int(vertex) + base for vertex in face) for face in island_faces)
+    return [(vertices, faces, islands[0][2])]
+
+
 def bench_island_keys(islands: list[tuple]) -> set[str]:
     """Лавки получает только самый большой кусок каждого объекта."""
     groups: dict[str, list[tuple[float, str]]] = {}
@@ -2062,14 +2124,17 @@ def compose_playground(
     seed: int = 0,
     bench: dict | None = None,
     clearance_scale: float = 1.0,
+    layout: str = "set",
 ) -> dict:
-    """Модели рядами вдоль оси покрытия, затем лавки по краям.
+    """Оба способа заполняют полигон по его размеру и ставят лавки.
 
-    Сид повторяет набор и места. Повтор модели — только когда других подходящих нет.
+    Один объект начинает с самой большой модели в центре. Сид выбирает поворот
+    вдоль стороны или поперёк неё. Тот же сид повторяет раскладку.
     """
     empty = {"items": [], "benches": [], "urns": [], "hero_missing": False}
     if not assets or not faces:
         return empty
+    mode = "single" if str(layout or "set") == "single" else "set"
     specs = [_compose_spec(asset) for asset in assets]
     zone = min(max(float(clearance_scale), 0.0), 1.0)
     if zone < 1.0:
@@ -2086,10 +2151,12 @@ def compose_playground(
         return empty
     axis = _playground_axis(usable)
     gap = (1.5, 1.0, 0.4)[int(seed) % 3]
-    style = int(seed) % 4
-    placed, hero_point, hero_missing = _lay_rows(specs, usable, rng, axis, gap, style)
+    across_first = int(seed) % 2 == 1
+    placed, hero_point, hero_missing = _lay_rows(specs, usable, rng, axis, gap, mode, across_first)
     station = (0.5, 0.25, 0.75)[int(seed) % 3]
-    benches, urns = _compose_benches(usable, hero_point, placed, bench, rng, station) if bench else ([], [])
+    benches, urns = ([], [])
+    if bench:
+        benches, urns = _compose_benches(usable, hero_point, placed, bench, rng, station)
     return {
         "items": [_public_item(item) for item in placed],
         "benches": benches,

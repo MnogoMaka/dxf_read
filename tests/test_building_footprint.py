@@ -146,4 +146,17 @@ class FootprintLoopTests(unittest.TestCase):
         text = SOURCE.read_text(encoding="utf-8")
         self.assertIn("apply_preset(obj, DEFAULT_BUILDING_PRESET)", text)
         self.assertIn('DEFAULT_BUILDING_PRESET = "main002"', text)
-        self.assertIn("return found[-1]", text)
+        self.assertIn("logging.warning(\"Сокет %s пресета дома пропущен\", ident, exc_info=True)", text)
+
+    def test_fresh_house_stays_out_of_the_scene_until_the_footprint(self) -> None:
+        text = SOURCE.read_text(encoding="utf-8")
+        append = text.split("def _append_driver", 1)[1].split("\ndef ", 1)[0]
+        copy = text.split("def _copy_building", 1)[1].split("\ndef ", 1)[0]
+        islands = text.split("def _place_islands", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("_clear_file_pose(obj)", append)
+        self.assertNotIn("root.objects.link", append)
+        self.assertIn("mesh.copy()", copy)
+        self.assertNotIn("copy.data = source.data", copy)
+        self.assertLess(islands.index("_apply_polygon("), islands.index("_reveal_building("))
+        self.assertIn("Не встали", text)
+        self.assertIn("_unlink_everywhere(obj)", text.split("def _discard_library", 1)[1].split("\ndef ", 1)[0])
